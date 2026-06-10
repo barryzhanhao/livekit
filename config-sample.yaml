@@ -19,7 +19,7 @@ port: 7880
 # when redis is set, LiveKit will automatically operate in a fully distributed fashion
 # clients could connect to any node and be routed to the same room
 redis:
-  address: redis.host:6379
+  address: localhost:6379
   # db: 0
   # username: myuser
   # password: mypassword
@@ -88,23 +88,17 @@ rtc:
   # use_ice_lite: true
   # # optional STUN servers for LiveKit clients to use. Clients will be configured to use these STUN servers automatically.
   # # by default LiveKit clients use Google's public STUN servers
-  # stun_servers:
-  #   - server1
+  stun_servers:
+    - 192.168.97.216:3478
   # # optional TURN servers for clients. This isn't necessary if using embedded TURN server (see below).
-  # turn_servers:
-  #   - host: myhost.com
-  #     port: 443
-  #     # tls, tcp, or udp
-  #     protocol: tls
-  #     # Shared secret for TURN server authentication
-  #     secret: ""
-  #     # Path for file containing shared secret for TURN server authentication
-  #     # When both secret and secret_file are set, secret takes precedence
-  #     secret_file: "/var/lib/coturn/secret"
-  #     ttl: 14400 # seconds
-  #     # Insecure username/password authentication
-  #     username: ""
-  #     credential: ""
+  turn_servers:
+    - host: 127.0.0.1
+      port: 3478
+      # tls, tcp, or udp
+      protocol: udp
+      # Insecure username/password authentication
+      username: "username1"
+      credential: "password1"
   # # allows LiveKit to monitor congestion when sending streams and automatically
   # # manage bandwidth utilization to avoid congestion/loss. Enabled by default
   # congestion_control:
@@ -142,7 +136,7 @@ rtc:
   #   excludes:
   #     - docker0
   # # ip address filter. If the machine has more than one ip address and you'd like it to use or skip specific ips,
-  # # both inclusion and exclusion CIDR filters can be used together. If neither is defined (default), all ip on the machine will be used.
+  # # both inclusion and exclusion CIDR Fzfilters can be used together. If neither is defined (default), all ip on the machine will be used.
   # # If both of them are set, then only include takes effect.
   # ips:
   #   includes:
@@ -174,8 +168,8 @@ rtc:
 # Keys are used for JWT authentication, server APIs would require a keypair in order to generate access tokens
 # and make calls to the server
 keys:
-  key1: secret1
-  key2: secret2
+  key1: secret1secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2
+  key2: secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2secret2
 # Logging config
 # logging:
 #   # log level, valid values: debug, info, warn, error
@@ -272,15 +266,15 @@ keys:
 #   active_red_encoding: true
 
 # turn server
-# turn:
-#   # Uses TLS. Requires cert and key pem files by either:
-#   # - using turn.secretName if deploying with our helm chart, or
-#   # - setting LIVEKIT_TURN_CERT and LIVEKIT_TURN_KEY env vars with file locations, or
-#   # - using cert_file and key_file below
-#   # defaults to false
-#   enabled: false
-#   # defaults to 3478 - recommended to 443 if not running HTTP3/QUIC server
-#   # only 53/80/443 are allowed if less than 1024
+#turn:
+##   # Uses TLS. Requires cert and key pem files by either:
+##   # - using turn.secretName if deploying with our helm chart, or
+##   # - setting LIVEKIT_TURN_CERT and LIVEKIT_TURN_KEY env vars with file locations, or
+##   # - using cert_file and key_file below
+##   # defaults to false
+#   enabled: true
+##   # defaults to 3478 - recommended to 443 if not running HTTP3/QUIC server
+##   # only 53/80/443 are allowed if less than 1024
 #   udp_port: 3478
 #   # defaults to 5349 - if not using a load balancer, this must be set to 443
 #   tls_port: 5349

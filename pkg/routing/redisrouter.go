@@ -38,6 +38,9 @@ const (
 
 	// hash of room_name => node_id
 	NodeRoomKey = "room_node_map"
+
+	// hash of room_name => participant_id => node_id
+	RoomParticipantNodesPrefix = "room_participant_nodes"
 )
 
 var _ Router = (*RedisRouter)(nil)
@@ -53,6 +56,8 @@ type RedisRouter struct {
 	ctx       context.Context
 	isStarted atomic.Bool
 
+	mediaRelay *MediaRelayManager
+
 	cancel func()
 }
 
@@ -63,6 +68,7 @@ func NewRedisRouter(lr *LocalRouter, rc redis.UniversalClient, kps rpc.Keepalive
 		kps:         kps,
 	}
 	rr.ctx, rr.cancel = context.WithCancel(context.Background())
+	rr.mediaRelay = NewMediaRelayManager(rc, lr.currentNode.NodeID(), lr.currentNode.NodeIP())
 	return rr
 }
 
@@ -114,9 +120,48 @@ func (r *RedisRouter) SetNodeForRoom(_ context.Context, roomName livekit.RoomNam
 }
 
 func (r *RedisRouter) ClearRoomState(_ context.Context, roomName livekit.RoomName) error {
-	if err := r.rc.HDel(context.Background(), NodeRoomKey, string(roomName)).Err(); err != nil {
+	pipe := r.rc.Pipeline()
+	pipe.HDel(context.Background(), NodeRoomKey, string(roomName))
+	pipe.Del(context.Background(), RoomParticipantNodesPrefix+":"+string(roomName))
+	_, err := pipe.Exec(context.Background())
+	if err != nil {
 		return errors.Wrap(err, "could not clear room state")
 	}
+	return nil
+}
+
+// ---- Participant-level routing (NAT mode) ----
+
+func (r *RedisRouter) SetParticipantNode(_ context.Context, roomName livekit.RoomName, participantID livekit.ParticipantID, nodeID livekit.NodeID) error {
+	key := RoomParticipantNodesPrefix + ":" + string(roomName)
+	return r.rc.HSet(r.ctx, key, string(participantID), string(nodeID)).Err()
+}
+
+func (r *RedisRouter) RemoveParticipantNode(_ context.Context, roomName livekit.RoomName, participantID livekit.ParticipantID) error {
+	key := RoomParticipantNodesPrefix + ":" + string(roomName)
+	return r.rc.HDel(r.ctx, key, string(participantID)).Err()
+}
+
+func (r *RedisRouter) GetRoomParticipantNodes(_ context.Context, roomName livekit.RoomName) (map[livekit.ParticipantID]livekit.NodeID, error) {
+	key := RoomParticipantNodesPrefix + ":" + string(roomName)
+	result, err := r.rc.HGetAll(r.ctx, key).Result()
+	if err != nil {
+		return nil, errors.Wrap(err, "could not get room participant nodes")
+	}
+	nodes := make(map[livekit.ParticipantID]livekit.NodeID, len(result))
+	for pid, nid := range result {
+		nodes[livekit.ParticipantID(pid)] = livekit.NodeID(nid)
+	}
+	return nodes, nil
+}
+
+// ---- Media Relay (NAT mode) ----
+
+func (r *RedisRouter) CreateRTPRelay(ctx context.Context, targetNodeID livekit.NodeID) (RTPRelay, error) {
+	return r.mediaRelay.SubscribeRemoteTrack(ctx, "", "", targetNodeID, "")
+}
+
+func (r *RedisRouter) CloseRTPRelay(targetNodeID livekit.NodeID) error {
 	return nil
 }
 
@@ -178,6 +223,11 @@ func (r *RedisRouter) Start() error {
 	go r.statsWorker()
 	go r.keepaliveWorker(workerStarted)
 
+	// Start media relay manager for cross-node RTP forwarding (NAT mode)
+	if err := r.mediaRelay.Start(); err != nil {
+		return err
+	}
+
 	// wait until worker is running
 	return <-workerStarted
 }
@@ -195,6 +245,7 @@ func (r *RedisRouter) Stop() {
 	}
 	logger.Debugw("stopping RedisRouter")
 	_ = r.UnregisterNode()
+	r.mediaRelay.Stop()
 	r.cancel()
 }
 

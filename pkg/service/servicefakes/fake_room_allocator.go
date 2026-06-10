@@ -40,6 +40,20 @@ type FakeRoomAllocator struct {
 		result3 bool
 		result4 error
 	}
+	SelectParticipantNodeStub        func(context.Context, livekit.RoomName) (livekit.NodeID, error)
+	selectParticipantNodeMutex       sync.RWMutex
+	selectParticipantNodeArgsForCall []struct {
+		arg1 context.Context
+		arg2 livekit.RoomName
+	}
+	selectParticipantNodeReturns struct {
+		result1 livekit.NodeID
+		result2 error
+	}
+	selectParticipantNodeReturnsOnCall map[int]struct {
+		result1 livekit.NodeID
+		result2 error
+	}
 	SelectRoomNodeStub        func(context.Context, livekit.RoomName, livekit.NodeID) error
 	selectRoomNodeMutex       sync.RWMutex
 	selectRoomNodeArgsForCall []struct {
@@ -200,6 +214,71 @@ func (fake *FakeRoomAllocator) CreateRoomReturnsOnCall(i int, result1 *livekit.R
 		result3 bool
 		result4 error
 	}{result1, result2, result3, result4}
+}
+
+func (fake *FakeRoomAllocator) SelectParticipantNode(arg1 context.Context, arg2 livekit.RoomName) (livekit.NodeID, error) {
+	fake.selectParticipantNodeMutex.Lock()
+	ret, specificReturn := fake.selectParticipantNodeReturnsOnCall[len(fake.selectParticipantNodeArgsForCall)]
+	fake.selectParticipantNodeArgsForCall = append(fake.selectParticipantNodeArgsForCall, struct {
+		arg1 context.Context
+		arg2 livekit.RoomName
+	}{arg1, arg2})
+	stub := fake.SelectParticipantNodeStub
+	fakeReturns := fake.selectParticipantNodeReturns
+	fake.recordInvocation("SelectParticipantNode", []interface{}{arg1, arg2})
+	fake.selectParticipantNodeMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2)
+	}
+	if specificReturn {
+		return ret.result1, ret.result2
+	}
+	return fakeReturns.result1, fakeReturns.result2
+}
+
+func (fake *FakeRoomAllocator) SelectParticipantNodeCallCount() int {
+	fake.selectParticipantNodeMutex.RLock()
+	defer fake.selectParticipantNodeMutex.RUnlock()
+	return len(fake.selectParticipantNodeArgsForCall)
+}
+
+func (fake *FakeRoomAllocator) SelectParticipantNodeCalls(stub func(context.Context, livekit.RoomName) (livekit.NodeID, error)) {
+	fake.selectParticipantNodeMutex.Lock()
+	defer fake.selectParticipantNodeMutex.Unlock()
+	fake.SelectParticipantNodeStub = stub
+}
+
+func (fake *FakeRoomAllocator) SelectParticipantNodeArgsForCall(i int) (context.Context, livekit.RoomName) {
+	fake.selectParticipantNodeMutex.RLock()
+	defer fake.selectParticipantNodeMutex.RUnlock()
+	argsForCall := fake.selectParticipantNodeArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2
+}
+
+func (fake *FakeRoomAllocator) SelectParticipantNodeReturns(result1 livekit.NodeID, result2 error) {
+	fake.selectParticipantNodeMutex.Lock()
+	defer fake.selectParticipantNodeMutex.Unlock()
+	fake.SelectParticipantNodeStub = nil
+	fake.selectParticipantNodeReturns = struct {
+		result1 livekit.NodeID
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeRoomAllocator) SelectParticipantNodeReturnsOnCall(i int, result1 livekit.NodeID, result2 error) {
+	fake.selectParticipantNodeMutex.Lock()
+	defer fake.selectParticipantNodeMutex.Unlock()
+	fake.SelectParticipantNodeStub = nil
+	if fake.selectParticipantNodeReturnsOnCall == nil {
+		fake.selectParticipantNodeReturnsOnCall = make(map[int]struct {
+			result1 livekit.NodeID
+			result2 error
+		})
+	}
+	fake.selectParticipantNodeReturnsOnCall[i] = struct {
+		result1 livekit.NodeID
+		result2 error
+	}{result1, result2}
 }
 
 func (fake *FakeRoomAllocator) SelectRoomNode(arg1 context.Context, arg2 livekit.RoomName, arg3 livekit.NodeID) error {

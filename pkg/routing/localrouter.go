@@ -68,6 +68,32 @@ func (r *LocalRouter) ClearRoomState(_ context.Context, _ livekit.RoomName) erro
 	return nil
 }
 
+// ---- Participant-level routing (NAT mode) ----
+// Single-node: all participants always on the current node, no Redis needed.
+
+func (r *LocalRouter) SetParticipantNode(_ context.Context, _ livekit.RoomName, _ livekit.ParticipantID, _ livekit.NodeID) error {
+	return nil
+}
+
+func (r *LocalRouter) RemoveParticipantNode(_ context.Context, _ livekit.RoomName, _ livekit.ParticipantID) error {
+	return nil
+}
+
+func (r *LocalRouter) GetRoomParticipantNodes(_ context.Context, _ livekit.RoomName) (map[livekit.ParticipantID]livekit.NodeID, error) {
+	return map[livekit.ParticipantID]livekit.NodeID{}, nil
+}
+
+// ---- Media Relay (NAT mode) ----
+// Single-node: all media local, relay is a no-op.
+
+func (r *LocalRouter) CreateRTPRelay(_ context.Context, _ livekit.NodeID) (RTPRelay, error) {
+	return nil, ErrNotFound
+}
+
+func (r *LocalRouter) CloseRTPRelay(_ livekit.NodeID) error {
+	return nil
+}
+
 func (r *LocalRouter) RegisterNode() error {
 	return nil
 }

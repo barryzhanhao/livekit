@@ -83,6 +83,11 @@ type RoomAllocator interface {
 	SelectRoomNode(ctx context.Context, roomName livekit.RoomName, nodeID livekit.NodeID) error
 	CreateRoom(ctx context.Context, req *livekit.CreateRoomRequest, isExplicit bool) (*livekit.Room, *livekit.RoomInternal, bool, error)
 	ValidateCreateRoom(ctx context.Context, roomName livekit.RoomName) error
+
+	// SelectParticipantNode selects a node for a specific participant.
+	// In NAT mode, participants in the same room can be on different nodes.
+	// This replaces the room-level SelectRoomNode for NAT deployments.
+	SelectParticipantNode(ctx context.Context, roomName livekit.RoomName) (livekit.NodeID, error)
 }
 
 //counterfeiter:generate . SIPStore

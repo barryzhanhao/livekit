@@ -15,6 +15,8 @@
 package routing
 
 import (
+	"net"
+	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -48,9 +50,6 @@ type LocalNodeImpl struct {
 
 func NewLocalNode(conf *config.Config) (*LocalNodeImpl, error) {
 	nodeID := guid.New(utils.NodePrefix)
-	if conf != nil && conf.RTC.NodeIP.IsEmpty() {
-		return nil, ErrIPNotSet
-	}
 	nowUnix := time.Now().Unix()
 	l := &LocalNodeImpl{
 		node: &livekit.Node{
@@ -64,12 +63,24 @@ func NewLocalNode(conf *config.Config) (*LocalNodeImpl, error) {
 		},
 	}
 	var nsc *config.NodeStatsConfig
-	if conf != nil {
-		l.node.Ip = conf.RTC.NodeIP.PrimaryIP()
-		l.node.Region = conf.Region
 
+	// Resolve Node IP:
+	// 1. Prefer POD_IP env var (K8s native)
+	// 2. Fall back to config.RTC.NodeIP
+	// 3. Fall back to local interface
+	if podIP := os.Getenv("POD_IP"); podIP != "" && net.ParseIP(podIP) != nil {
+		l.node.Ip = podIP
+	} else if conf != nil && !conf.RTC.NodeIP.IsEmpty() {
+		l.node.Ip = conf.RTC.NodeIP.PrimaryIP()
+	} else {
+		return nil, ErrIPNotSet
+	}
+
+	if conf != nil {
+		l.node.Region = conf.Region
 		nsc = &conf.NodeStats
 	}
+
 	l.nodeStats = NewNodeStats(nsc, nowUnix)
 
 	return l, nil

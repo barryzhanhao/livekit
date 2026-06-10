@@ -183,6 +183,26 @@ func (r *StandardRoomAllocator) ValidateCreateRoom(ctx context.Context, roomName
 	return nil
 }
 
+// SelectParticipantNode selects a node for a specific participant in NAT mode.
+// Unlike SelectRoomNode (which assigns a room to a single node), this allows
+// participants in the same room to be distributed across multiple nodes.
+// The selector tries to balance load across available nodes.
+func (r *StandardRoomAllocator) SelectParticipantNode(ctx context.Context, roomName livekit.RoomName) (livekit.NodeID, error) {
+	// In NAT mode, each participant can be on a different node.
+	// List all available nodes and pick one based on the configured selector.
+	nodes, err := r.router.ListNodes()
+	if err != nil {
+		return "", err
+	}
+
+	node, err := r.selector.SelectNode(nodes)
+	if err != nil {
+		return "", err
+	}
+
+	return livekit.NodeID(node.Id), nil
+}
+
 func applyDefaultRoomConfig(room *livekit.Room, internal *livekit.RoomInternal, conf *config.RoomConfig) {
 	room.EmptyTimeout = conf.EmptyTimeout
 	room.DepartureTimeout = conf.DepartureTimeout

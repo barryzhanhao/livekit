@@ -151,6 +151,29 @@ type RTCConfig struct {
 
 	// enable rtp stream restart detection for published tracks
 	EnableRTPStreamRestartDetection bool `yaml:"enable_rtp_stream_restart_detection,omitempty"`
+
+	// MediaRelay configures cross-node RTP forwarding for NAT mode.
+	// When enabled, participants in the same room can be on different nodes
+	// and media is forwarded between nodes via internal network.
+	MediaRelay MediaRelayConfig `yaml:"media_relay,omitempty"`
+}
+
+// MediaRelayConfig configures cross-node RTP forwarding for NAT/K8s deployments.
+type MediaRelayConfig struct {
+	// Enabled enables cross-node RTP forwarding. Default true for multi-node (NAT) mode.
+	// When enabled, participants in the same room can be on different nodes
+	// and media is forwarded between nodes via internal network.
+	Enabled bool `yaml:"enabled,omitempty"`
+	// Timeout for establishing a relay connection to another node.
+	Timeout time.Duration `yaml:"timeout,omitempty"`
+	// BufferSize is the size of the RTP packet buffer for relay.
+	BufferSize int `yaml:"buffer_size,omitempty"`
+}
+
+var DefaultMediaRelayConfig = MediaRelayConfig{
+	Enabled:    true,
+	Timeout:    10 * time.Second,
+	BufferSize: 4096,
 }
 
 type TURNServer struct {
@@ -405,6 +428,7 @@ var DefaultConfig = Config{
 			SendSideBWEPacer:          string(pacer.PacerBehaviorNoQueue),
 			SendSideBWE:               sendsidebwe.DefaultSendSideBWEConfig,
 		},
+		MediaRelay: DefaultMediaRelayConfig,
 	},
 	Audio: sfu.DefaultAudioConfig,
 	Video: VideoConfig{
