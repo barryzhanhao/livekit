@@ -190,14 +190,18 @@ func (r *remotePeerConnection) dispatchEvent(msg remotePCMessage) {
 			}
 		}
 	case remotePCOpEventICEGatheringStateChange:
-		if r.onICEGatheringStateChange != nil {
-			var v int
-			if err := json.Unmarshal(msg.Body, &v); err == nil {
-				state := webrtc.ICEGatheringState(v)
+		var v int
+		if err := json.Unmarshal(msg.Body, &v); err == nil {
+			state := webrtc.ICEGatheringState(v)
+			// One-shot mode does not wire onICEGatheringStateChange (the room
+			// never trickles), but GetAnswer still waits on gatheringComplete —
+			// signal it whenever the edge's gathering completes, independent of
+			// the user callback (otherwise a WHIP/one-shot answer hangs forever).
+			if r.onICEGatheringStateChange != nil {
 				r.onICEGatheringStateChange(state)
-				if state == webrtc.ICEGatheringStateComplete {
-					r.gatheringOnce.Do(func() { close(r.gatheringComplete) })
-				}
+			}
+			if state == webrtc.ICEGatheringStateComplete {
+				r.gatheringOnce.Do(func() { close(r.gatheringComplete) })
 			}
 		}
 	case remotePCOpEventICEConnectionStateChange:

@@ -81,6 +81,10 @@ cd test/nat-e2e
 | mute | 发布者对已发布 track 发 `MuteTrack` → 订阅者跨节点看到 `Muted=true` |
 | multitrack | 单发布者同时发布 2 路视频（camera+screen）→ 订阅者自动订阅两路（房主桥接 ≥2 个下行 track） |
 | **single-pc** | 双端 `join_request` 单 PC 模式：NAT 每 participant 只建 1 个远程会话/1 个边缘网关（无 dual-PC 标记），上下行媒体跨节点流转（实测 2KB+） |
+| **whip** | 单 PC one-shot 信令（RFC 9725）：WHIP 客户端 POST `/whip/v1` 提供 SDP → 边缘终止 pion PC → 房间返回带 ICE 的 answer → 连接并发布 VP8（房主日志断言 `"oneShot": true` + up-plane 注册） |
+| manual-subscribe | 订阅者 `AutoSubscribe=false` 加入 → 发布者发布 → 订阅者显式 `UpdateSubscription` → 收包 |
+| participant-name | 发布者更新显示名 `Name` → 订阅者跨节点看到 |
+| room-admin | REST `RoomService` 建房间/列房间/踢人/删房间（跨节点，边缘 HTTP 端点） |
 
 ## 验证结果（真实节点实测，双节点 kind）
 
@@ -90,9 +94,10 @@ SUMMARY: 37 passed, 0 failed
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 8 passed, 0 failed
-  (receive-before-publish / NACK 跨节点 / data / attributes / metadata /
-   mute / multitrack / single-pc，含 single-PC 单会话 NAT split)
+GO-CLIENT SUMMARY: 12 passed, 0 failed
+  (receive-before-publish / NACK / data / attributes / metadata / mute /
+   multitrack / single-pc / whip / manual-subscribe / participant-name /
+   room-admin，含 single-PC 与 one-shot WHIP 单会话 NAT split)
 ```
 
 覆盖的功能：
@@ -142,6 +147,23 @@ GO-CLIENT SUMMARY: 8 passed, 0 failed
   `MediaSectionsRequirement` 上报 `numVideos=0`、客户端永不补齐媒体段。新增
   `adjustNumOutstandingMediaForRemote` + `TransportManager.NoteSubscriberTrackAdded` 在
   `addTrackLocalRemote` 绑定后累加，单 PC 订阅者现在能收到媒体（实测 2KB+）。
+- **WHIP / one-shot 信令打通**（本轮多修复，`remote_transport.go`/`wire.go`/`remote_executor.go`）：
+  - `getPSRPCClientParams` 用节点 ID 作为 psrpc 客户端 ID → 请求元数据 `RemoteID` 是**节点 ID**
+    而非默认随机 `CLI_` 客户端 ID。`StartSession` 用 `RemoteID` 推导 signal 节点做 NAT split，
+    原来 psrpc 请求（WHIP.Create）的 `RemoteID` 是 `CLI_` → `nodeByID` 找不到 → one-shot 会话
+    无法建立。
+  - `dispatchEvent` 的 ICE gathering-complete 信号不再依赖 `onICEGatheringStateChange` 回调：
+    one-shot 模式不挂该回调（不 trickle），但 `GetAnswer` 仍等 `gatheringComplete` → 原来永远
+    挂起（WHIP answer 超时）。
+  - `03-deploy.sh` 改为**每节点 configmap**（`advertise_ip`/`node_ip` 直接写入 YAML）：
+    `LIVEKIT_RTC_ADVERTISE_IP` 环境变量无法绑定 `NodeIP` 结构体配置字段（cli 字符串→struct
+    转换失败），留下空值 → 边缘 PC 回退 `DefaultStunServers`（kind 内不可达 → 10s srflx 收集
+    拖垮 one-shot answer）。bake 进 YAML 后边缘只收集 host 候选、即时完成。
+  - WHIP 客户端在 `GatheringCompletePromise` 后发送 `LocalDescription()`（含已收集候选），
+    否则 offer 缺候选 → ICE 无法连通。
+- **VP9/AV1 跨节点（已知限制）**：test/client 的假 RTP 负载不触发边缘网关的 `OnTrack`
+  （边缘 `FireOnTrackBeforeFirstRTP` 关闭），故 VP9/AV1 上行媒体面无法用合成媒体建立。真实
+  编码器客户端（VP8/Opus/H264）已被其余场景覆盖；VP9/AV1 路径留待真实客户端验证。
 - **可复现部署**（`03-deploy.sh`）：新增 `kubectl rollout restart`（镜像 tag 不变时重跑也能滚动到
   新二进制）+ `kubectl rollout status`（`kubectl wait` 会匹配 Recreate 滚动中被删除的旧 pod，
   导致 room 不滚动）；`02-build-image.sh`/`06-client-e2e.sh` 修正 `REPO_ROOT` 层级（`../../..` → `../..`）。

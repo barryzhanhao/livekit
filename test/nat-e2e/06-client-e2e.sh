@@ -117,5 +117,36 @@ else
   FAIL=$((FAIL+1))
 fi
 
+# manual-subscribe: AutoSubscribe=false + explicit UpdateSubscription
+if run_scenario manual-subscribe yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# participant-name: display-name update broadcast cross-node
+if run_scenario participant-name yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# room-admin: REST RoomService create/list/kick/delete cross-node
+if run_scenario room-admin yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# whip: one-shot signalling (RFC 9725) ingest over /whip/v1. Client asserts media
+# flows to a WS subscriber; the room logs must show UseOneShotSignallingMode
+# ("oneShot": true) and the WHIP publisher's up-plane registered.
+ROOM_WHIP="${ROOM_GO}-whip"
+seed_room_map "$ROOM_WHIP"
+if run_scenario whip yes "$ROOM_WHIP"; then
+  if wait_log room '"oneShot": true' 40; then
+    n="$(room_logs --since=3m | grep "$ROOM_WHIP" | grep -c 'nat up track receiver registered' || true)"
+    n="${n:-0}"
+    if [ "$n" -ge 1 ]; then
+      echo "  ✓ WHIP: one-shot session + up-plane registered (up receivers=$n)"
+      PASS=$((PASS+1))
+    else
+      echo "  ✗ WHIP: one-shot session but no up-plane for the WHIP publisher"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ✗ WHIP: room logs did not show one-shot mode"; FAIL=$((FAIL+1))
+  fi
+else
+  FAIL=$((FAIL+1))
+fi
+
 echo "==== GO-CLIENT SUMMARY: $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]

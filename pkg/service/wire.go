@@ -275,8 +275,14 @@ func getPSRPCConfig(config *config.Config) rpc.PSRPCConfig {
 	return config.PSRPC
 }
 
-func getPSRPCClientParams(config rpc.PSRPCConfig, bus psrpc.MessageBus) rpc.ClientParams {
+func getPSRPCClientParams(nodeID livekit.NodeID, config rpc.PSRPCConfig, bus psrpc.MessageBus) rpc.ClientParams {
+	// Use the node ID as the psrpc client ID so request metadata's RemoteID is
+	// the NODE id (not the default random CLI_ client id). StartSession relies on
+	// RemoteID to identify the signal node for the NAT split (media follows
+	// signaling); without this, psrpc-initiated sessions (WHIP/one-shot) resolve
+	// a nonexistent node and the split never establishes.
 	return rpc.NewClientParams(config, bus, logger.GetLogger(), rpc.PSRPCMetricsObserver{},
+		psrpc.WithClientID(string(nodeID)),
 		otelpsrpc.ClientOptions(otelpsrpc.Config{}),
 	)
 }

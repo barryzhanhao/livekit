@@ -9,15 +9,20 @@
 // Usage (built by 06-client-e2e.sh):
 //
 //	nat-client -url ws://<edge-ip>:7880 -api-key devkey -api-secret secret \
-//	           -room nat-go -scenario <receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack>
+//	           -room nat-go -scenario <receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name>
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"time"
 
+	"github.com/pion/webrtc/v4"
+	"github.com/twitchtv/twirp"
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
 
@@ -26,6 +31,12 @@ import (
 )
 
 func boolPtr(b bool) *bool { return &b }
+
+func mustParseURL(raw string) *url.URL {
+	u, err := url.Parse(raw)
+	must(err)
+	return u
+}
 
 func must(err error) {
 	if err != nil {
@@ -260,6 +271,222 @@ func scenarioMultitrack(url, apiKey, apiSecret, room string) {
 	fmt.Println("MULTITRACK: PASS (2 tracks published; subscriber received", sub.BytesReceived(), "bytes)")
 }
 
+// scenarioWhip: a WHIP (one-shot signalling) publisher ingests video over
+// /whip/v1 (RFC 9725); a normal WS subscriber must receive its track cross-node.
+// On the server this exercises UseOneShotSignallingMode — one control channel +
+// one edge gateway session, ICE gathered before the answer (asserted via room
+// logs "oneShot": true in 06-client-e2e.sh).
+func scenarioWhip(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-whip-sub")
+	waitConnected(sub)
+
+	httpBase := "http://" + mustParseURL(url).Host
+	done := make(chan error, 1)
+	go func() {
+		done <- whipPublish(httpBase, token(apiKey, apiSecret, room, "go-whip-pub"), room, "go-whip-pub", 25*time.Second)
+	}()
+
+	// The subscriber must observe the WHIP publisher's track and receive media.
+	if err := waitRemoteTrackCount(sub, 1, 20*time.Second); err != nil {
+		select {
+		case perr := <-done:
+			fmt.Println("WHIP: publisher error:", perr)
+		default:
+		}
+		fmt.Println("WHIP: FAIL subscriber never saw the WHIP track", err)
+		os.Exit(1)
+	}
+	if err := waitBytes(sub, 4096, 30*time.Second); err != nil {
+		fmt.Println("WHIP: FAIL no media from WHIP publisher", err)
+		os.Exit(1)
+	}
+	if err := <-done; err != nil {
+		fmt.Println("WHIP: FAIL publisher error", err)
+		os.Exit(1)
+	}
+	fmt.Println("WHIP: PASS (one-shot publish; subscriber received", sub.BytesReceived(), "bytes)")
+}
+
+// scenarioCodecs: publish VP9 and AV1 tracks cross-node; the room must register
+// up receivers with those MIME types (covered beyond the usual VP8/H264/Opus).
+// NOTE: kept out of the automated suite — the test client's fake RTP does not
+// carry a payload type that triggers the edge gateway's OnTrack for VP9/AV1
+// (FireOnTrackBeforeFirstRTP is off on the edge), so the up-plane never
+// establishes with synthetic media. Documented in the README; real-encoder
+// clients (pion's VP8/Opus) are covered by other scenarios.
+func scenarioCodecs(url, apiKey, apiSecret, room string) {
+	pub := newClient(url, apiKey, apiSecret, room, "go-codec-pub")
+	waitConnected(pub)
+	sub := newClient(url, apiKey, apiSecret, room, "go-codec-sub")
+	waitConnected(sub)
+
+	w1, err := pub.AddStaticTrackWithCodec(webrtc.RTPCodecCapability{MimeType: "video/vp9"}, "vp9", "camera")
+	must(err)
+	defer w1.Stop()
+	w2, err := pub.AddStaticTrackWithCodec(webrtc.RTPCodecCapability{MimeType: "video/av1"}, "av1", "camera")
+	must(err)
+	defer w2.Stop()
+
+	if err := waitRemoteTrackCount(sub, 2, 20*time.Second); err != nil {
+		fmt.Println("CODECS: FAIL subscriber did not see both tracks", err)
+		os.Exit(1)
+	}
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("CODECS: FAIL no media received", err)
+		os.Exit(1)
+	}
+	fmt.Println("CODECS: PASS (VP9 + AV1 published; subscriber received", sub.BytesReceived(), "bytes)")
+}
+
+// scenarioManualSubscribe: subscriber joins with AutoSubscribe=false, the
+// publisher publishes, and the subscriber explicitly subscribes to the track
+// (UpdateSubscription), then receives media.
+func scenarioManualSubscribe(url, apiKey, apiSecret, room string) {
+	opts := &testclient.Options{AutoSubscribe: false}
+	conn, err := testclient.NewWebSocketConn(url, token(apiKey, apiSecret, room, "go-manual-sub"), opts)
+	must(err)
+	sub, err := testclient.NewRTCClient(conn, false, opts)
+	must(err)
+	go sub.Run()
+	waitConnected(sub)
+
+	pub := newClient(url, apiKey, apiSecret, room, "go-manual-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	// AutoSubscribe=false: the subscriber must NOT auto-receive; find the track
+	// and subscribe explicitly.
+	if err := waitRemoteTrack(sub, 20*time.Second); err != nil {
+		fmt.Println("MANUAL_SUBSCRIBE: FAIL no remote track visible", err)
+		os.Exit(1)
+	}
+	var trackSid string
+	for _, p := range sub.RemoteParticipants() {
+		for _, t := range p.Tracks {
+			trackSid = t.Sid
+		}
+	}
+	must(sub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_Subscription{
+			Subscription: &livekit.UpdateSubscription{
+				TrackSids: []string{trackSid},
+				Subscribe: true,
+			},
+		},
+	}))
+
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("MANUAL_SUBSCRIBE: FAIL no media after explicit subscribe", err)
+		os.Exit(1)
+	}
+	fmt.Println("MANUAL_SUBSCRIBE: PASS (explicit subscription delivered", sub.BytesReceived(), "bytes)")
+}
+
+// scenarioParticipantName: the publisher updates its display name; the
+// subscriber must observe it via the participant broadcast cross-node.
+func scenarioParticipantName(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-name-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-name-pub")
+	waitConnected(pub)
+
+	name := fmt.Sprintf("nat-e2e-name-%d", time.Now().Unix())
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_UpdateMetadata{
+			UpdateMetadata: &livekit.UpdateParticipantMetadata{Name: name},
+		},
+	}))
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, p := range sub.RemoteParticipants() {
+			if p.Name == name {
+				fmt.Println("PARTICIPANT_NAME: PASS (subscriber saw updated name)")
+				return
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	fmt.Println("PARTICIPANT_NAME: FAIL subscriber never saw the name update")
+	os.Exit(1)
+}
+
+// scenarioRoomAdmin: exercises the REST RoomService API (admin): create a room,
+// list rooms, two clients join, kick one participant (admin), and delete the
+// room — all cross-node through the edge's HTTP endpoint.
+func scenarioRoomAdmin(url, apiKey, apiSecret, room string) {
+	httpBase := "http://" + mustParseURL(url).Host
+	rmc := livekit.NewRoomServiceJSONClient(httpBase, &http.Client{})
+
+	adminCtx := func() context.Context {
+		at := auth.NewAccessToken(apiKey, apiSecret)
+		at.AddGrant(&auth.VideoGrant{RoomCreate: true, RoomList: true, RoomAdmin: true, Room: room})
+		t, err := at.ToJWT()
+		must(err)
+		header := make(http.Header)
+		testclient.SetAuthorizationToken(header, t)
+		ctx, err := twirp.WithHTTPRequestHeaders(context.Background(), header)
+		must(err)
+		return ctx
+	}
+
+	// create the room
+	_, err := rmc.CreateRoom(adminCtx(), &livekit.CreateRoomRequest{Name: room})
+	if err != nil {
+		fmt.Println("ROOM_ADMIN: FAIL create room", err)
+		os.Exit(1)
+	}
+
+	// two clients join (via WS, dual-PC)
+	pub := newClient(url, apiKey, apiSecret, room, "go-admin-pub")
+	waitConnected(pub)
+	sub := newClient(url, apiKey, apiSecret, room, "go-admin-sub")
+	waitConnected(sub)
+
+	// list rooms: the created room must be present with 2 participants
+	found := false
+	for range 10 {
+		res, err := rmc.ListRooms(adminCtx(), &livekit.ListRoomsRequest{})
+		must(err)
+		for _, r := range res.Rooms {
+			if r.Name == room {
+				found = true
+				if r.NumParticipants >= 2 {
+					break
+				}
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !found {
+		fmt.Println("ROOM_ADMIN: FAIL room not listed with participants")
+		os.Exit(1)
+	}
+
+	// admin kicks the subscriber
+	_, err = rmc.RemoveParticipant(adminCtx(), &livekit.RoomParticipantIdentity{
+		Room: room, Identity: "go-admin-sub",
+	})
+	if err != nil {
+		fmt.Println("ROOM_ADMIN: FAIL kick", err)
+		os.Exit(1)
+	}
+	time.Sleep(2 * time.Second)
+
+	// delete the room
+	_, err = rmc.DeleteRoom(adminCtx(), &livekit.DeleteRoomRequest{Room: room})
+	if err != nil {
+		fmt.Println("ROOM_ADMIN: FAIL delete room", err)
+		os.Exit(1)
+	}
+	fmt.Println("ROOM_ADMIN: PASS (create/list/kick/delete via RoomService REST)")
+}
+
 // scenarioReceiveBeforePublish: subscriber joins an empty room, then the publisher
 // joins and publishes. The subscriber must auto-subscribe to the new track.
 func scenarioReceiveBeforePublish(url, apiKey, apiSecret, room string) {
@@ -385,6 +612,14 @@ func main() {
 		scenarioMute(*url, *apiKey, *apiSecret, *room)
 	case "multitrack":
 		scenarioMultitrack(*url, *apiKey, *apiSecret, *room)
+	case "whip":
+		scenarioWhip(*url, *apiKey, *apiSecret, *room)
+	case "manual-subscribe":
+		scenarioManualSubscribe(*url, *apiKey, *apiSecret, *room)
+	case "participant-name":
+		scenarioParticipantName(*url, *apiKey, *apiSecret, *room)
+	case "room-admin":
+		scenarioRoomAdmin(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

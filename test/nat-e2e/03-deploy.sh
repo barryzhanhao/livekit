@@ -21,8 +21,22 @@ wait_for "redis running" 120 kubectl get deploy/redis -o jsonpath='{.status.read
 # node IDs behind; stable IDs below prevent future duplicates).
 kubectl exec deploy/redis -- redis-cli DEL nodes room_node_map >/dev/null 2>&1 || true
 
-# ---- server config configmap ----
-kubectl create configmap nat-config --from-file=config.yaml="$DIR/configs/config.yaml" --dry-run=client -o yaml | kubectl apply -f -
+# ---- server config configmaps (per-node: advertise_ip/node_ip baked in) ----
+# NOTE: LIVEKIT_RTC_ADVERTISE_IP / LIVEKIT_RTC_NODE_IP env vars do NOT bind to the
+# NodeIP struct config type (cli string->struct conversion fails), leaving them
+# empty and making the edge fall back to DefaultStunServers (unreachable in kind ->
+# 10s srflx gather that stalls one-shot/WHIP answers). Bake the IPs into the
+# configmap instead.
+gen_node_config() { # gen_node_config <node-ip>
+  local ip="$1"
+  sed -E "s/^  (advertise_ip|node_ip):.*/  \1: $ip/" "$DIR/configs/config.yaml"
+}
+for role_ip in "edge:$EDGE_IP" "room:$ROOM_IP"; do
+  role="${role_ip%%:*}"; ip="${role_ip##*:}"
+  kubectl create configmap "nat-config-$role" \
+    --from-file=config.yaml=<(gen_node_config "$ip") \
+    --dry-run=client -o yaml | kubectl apply -f -
+done
 
 # ---- server deployments (hostNetwork => pod IP == node IP; advertise_ip = node IP) ----
 gen_server_deploy() { # gen_server_deploy <name> <nat-role> <node-ip>
@@ -53,7 +67,6 @@ spec:
           args: ["--config", "/etc/livekit/config.yaml"]
           env:
             - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
-            - {name: LIVEKIT_RTC_ADVERTISE_IP, value: "$ip"}
             - {name: LIVEKIT_REGION, value: "$role"}
             - {name: LIVEKIT_NODE_ID, value: "node-$name"}
           ports:
@@ -69,7 +82,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: nat-config
+            name: nat-config-$name
             items:
               - {key: config.yaml, path: config.yaml}
 EOF

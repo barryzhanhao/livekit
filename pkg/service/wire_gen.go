@@ -50,7 +50,7 @@ func InitializeServer(conf *config.Config, currentNode routing.LocalNode) (*Live
 		return nil, err
 	}
 	psrpcConfig := getPSRPCConfig(conf)
-	clientParams := getPSRPCClientParams(psrpcConfig, messageBus)
+	clientParams := getPSRPCClientParams(nodeID, psrpcConfig, messageBus)
 	roomConfig := getRoomConfig(conf)
 	roomManagerClient, err := routing.NewRoomManagerClient(clientParams, roomConfig)
 	if err != nil {
@@ -175,7 +175,7 @@ func InitializeRouter(conf *config.Config, currentNode routing.LocalNode) (routi
 		return nil, err
 	}
 	psrpcConfig := getPSRPCConfig(conf)
-	clientParams := getPSRPCClientParams(psrpcConfig, messageBus)
+	clientParams := getPSRPCClientParams(nodeID, psrpcConfig, messageBus)
 	roomConfig := getRoomConfig(conf)
 	roomManagerClient, err := routing.NewRoomManagerClient(clientParams, roomConfig)
 	if err != nil {
@@ -335,8 +335,12 @@ func getPSRPCConfig(config2 *config.Config) rpc.PSRPCConfig {
 	return config2.PSRPC
 }
 
-func getPSRPCClientParams(config2 rpc.PSRPCConfig, bus psrpc.MessageBus) rpc.ClientParams {
-	return rpc.NewClientParams(config2, bus, logger.GetLogger(), rpc.PSRPCMetricsObserver{}, otelpsrpc.ClientOptions(otelpsrpc.Config{}))
+func getPSRPCClientParams(nodeID livekit.NodeID, config2 rpc.PSRPCConfig, bus psrpc.MessageBus) rpc.ClientParams {
+	// node ID as psrpc client ID so request RemoteID = node (NAT split's
+	// signal-node resolution, incl. psrpc-initiated WHIP/one-shot sessions).
+	return rpc.NewClientParams(config2, bus, logger.GetLogger(), rpc.PSRPCMetricsObserver{},
+		psrpc.WithClientID(string(nodeID)),
+		otelpsrpc.ClientOptions(otelpsrpc.Config{}))
 }
 
 func createForwardStats(conf *config.Config) *sfu.ForwardStats {
