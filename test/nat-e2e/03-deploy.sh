@@ -83,8 +83,10 @@ gen_server_deploy room room "$ROOM_IP" | kubectl apply -f -
 kubectl rollout restart deploy/livekit-edge deploy/livekit-room -n "$NAMESPACE"
 
 log "waiting for both server pods Ready..."
-kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=edge -n "$NAMESPACE" --timeout=180s
-kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=room -n "$NAMESPACE" --timeout=180s
+# rollout status waits for the NEW ReplicaSet (unlike `kubectl wait`, which can
+# match the old pod still terminating after a Recreate rollout).
+kubectl rollout status deploy/livekit-edge -n "$NAMESPACE" --timeout=180s
+kubectl rollout status deploy/livekit-room -n "$NAMESPACE" --timeout=180s
 
 log "waiting for both nodes registered in redis..."
 wait_for "both nodes registered" 120 sh -c 'kubectl exec deploy/redis -- redis-cli --raw HLEN nodes | grep -qx 2'

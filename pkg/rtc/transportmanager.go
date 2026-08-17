@@ -585,6 +585,20 @@ func (t *TransportManager) NegotiateSubscriber(force bool) {
 	}
 }
 
+// NoteSubscriberTrackAdded records a subscriber (down) track that was added in
+// NAT mode without a local transceiver (the edge node holds the real one). It
+// bumps the outstanding-media counter on the transport that would negotiate it,
+// so a single-PC renegotiation asks the client for the right number of media
+// sections. In dual-PC mode the subscriber transport offers directly, but the
+// counter is harmless there and kept consistent.
+func (t *TransportManager) NoteSubscriberTrackAdded(kind webrtc.RTPCodecType) {
+	if t.subscriber != nil {
+		t.subscriber.adjustNumOutstandingMediaForRemote(kind)
+	} else {
+		t.publisher.adjustNumOutstandingMediaForRemote(kind)
+	}
+}
+
 func (t *TransportManager) HandleClientReconnect(reason livekit.ReconnectReason) {
 	var (
 		isShort              bool

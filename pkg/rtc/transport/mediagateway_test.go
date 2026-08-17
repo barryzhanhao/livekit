@@ -91,3 +91,62 @@ func TestMediaGatewayRemoveAndClose(t *testing.T) {
 	ch2, _ := NewLocalMediaChannelPair(10)
 	require.ErrorIs(t, g.AddSubscriberTrack("track-4", codec, ch2), ErrMediaChannelClosed)
 }
+
+// TestMediaGatewayDuplicateSubscriberTrackClosesChannel verifies the duplicate-
+// attach guard: a second MediaChannel for the same track must be closed (not
+// leaked) so the room side's pump unblocks and no redundant TCP connection
+// lingers, while the first channel keeps owning the bridge.
+func TestMediaGatewayDuplicateSubscriberTrackClosesChannel(t *testing.T) {
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	require.NoError(t, err)
+	defer pc.Close()
+
+	g := NewMediaGateway(pc)
+	defer g.Close()
+
+	codec := webrtc.RTPCodecCapability{MimeType: "video/vp8", ClockRate: 90000}
+
+	ch1, _ := NewLocalMediaChannelPair(10)
+	require.NoError(t, g.AddSubscriberTrack("track-dup", codec, ch1))
+
+	// Duplicate attach with a new channel: the first channel owns the bridge.
+	ch2, peer2 := NewLocalMediaChannelPair(10)
+	require.NoError(t, g.AddSubscriberTrack("track-dup", codec, ch2))
+
+	// ch2 was closed -> its peer end is unusable (not leaked).
+	require.ErrorIs(t, peer2.WriteRTP([]byte{0x01}), ErrMediaChannelClosed)
+
+	// The bridge is intact: exactly one sender and the original channel registered.
+	require.Len(t, pc.GetSenders(), 1)
+	g.mu.RLock()
+	_, ok := g.downTracks["track-dup"]
+	g.mu.RUnlock()
+	require.True(t, ok)
+}
+
+// TestMediaGatewayDuplicatePublisherTrackClosesChannel is the up-direction
+// counterpart of the subscriber duplicate-attach guard.
+func TestMediaGatewayDuplicatePublisherTrackClosesChannel(t *testing.T) {
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	require.NoError(t, err)
+	defer pc.Close()
+
+	g := NewMediaGateway(pc)
+	defer g.Close()
+
+	pkt := testPacket(t, 300, 0x1234abcd, []byte{0xaa, 0xbb})
+	r := &fakeRTPReader{packets: []*rtp.Packet{pkt}}
+
+	ch1, _ := NewLocalMediaChannelPair(10)
+	require.NoError(t, g.AddPublisherTrack("track-dup-up", r, ch1))
+
+	ch2, peer2 := NewLocalMediaChannelPair(10)
+	require.NoError(t, g.AddPublisherTrack("track-dup-up", r, ch2))
+
+	require.ErrorIs(t, peer2.WriteRTP([]byte{0x01}), ErrMediaChannelClosed)
+
+	g.mu.RLock()
+	_, ok := g.upTracks["track-dup-up"]
+	g.mu.RUnlock()
+	require.True(t, ok)
+}

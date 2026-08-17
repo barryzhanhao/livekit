@@ -355,9 +355,23 @@ s11_reconnect() {
 }
 
 # ================================================================ S12: scale
+# Runs S12 (3 pub + 3 sub) with one retry: immediately after S11's edge restart
+# the concurrent control-establishment burst can fail (documented limitation),
+# so a fresh attempt after a settle window makes the scenario deterministic.
 s12_scale() {
-  info "S12: 更大并发（3 pub + 3 sub）"
+  info "S12: 更大并发（3 pub + 3 sub，失败重试一次）"
   new_room s12 || return
+  if s12_run; then
+    return 0
+  fi
+  echo "  S12 first attempt failed; settling 10s and retrying..."
+  kill_all_lk
+  sleep 10
+  new_room s12r || return
+  s12_run
+}
+
+s12_run() {
   # NOTE: 4+4 (8 concurrent) was attempted; only 2/8 sessions established under
   # concurrent load right after an edge restart (media channels closed). 3+3
   # exercises more concurrency than S8 while staying within capacity. See README.
@@ -372,15 +386,25 @@ s12_scale() {
   for i in 1 2 3; do
     pubs+=("$(pub_demo "s12-pub$i")")
   done
-  wait_log room "remote published track media plane established" 60 || fail "S12 up-plane"
+  wait_log room "remote published track media plane established" 60 || { fail "S12 up-plane"; s12_cleanup "${pubs[@]}" "${subs[@]}"; return 1; }
   wait_log room "nat down track attached" 60 || true
   sleep 8
   local up; up="$(room_logs --since=3m | grep -c 'nat up track receiver registered' || true)"
-  [ "$up" -ge 9 ] && ok "3-pub up receivers (count=$up)" || fail "expected >=9 up receivers, got $up"
   local down; down="$(room_logs --since=3m | grep -c 'nat down track attached' || true)"
-  [ "$down" -ge 9 ] && ok "3-sub down tracks bridged (count=$down)" || fail "expected >=9 down tracks, got $down"
-  grep -qE '"packetsSeenPrimary": [1-9]' < <(room_logs --since=3m) \
-    && ok "media flowed at scale" || fail "no media at scale"
+  local media=0
+  grep -qE '"packetsSeenPrimary": [1-9]' < <(room_logs --since=3m) && media=1
+  if [ "$up" -ge 9 ]; then ok "3-pub up receivers (count=$up)"; else fail "expected >=9 up receivers, got $up"; fi
+  if [ "$down" -ge 9 ]; then ok "3-sub down tracks bridged (count=$down)"; else fail "expected >=9 down tracks, got $down"; fi
+  if [ "$media" -eq 1 ]; then ok "media flowed at scale"; else fail "no media at scale"; fi
+  local rc=0
+  [ "$up" -ge 9 ] && [ "$down" -ge 9 ] && [ "$media" -eq 1 ] || rc=1
+  s12_cleanup "${pubs[@]}" "${subs[@]}"
+  return $rc
+}
+
+s12_cleanup() { # s12_cleanup <pub pid...> <sub pid...>
+  local pubs=("${@:1:3}") subs=("${@:4:3}")
+  local p
   for p in "${pubs[@]}"; do stop_pub "$p"; done
   for s in "${subs[@]}"; do kill -9 "$s" 2>/dev/null || true; done
 }

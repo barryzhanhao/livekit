@@ -4229,6 +4229,13 @@ func (p *ParticipantImpl) addTrackLocalRemote(trackLocal webrtc.TrackLocal) (*we
 		return nil, nil, err
 	}
 	p.params.Logger.Infow("nat down track attached (room -> edge)", "trackID", trackLocal.ID(), "ssrc", ssrc, "codec", hello.Codec.MimeType)
+	// In remote mode there is no local transceiver to bump the transport's
+	// outstanding-media counter; record the track so a single-PC renegotiation
+	// requests the media section from the client (see TransportManager.
+	// NoteSubscriberTrackAdded).
+	if p.TransportManager != nil {
+		p.TransportManager.NoteSubscriberTrackAdded(downTrack.Kind())
+	}
 	// Forward RTCP feedback (NACK/PLI/SR/RR) from the edge node back to the
 	// DownTrack (down-direction RTCP, NAT mode).
 	go func() {

@@ -117,3 +117,59 @@ func TestRemotePeerConnectionEventDispatch(t *testing.T) {
 		t.Fatal("timed out waiting for connection state event")
 	}
 }
+
+// TestRemotePeerConnectionRequestTimeout verifies the round-trip backstop: a
+// wedged edge (no response on the control channel) must fail the request after
+// the timeout instead of blocking the room-side negotiation forever.
+func TestRemotePeerConnectionRequestTimeout(t *testing.T) {
+	a, _ := transport.NewLocalControlChannelPair(10)
+	defer a.Close()
+
+	// No executor on the peer end: requests are never answered.
+	r := NewRemotePeerConnection(a)
+	defer r.Close()
+
+	old := remotePCRequestTimeout
+	remotePCRequestTimeout = 100 * time.Millisecond
+	defer func() { remotePCRequestTimeout = old }()
+
+	start := time.Now()
+	_, err := r.CreateAnswer(nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "timed out")
+	// Fails promptly, far below the production 15s ceiling.
+	require.Less(t, time.Since(start), 5*time.Second)
+
+	// The pending entry is cleaned up so no stale state accumulates.
+	r.mu.Lock()
+	require.Len(t, r.pending, 0)
+	r.mu.Unlock()
+}
+
+// TestRemotePeerConnectionCloseUnblocksRequests verifies that when the control
+// channel dies while a request is in flight, the pending request is resolved
+// with a closed error instead of hanging (the channel-close teardown path used
+// when a participant leaves / the edge restarts).
+func TestRemotePeerConnectionCloseUnblocksRequests(t *testing.T) {
+	a, b := transport.NewLocalControlChannelPair(10)
+
+	// No executor; close the peer end while a request is in flight.
+	r := NewRemotePeerConnection(a)
+	defer r.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.CreateAnswer(nil)
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // let the request send and block
+	_ = b.Close()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		require.ErrorIs(t, err, transport.ErrMediaChannelClosed)
+	case <-time.After(3 * time.Second):
+		t.Fatal("request did not unblock after channel close")
+	}
+}

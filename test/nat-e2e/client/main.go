@@ -9,7 +9,7 @@
 // Usage (built by 06-client-e2e.sh):
 //
 //	nat-client -url ws://<edge-ip>:7880 -api-key devkey -api-secret secret \
-//	           -room nat-go -scenario <receive-before-publish|nack|data|attributes>
+//	           -room nat-go -scenario <receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack>
 package main
 
 import (
@@ -46,10 +46,25 @@ func token(apiKey, apiSecret, room, identity string) string {
 
 // newClient connects to the edge WS and starts the RTC session (dual-PC mode).
 func newClient(wsURL, apiKey, apiSecret, room, identity string) *testclient.RTCClient {
-	opts := &testclient.Options{AutoSubscribe: true}
+	return newRTCClient(wsURL, apiKey, apiSecret, room, identity, false)
+}
+
+// newSinglePCClient connects in single-PC mode: the WS URL carries a
+// join_request (v1 protocol), which makes the server use UseSinglePeerConnection.
+// In NAT mode this exercises a distinct path: ONE control channel + ONE edge
+// gateway session per participant (instead of the dual-PC publisher+subscriber
+// pair). The room-side assertions live in 06-client-e2e.sh.
+func newSinglePCClient(wsURL, apiKey, apiSecret, room, identity string) *testclient.RTCClient {
+	return newRTCClient(wsURL, apiKey, apiSecret, room, identity, true)
+}
+
+func newRTCClient(wsURL, apiKey, apiSecret, room, identity string, singlePC bool) *testclient.RTCClient {
+	// singlePC: the WS URL must carry a join_request (v1 protocol) for the server
+	// to enable UseSinglePeerConnection; NewRTCClient's flag alone does not add it.
+	opts := &testclient.Options{AutoSubscribe: true, UseJoinRequestQueryParam: singlePC}
 	conn, err := testclient.NewWebSocketConn(wsURL, token(apiKey, apiSecret, room, identity), opts)
 	must(err)
-	c, err := testclient.NewRTCClient(conn, false /* dual-PC */, opts)
+	c, err := testclient.NewRTCClient(conn, singlePC, opts)
 	must(err)
 	go c.Run() // Run blocks (signal read loop); drive it in a goroutine like the official harness
 	return c
@@ -84,6 +99,165 @@ func waitRemoteTrack(c *testclient.RTCClient, timeout time.Duration) error {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("timed out: no remote tracks")
+}
+
+// waitRemoteTrackCount polls until the client observes n published remote tracks
+// (across all remote participants).
+func waitRemoteTrackCount(c *testclient.RTCClient, n int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		total := 0
+		for _, p := range c.RemoteParticipants() {
+			total += len(p.Tracks)
+		}
+		if total >= n {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out: observed %d remote tracks, want >=%d", countRemoteTracks(c), n)
+}
+
+func countRemoteTracks(c *testclient.RTCClient) int {
+	total := 0
+	for _, p := range c.RemoteParticipants() {
+		total += len(p.Tracks)
+	}
+	return total
+}
+
+// scenarioSinglePC: both peers connect in single-PC mode (join_request).
+// Exercises the NAT single-PC path: one control channel + one edge gateway
+// session per participant, media flowing both directions across nodes.
+func scenarioSinglePC(url, apiKey, apiSecret, room string) {
+	sub := newSinglePCClient(url, apiKey, apiSecret, room, "go-spc-sub")
+	waitConnected(sub)
+	pub := newSinglePCClient(url, apiKey, apiSecret, room, "go-spc-pub")
+	waitConnected(pub)
+
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("SINGLE_PC: FAIL no media received in single-PC mode", err)
+		os.Exit(1)
+	}
+	fmt.Println("SINGLE_PC: PASS (subscriber received", sub.BytesReceived(), "bytes in single-PC mode)")
+}
+
+// scenarioMetadata: update participant metadata on the publisher; the subscriber
+// must observe it via the participant broadcast across nodes.
+func scenarioMetadata(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-meta-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-meta-pub")
+	waitConnected(pub)
+
+	md := fmt.Sprintf("nat-e2e-meta-%d", time.Now().Unix())
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_UpdateMetadata{
+			UpdateMetadata: &livekit.UpdateParticipantMetadata{Metadata: md},
+		},
+	}))
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, p := range sub.RemoteParticipants() {
+			if p.Metadata == md {
+				fmt.Println("METADATA: PASS (subscriber saw updated metadata)")
+				return
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	fmt.Println("METADATA: FAIL subscriber never saw the metadata update")
+	os.Exit(1)
+}
+
+// scenarioMute: publisher mutes its published track; the subscriber must observe
+// the muted flag via the participant broadcast. The track SID is read from the
+// subscriber's remote view (server-assigned TR_*), which is what mute expects.
+func scenarioMute(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-mute-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-mute-pub")
+	waitConnected(pub)
+
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	// wait until the track is visible to the subscriber and capture its SID
+	trackID := ""
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) && trackID == "" {
+		for _, p := range sub.RemoteParticipants() {
+			if p.Identity != "go-mute-pub" {
+				continue
+			}
+			for _, t := range p.Tracks {
+				trackID = t.Sid
+			}
+		}
+		if trackID == "" {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if trackID == "" {
+		fmt.Println("MUTE: FAIL published track never visible to subscriber")
+		os.Exit(1)
+	}
+
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_Mute{
+			Mute: &livekit.MuteTrackRequest{Sid: trackID, Muted: true},
+		},
+	}))
+
+	deadline = time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, p := range sub.RemoteParticipants() {
+			if p.Identity != "go-mute-pub" {
+				continue
+			}
+			for _, t := range p.Tracks {
+				if t.Sid == trackID && t.Muted {
+					fmt.Println("MUTE: PASS (subscriber saw track muted)")
+					return
+				}
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	fmt.Println("MUTE: FAIL subscriber never saw the track muted")
+	os.Exit(1)
+}
+
+// scenarioMultitrack: publish two video tracks (camera + screen-share style);
+// the subscriber must auto-subscribe to both and receive media.
+func scenarioMultitrack(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-mt-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-mt-pub")
+	waitConnected(pub)
+
+	w1, err := pub.AddStaticTrack("video/vp8", "video1", "camera")
+	must(err)
+	defer w1.Stop()
+	w2, err := pub.AddStaticTrack("video/vp8", "video2", "screen")
+	must(err)
+	defer w2.Stop()
+
+	if err := waitRemoteTrackCount(sub, 2, 20*time.Second); err != nil {
+		fmt.Println("MULTITRACK: FAIL", err)
+		os.Exit(1)
+	}
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("MULTITRACK: FAIL no media received", err)
+		os.Exit(1)
+	}
+	fmt.Println("MULTITRACK: PASS (2 tracks published; subscriber received", sub.BytesReceived(), "bytes)")
 }
 
 // scenarioReceiveBeforePublish: subscriber joins an empty room, then the publisher
@@ -203,6 +377,14 @@ func main() {
 		scenarioData(*url, *apiKey, *apiSecret, *room)
 	case "attributes":
 		scenarioAttributes(*url, *apiKey, *apiSecret, *room)
+	case "single-pc":
+		scenarioSinglePC(*url, *apiKey, *apiSecret, *room)
+	case "metadata":
+		scenarioMetadata(*url, *apiKey, *apiSecret, *room)
+	case "mute":
+		scenarioMute(*url, *apiKey, *apiSecret, *room)
+	case "multitrack":
+		scenarioMultitrack(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

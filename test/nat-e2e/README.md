@@ -74,9 +74,13 @@ cd test/nat-e2e
 | 场景 | 验证内容 |
 |---|---|
 | receive-before-publish | 订阅者先入空房间，发布者后加入发布 → 订阅者自动订阅并收包 |
-| **NACK 跨节点** | 订阅者客户端发真 RTCP NACK → 边缘 `pumpSenderRTCPToMediaChannel` → 房主 `DownTrack.ProcessRTCP`（实测边缘转发 6 个 nack 批） |
+| **NACK 跨节点** | 订阅者客户端发真 RTCP NACK → 边缘 `pumpSenderRTCPToMediaChannel` → 房主 `DownTrack.ProcessRTCP`（实测边缘转发 8 个 nack 批） |
 | data | 数据通道消息（当前未跨节点桥接，§6.8 既定暂拆，记录行为） |
 | attributes | 发布者 `SetAttributes` → 房间广播 → 订阅者跨节点看到属性更新 |
+| metadata | 发布者更新 `Metadata` → 订阅者跨节点看到（`UpdateParticipantMetadata` 信号） |
+| mute | 发布者对已发布 track 发 `MuteTrack` → 订阅者跨节点看到 `Muted=true` |
+| multitrack | 单发布者同时发布 2 路视频（camera+screen）→ 订阅者自动订阅两路（房主桥接 ≥2 个下行 track） |
+| **single-pc** | 双端 `join_request` 单 PC 模式：NAT 每 participant 只建 1 个远程会话/1 个边缘网关（无 dual-PC 标记），上下行媒体跨节点流转（实测 2KB+） |
 
 ## 验证结果（真实节点实测，双节点 kind）
 
@@ -86,7 +90,9 @@ SUMMARY: 37 passed, 0 failed
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 4 passed, 0 failed  (含 NACK 跨节点)
+GO-CLIENT SUMMARY: 8 passed, 0 failed
+  (receive-before-publish / NACK 跨节点 / data / attributes / metadata /
+   mute / multitrack / single-pc，含 single-PC 单会话 NAT split)
 ```
 
 覆盖的功能：
@@ -106,8 +112,10 @@ GO-CLIENT SUMMARY: 4 passed, 0 failed  (含 NACK 跨节点)
   `FULL_RECONNECT`）。生产级改进方向：远程 PC 检测到控制通道死亡后主动触发干净的全量重连，
   而非先尝试失败的 resume。
 - **并发容量（8 会话）**：4+4 并发（8 个 participant × 2 会话）实测只建立 2/8（media
-  channel closed + TRANSPORT_FAILURE）。3+3 稳定。生产级改进方向：核查边缘控制 accept 的并发
-  建立与 room 的 establishRemoteSession 背压。
+  channel closed + TRANSPORT_FAILURE）。3+3 稳定。`04-e2e.sh` 的 S12 在 S11 边缘重启后紧跟
+  并发建立偶发失败（同为控制链路并发建立竞态），已内置**一次自动重试**（等 10s 后用新房间
+  重跑）使其确定性通过。生产级改进方向：核查边缘控制 accept 的并发建立与 room 的
+  `establishRemoteSession` 背压。
 - **数据通道消息**：跨节点只转发 SDP 协商（m=application）；DC 数据消息未桥接（§6.8 既定暂拆）。
 - **内网明文**：media_relay 明文 TCP，生产需内网隔离或 TLS（§9）。
 - **瞬时 ICE 抖动**：Go 客户端 `nack` 场景偶发订阅者 ICE/DTLS 10s 超时（`TRANSPORT_FAILURE`），
@@ -129,8 +137,19 @@ GO-CLIENT SUMMARY: 4 passed, 0 failed  (含 NACK 跨节点)
   防止 RR/XR 批次刷屏顶掉 kubectl logs 断言锚点。
 - **S7 拆台断言自洽化**（`04-e2e.sh`）：自建发布者→杀掉→等边缘网关会话关闭与房主 participant
   closing，不再依赖 `--since=10m` 历史日志（原实现偶发时序抖动）。
-- **可复现部署**（`03-deploy.sh`）：新增 `kubectl rollout restart`，镜像 tag 不变时重跑也能滚动到
-  新二进制；`02-build-image.sh`/`06-client-e2e.sh` 修正 `REPO_ROOT` 层级（`../../..` → `../..`）。
+- **单 PC NAT 订阅修复**（`transport.go`/`transportmanager.go`/`participant.go`）：single-PC/one-shot
+  模式下下行 track 在远端（边缘）无本地 transceiver，`numOutstandingVideos` 未累加导致
+  `MediaSectionsRequirement` 上报 `numVideos=0`、客户端永不补齐媒体段。新增
+  `adjustNumOutstandingMediaForRemote` + `TransportManager.NoteSubscriberTrackAdded` 在
+  `addTrackLocalRemote` 绑定后累加，单 PC 订阅者现在能收到媒体（实测 2KB+）。
+- **可复现部署**（`03-deploy.sh`）：新增 `kubectl rollout restart`（镜像 tag 不变时重跑也能滚动到
+  新二进制）+ `kubectl rollout status`（`kubectl wait` 会匹配 Recreate 滚动中被删除的旧 pod，
+  导致 room 不滚动）；`02-build-image.sh`/`06-client-e2e.sh` 修正 `REPO_ROOT` 层级（`../../..` → `../..`）。
+- **单测**（本轮新增 6 个）：`TestRemotePeerConnectionRequestTimeout`（控制通道 15s 超时兜底）、
+  `TestRemotePeerConnectionCloseUnblocksRequests`（通道关闭解阻塞 pending 请求）、
+  `TestMediaChannelRTPWriterPadding`/`TestMediaChannelRTPWriterMalformedPadding`（padding 翻译 +
+  畸形防护）、`TestMediaGatewayDuplicateSubscriberTrackClosesChannel`/
+  `TestMediaGatewayDuplicatePublisherTrackClosesChannel`（重复 attach 关闭冗余通道）。
 
 ## 与上游 LiveKit K8s 部署的对比
 

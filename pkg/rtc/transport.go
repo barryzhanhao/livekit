@@ -2672,6 +2672,22 @@ func (t *PCTransport) adjustNumOutstandingMedia(transceiver *webrtc.RTPTransceiv
 	t.lock.Unlock()
 }
 
+// adjustNumOutstandingMediaForRemote increments the outstanding-media counter
+// for a subscriber track added in NAT mode, where the real transceiver lives on
+// the edge node and no local transceiver exists to bump the counter (as
+// adjustNumOutstandingMedia does). Without it, a single-PC negotiation reports
+// zero unmatched media sections and the client is never asked to add the
+// recvonly transceiver it needs to receive the track.
+func (t *PCTransport) adjustNumOutstandingMediaForRemote(kind webrtc.RTPCodecType) {
+	t.lock.Lock()
+	if kind == webrtc.RTPCodecTypeAudio {
+		t.numOutstandingAudios++
+	} else {
+		t.numOutstandingVideos++
+	}
+	t.lock.Unlock()
+}
+
 func (t *PCTransport) sendUnmatchedMediaRequirement(force bool) error {
 	// if there are unmatched media sections, notify remote peer to generate offer with
 	// enough media section in subsequent offers

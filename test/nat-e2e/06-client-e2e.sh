@@ -19,12 +19,12 @@ seed_room_map "$ROOM_GO"
 echo "building nat-client..."
 go build -o /tmp/nat-client "$DIR/client"
 
-run_scenario() { # run_scenario <name> <expect-exit-zero>
-  local name="$1" expect_zero="$2"
+run_scenario() { # run_scenario <name> <expect-exit-zero> [room]
+  local name="$1" expect_zero="$2" room="${3:-$ROOM_GO}"
   echo "=== $name ==="
   set +e
   /tmp/nat-client -url "$WS_URL" -api-key "$API_KEY" -api-secret "$API_SECRET" \
-    -room "$ROOM_GO" -scenario "$name"
+    -room "$room" -scenario "$name"
   local rc=$?
   set -e
   if [ "$expect_zero" = "yes" ] && [ "$rc" -ne 0 ]; then
@@ -70,6 +70,52 @@ if run_scenario data no; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
 # attributes: broadcast cross-node
 if run_scenario attributes yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# metadata: participant metadata broadcast cross-node
+if run_scenario metadata yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# mute: track mute broadcast cross-node
+if run_scenario mute yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# multitrack: two video tracks from one publisher, subscriber receives both;
+# assert the room bridged >=2 down tracks cross-node.
+if run_scenario multitrack yes; then
+  if wait_log room 'nat down track attached \(room -> edge\)' 40; then
+    n="$(room_logs --since=3m | grep 'go-mt-sub' | grep -c 'nat down track attached (room -> edge)' || true)"
+    n="${n:-0}"
+    if [ "$n" -ge 2 ]; then
+      echo "  ✓ MULTITRACK: go-mt-sub bridged $n down tracks cross-node"; PASS=$((PASS+1))
+    else
+      echo "  ✗ MULTITRACK: only $n down tracks bridged for go-mt-sub (expected >=2)"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ✗ MULTITRACK: no down track bridged"; FAIL=$((FAIL+1))
+  fi
+else
+  FAIL=$((FAIL+1))
+fi
+
+# single-pc: server MUST run single-PC NAT (one control channel + one gateway
+# session per participant). The client asserts media flows; the room logs assert
+# UseSinglePeerConnection was active and NO dual-PC marker appeared for this room.
+ROOM_SPC="${ROOM_GO}-spc"
+seed_room_map "$ROOM_SPC"
+if run_scenario single-pc yes "$ROOM_SPC"; then
+  if wait_log room 'useSinglePC": true' 40; then
+    n="$(room_logs --since=3m | grep "$ROOM_SPC" | grep -c 'remote subscriber peer connection (dual-PC)' || true)"
+    n="${n:-0}"
+    if [ "$n" -eq 0 ]; then
+      echo "  ✓ SINGLE-PC: one session per participant (no dual-PC marker for room)"
+      PASS=$((PASS+1))
+    else
+      echo "  ✗ SINGLE-PC: found $n dual-PC markers, expected 0"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ✗ SINGLE-PC: room logs did not show single-PC mode"; FAIL=$((FAIL+1))
+  fi
+else
+  FAIL=$((FAIL+1))
+fi
 
 echo "==== GO-CLIENT SUMMARY: $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]

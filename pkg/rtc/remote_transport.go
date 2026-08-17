@@ -32,7 +32,8 @@ import (
 // remotePCRequestTimeout bounds a control-channel round-trip. Pion ops on the
 // edge complete in milliseconds; a timeout here only fires when the edge is
 // wedged, so the room's negotiation can fail cleanly instead of hanging.
-const remotePCRequestTimeout = 15 * time.Second
+// A var (not const) so tests can shrink it.
+var remotePCRequestTimeout = 15 * time.Second
 
 // remotePCMessage is the JSON control envelope exchanged over a ControlChannel
 // between the room node (remotePeerConnection) and the edge node (MediaGateway

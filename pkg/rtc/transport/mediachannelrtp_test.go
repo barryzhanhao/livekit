@@ -51,3 +51,68 @@ func TestMediaChannelRTPWriterRoundTrip(t *testing.T) {
 	require.Equal(t, header.SSRC, got.SSRC)
 	require.Equal(t, payload, got.Payload)
 }
+
+// TestMediaChannelRTPWriterPadding verifies the SFU-pacer padding translation:
+// Padding=true with the padding already embedded in the payload (last byte =
+// padding size) must be rewritten so pion Marshal re-adds it cleanly.
+func TestMediaChannelRTPWriterPadding(t *testing.T) {
+	a, b := NewLocalMediaChannelPair(10)
+	defer a.Close()
+	defer b.Close()
+
+	w := NewMediaChannelRTPWriter(a)
+	header := &rtp.Header{
+		Version:        2,
+		PayloadType:    96,
+		SequenceNumber: 12345,
+		Timestamp:      67890,
+		SSRC:           0xdeadbeef,
+		Padding:        true,
+	}
+	// 4 bytes of padding already embedded (0x00 0x00 0x00 0x04 = size byte last).
+	payload := []byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x04}
+
+	_, err := w.WriteRTP(header, payload)
+	require.NoError(t, err)
+
+	raw, err := b.ReadRTP()
+	require.NoError(t, err)
+
+	var got rtp.Packet
+	require.NoError(t, got.Unmarshal(raw))
+	require.True(t, got.Padding)
+	require.Equal(t, uint8(4), got.PaddingSize)
+	require.Equal(t, []byte{0xde, 0xad, 0xbe, 0xef}, got.Payload)
+}
+
+// TestMediaChannelRTPWriterMalformedPadding verifies the malformed-padding guard:
+// a size byte larger than the payload must clear the Padding flag so Marshal
+// succeeds instead of failing with errInvalidRTPPadding for every such packet.
+func TestMediaChannelRTPWriterMalformedPadding(t *testing.T) {
+	a, b := NewLocalMediaChannelPair(10)
+	defer a.Close()
+	defer b.Close()
+
+	w := NewMediaChannelRTPWriter(a)
+	header := &rtp.Header{
+		Version:        2,
+		PayloadType:    96,
+		SequenceNumber: 12345,
+		Timestamp:      67890,
+		SSRC:           0xdeadbeef,
+		Padding:        true,
+	}
+	// Corrupt: the trailing size byte (0xff) claims more padding than exists.
+	payload := []byte{0xde, 0xad, 0xff}
+
+	_, err := w.WriteRTP(header, payload)
+	require.NoError(t, err)
+
+	raw, err := b.ReadRTP()
+	require.NoError(t, err)
+
+	var got rtp.Packet
+	require.NoError(t, got.Unmarshal(raw))
+	require.False(t, got.Padding)
+	require.Equal(t, []byte{0xde, 0xad, 0xff}, got.Payload)
+}
