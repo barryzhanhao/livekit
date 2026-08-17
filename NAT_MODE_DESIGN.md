@@ -31,7 +31,7 @@
 | 3e-2 | 上行 RTCP 跨节点：房主 `AddReceiver` 接受 `onRTCP` 覆盖 → `ch.WriteRTCP`；边缘 `pumpMediaChannelRTCPToPC`（`ch.ReadRTCP`→`pc.WriteRTCP`） | ✅ 接线 |
 | 3e-3 | header extensions 解析：`sfuutils.ExtractHeaderExtensionsFromSDP`（解析 `a=extmap`，从房主 remote description 重建协商扩展，单测绿）+ `handleRemotePublishedTrack` 接入 | ✅ |
 | 3e-4 | dual-PC 双会话：`SubscriberRemoteControlChannel`/`SubscriberRemotePeerConnection` + `StartSession` 为 dual-PC 建 publisher/subscriber 两个远程会话（`IsOfferer` 区分方向） | ✅ 接线 |
-| 验证 | 真节点端到端验证（真实客户端发布/订阅 + 真实 SRTP + 上下行 RTP/RTCP/NACK/PLI） | ⏳ 待做 |
+| 验证 | 真节点端到端验证：双节点 kind K8s 复现套件 `test/nat-e2e/`（20/20 断言绿，含 `--loss 5%` WAN 丢包）。覆盖 NAT split、上下行媒体面（H264 simulcast 30fps 实测）、RTCP 双向、dual-PC、数据通道、质量反馈跨节点 | ✅ |
 | 3e | 订阅/选层/拥塞控制跨节点同步：本架构 SubscriptionManager/dynacast/stream-allocator/pacer 全在房主节点，选层/订阅本就本地决策，无需跨节点同步；跨节点反馈（REMB/NACK/PLI/RR/TWCC）已由 3e-1/3e-2 的 RTCP 通道覆盖 | ✅（剩余即真节点验证） |
 
 ## 1. 目标与范围
