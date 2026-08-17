@@ -24,6 +24,10 @@ export WS_URL
 
 WORK="$(mktemp -d)"
 PUB_SECS=14   # seconds each publisher runs before being killed
+MEDIA_OGG="$WORK/audio.ogg"
+
+# 12s of Opus audio for the audio scenario (video demo is video-only).
+ffmpeg -y -f lavfi -i sine=frequency=440:duration=12 -c:a libopus -vn -f ogg "$MEDIA_OGG" 2>/dev/null || true
 
 # Pin the room to the room node so the NAT split is deterministic. Rooms are
 # cleared (room_node_map deleted) when the room closes, so re-seed every run.
@@ -93,7 +97,7 @@ s2_up_plane() {
   info "S2: 上行媒体面（publisher -> edge -> room SFU buffer）"
   local pid; pid="$(pub_demo s2-pub)"
   wait_log room "remote published track media plane established" 60 || fail "S2 up-plane not established"
-  local up; up="$(room_logs --since=2m | grep -c 'nat up track receiver registered')"
+  local up; up="$(room_logs --since=2m | grep -c 'nat up track receiver registered' || true)"
   [ "$up" -ge 3 ] && ok "simulcast up receivers registered (count=$up)" \
                    || fail "expected >=3 up receivers (simulcast), got $up"
   stop_pub "$pid"
@@ -175,7 +179,7 @@ s5_codecs() {
   info "S5: 多 codec + 数据通道跨节点"
   local pid; pid="$(pub_demo s5-pub)"
   wait_log room "remote published track media plane established" 60 || fail "S5 up-plane"
-  local h264; h264="$(room_logs --since=3m | grep -c 'remote published track media plane established.*H264')"
+  local h264; h264="$(room_logs --since=3m | grep -c 'remote published track media plane established.*H264' || true)"
   [ "$h264" -ge 1 ] && ok "H264 up track across nodes (count=$h264)" || fail "no H264 up track"
   grep -q 'nat edge created data channel' < <(edge_logs --since=3m) \
     && ok "edge created data channels (_reliable/_lossy on subscriber PC)" \
@@ -189,7 +193,7 @@ s6_dualpc() {
   local pid; pid="$(pub_demo s6-pub)"
   wait_log room "nat remote session established" 60 || fail "S6 no session"
   sleep 3
-  local n; n="$(room_logs --since=1m | grep -c 'nat remote session established')"
+  local n; n="$(room_logs --since=1m | grep -c 'nat remote session established' || true)"
   if [ "$n" -ge 2 ]; then
     ok "dual-PC: $n remote sessions (publisher answerer + subscriber offerer)"
   else
@@ -202,21 +206,105 @@ s6_dualpc() {
 s7_teardown() {
   info "S7: 会话拆除"
   sleep 5
-  local gw; gw="$(edge_logs --since=6m | grep -c 'nat edge gateway session closed')"
+  local gw; gw="$(edge_logs --since=6m | grep -c 'nat edge gateway session closed' || true)"
   [ "$gw" -ge 1 ] && ok "edge gateway sessions closed ($gw)" || fail "no gateway session close logged"
-  local up; up="$(room_logs --since=6m | grep -c 'remote published track media plane established')"
+  local up; up="$(room_logs --since=6m | grep -c 'remote published track media plane established' || true)"
   [ "$up" -ge 1 ] && ok "room processed remote published tracks ($up)" || fail "no remote tracks processed"
+}
+
+# ================================================================ S8: concurrency
+s8_concurrency() {
+  info "S8: 并发多 participant（2 pub + 2 sub 跨节点）"
+  lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
+    -r "$ROOM" -i "s8-sub1" --verbose >"$WORK/s8-sub1.log" 2>&1 &
+  local pid1=$!
+  lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
+    -r "$ROOM" -i "s8-sub2" --verbose >"$WORK/s8-sub2.log" 2>&1 &
+  local pid2=$!
+  sleep 3
+
+  local p1; p1="$(pub_demo s8-pub1)"
+  local p2; p2="$(pub_demo s8-pub2)"
+  wait_log room "remote published track media plane established" 40 || fail "S8 up-plane"
+  wait_log room "nat down track attached" 40 || true
+  sleep 5
+
+  local up; up="$(room_logs --since=4m | grep -c 'nat up track receiver registered' || true)"
+  [ "$up" -ge 6 ] && ok "concurrent up receivers (2 pub × simulcast) count=$up" \
+                   || fail "expected >=6 up receivers, got $up"
+  local down; down="$(room_logs --since=4m | grep -c 'nat down track attached' || true)"
+  [ "$down" -ge 4 ] && ok "concurrent down tracks bridged (2 sub × 2 pub video) count=$down" \
+                     || fail "expected >=4 down tracks, got $down"
+  grep -qE '"packetsSeenPrimary": [1-9]' < <(room_logs --since=4m) \
+    && ok "concurrent media flowed (DownTrack forwarding RTP)" \
+    || fail "no media flowed under concurrency"
+
+  stop_pub "$p1"; stop_pub "$p2"
+  kill -9 "$pid1" "$pid2" 2>/dev/null || true
+  wait "$pid1" "$pid2" 2>/dev/null || true
+}
+
+# ================================================================ S9: audio
+s9_audio() {
+  info "S9: 音频跨节点（Opus 上行 + 下行）"
+  lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
+    -r "$ROOM" -i "s9-sub" --verbose >"$WORK/s9-sub.log" 2>&1 &
+  local pid=$!
+  sleep 3
+
+  # publish the generated Opus file (no h26x flag needed for .ogg); exits after it ends
+  lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
+    -r "$ROOM" -i "s9-pub" --publish "$MEDIA_OGG" --exit-after-publish \
+    >"$WORK/s9-pub.log" 2>&1 &
+  local p=$!
+
+  wait_log room "remote published track media plane established" 60 || fail "S9 up-plane"
+  sleep 3
+  local up; up="$(room_logs --since=3m | grep -c 'nat up track receiver registered.*opus' || true)"
+  [ "$up" -ge 1 ] && ok "Opus up receiver registered (count=$up)" || fail "no Opus up receiver"
+  wait_log room "nat down track attached" 60 || true
+  local adown; adown="$(room_logs --since=3m | grep -c 'nat down track attached.*opus' || true)"
+  [ "$adown" -ge 1 ] && ok "Opus down track bridged (count=$adown)" || fail "no Opus down track"
+  grep -qE '"packetsSeenPrimary": [1-9]' < <(room_logs --since=3m) \
+    && ok "audio media flowed (DownTrack forwarded)" || fail "audio media did not flow"
+
+  wait "$p" 2>/dev/null || true
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+# ================================================================ S10: second room
+s10_second_room() {
+  info "S10: 第二个房间独立 split"
+  local room2="${ROOM}-2"
+  seed_room_map "$room2" || { fail "S10 seed failed"; return; }
+
+  lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
+    -r "$room2" -i "s10-pub" --publish-demo --fps 30 >"$WORK/s10-pub.log" 2>&1 &
+  local p=$!
+
+  wait_log room "nat remote session established" 60 \
+    && ok "second room NAT split established" \
+    || fail "second room did not split"
+  wait_log room "remote published track media plane established" 60 \
+    && ok "second room up-plane established" \
+    || fail "second room up-plane not established"
+
+  stop_pub "$p"
 }
 
 # ================================================================ main
 kill_all_lk          # ensure no stale lk processes bloat node logs
-s1_split
-s2_up_plane
-s3_down_plane
-s4_rtcp
-s5_codecs
-s6_dualpc
-s7_teardown
+s1_split;            kill_all_lk
+s2_up_plane;         kill_all_lk
+s3_down_plane;       kill_all_lk
+s4_rtcp;             kill_all_lk
+s5_codecs;           kill_all_lk
+s6_dualpc;           kill_all_lk
+s7_teardown;         kill_all_lk
+s8_concurrency;      kill_all_lk
+s9_audio;            kill_all_lk
+s10_second_room;     kill_all_lk
 
 summary
 echo "logs/work dir: $WORK"

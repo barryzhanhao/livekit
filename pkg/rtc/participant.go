@@ -321,6 +321,8 @@ type ParticipantImpl struct {
 
 	dirty   atomic.Bool
 	version atomic.Uint32
+	// lastUpRTCPLogAt rate-limits the per-track up-RTCP log (bounds log volume).
+	lastUpRTCPLogAt atomic.Int64
 
 	migrateState                atomic.Value // types.MigrateState
 	migratedTracksPublishedFuse core.Fuse
@@ -4350,7 +4352,12 @@ func (p *ParticipantImpl) mediaTrackReceivedRemote(track sfu.TrackRemote, mid st
 		if err != nil {
 			return
 		}
-		p.params.Logger.Infow("nat up RTCP forwarded to edge", "trackID", track.ID(), "ssrc", track.SSRC(), "pkts", len(pkts))
+		// rate-limit: RR/XR batches arrive every few seconds per track; keep the
+		// log bounded so E2E assertion anchors stay in the kubectl logs tail.
+		if time.Now().Unix()-p.lastUpRTCPLogAt.Load() >= 15 {
+			p.lastUpRTCPLogAt.Store(time.Now().Unix())
+			p.params.Logger.Infow("nat up RTCP forwarded to edge", "trackID", track.ID(), "ssrc", track.SSRC(), "pkts", len(pkts))
+		}
 		_ = ch.WriteRTCP(data)
 	}
 	if _, isReceiverAdded := mt.AddReceiver(parameters, track, mid, onRTCP); !isReceiverAdded && newTrack {

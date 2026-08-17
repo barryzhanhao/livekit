@@ -42,6 +42,18 @@ func (w *MediaChannelRTPWriter) WriteRTP(header *rtp.Header, payload []byte) (in
 		Header:  *header,
 		Payload: payload,
 	}
+	// The SFU pacer emits padding-only packets with Header.Padding set and the
+	// padding already embedded in the payload (its last byte is the padding
+	// size). pion's Marshal instead expects a clean payload and appends padding
+	// itself from PaddingSize, and errors if Padding=true with size 0. Translate:
+	// strip the embedded padding from the payload and let Marshal re-add it.
+	if header.Padding && len(payload) > 0 {
+		sz := payload[len(payload)-1]
+		if int(sz) <= len(payload) {
+			pkt.PaddingSize = sz
+			pkt.Payload = payload[:len(payload)-int(sz)]
+		}
+	}
 	buf := make([]byte, pkt.MarshalSize())
 	n, err := pkt.MarshalTo(buf)
 	if err != nil {

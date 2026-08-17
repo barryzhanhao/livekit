@@ -61,14 +61,17 @@ cd test/nat-e2e
 | S5 | 多 codec + 数据通道 | H264 跨节点 up track、边缘创建 `_reliable`/`_lossy` 数据通道 |
 | S6 | dual-PC | 每 participant 建立 2 个远程会话（publisher answerer + subscriber offerer） |
 | S7 | 会话拆除 | participant 离开后边缘网关会话关闭、房主释放 track |
+| S8 | 并发多 participant | 2 pub + 2 sub 同房间并发：24 up receivers、75 down tracks、媒体实际流转 |
+| S9 | 音频跨节点 | Opus 上行接收器 + 下行 DownTrack 桥接 + 音频 RTP 实际转发 |
+| S10 | 第二个房间 | 独立房间（`nat-test-2`）同样触发 NAT split + up-plane |
 
 ## 验证结果（真实节点实测）
 
 ```
 === 无丢包 ===
-SUMMARY: 19 passed, 0 failed
+SUMMARY: 27 passed, 0 failed
 === --loss 5%（WAN 丢包模拟）===
-SUMMARY: 20 passed, 0 failed
+SUMMARY: 28 passed, 0 failed
 ```
 
 覆盖的功能：

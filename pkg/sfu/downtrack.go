@@ -341,6 +341,7 @@ type DownTrack struct {
 
 	upstreamCodecs            []webrtc.RTPCodecParameters
 	codec                     atomic.Value // webrtc.RTPCodecCapability
+	lastRTCPLogAt             atomic.Int64 // rate-limit the cross-node RTCP log
 	clockRate                 uint32
 	negotiatedCodecParameters []webrtc.RTPCodecParameters
 
@@ -2022,11 +2023,19 @@ func (d *DownTrack) getH264BlankFrame(_frameEndNeeded bool) ([]byte, error) {
 // ProcessRTCP feeds RTCP feedback (NACK/PLI/SR/RR) received over the
 // MediaChannel (NAT mode down direction) into the DownTrack's RTCP handling.
 func (d *DownTrack) ProcessRTCP(data []byte) {
-	var codec string
-	if c, ok := d.codec.Load().(webrtc.RTPCodecCapability); ok {
-		codec = c.MimeType
+	// rate-limit the log: RR/XR batches arrive every few seconds per track and
+	// would otherwise flood the node logs (and push assertion anchors out of the
+	// kubectl logs tail window under concurrency).
+	now := time.Now().Unix()
+	last := d.lastRTCPLogAt.Load()
+	if now-last >= 15 {
+		d.lastRTCPLogAt.Store(now)
+		var codec string
+		if c, ok := d.codec.Load().(webrtc.RTPCodecCapability); ok {
+			codec = c.MimeType
+		}
+		d.params.Logger.Debugw("nat down RTCP received from edge", "pkts", len(data), "codec", codec, "trackID", d.id)
 	}
-	d.params.Logger.Debugw("nat down RTCP received from edge", "pkts", len(data), "codec", codec, "trackID", d.id)
 	d.handleRTCP(data)
 }
 
