@@ -4354,8 +4354,9 @@ func (p *ParticipantImpl) mediaTrackReceivedRemote(track sfu.TrackRemote, mid st
 		}
 		// rate-limit: RR/XR batches arrive every few seconds per track; keep the
 		// log bounded so E2E assertion anchors stay in the kubectl logs tail.
-		if time.Now().Unix()-p.lastUpRTCPLogAt.Load() >= 15 {
-			p.lastUpRTCPLogAt.Store(time.Now().Unix())
+		now := time.Now().Unix()
+		last := p.lastUpRTCPLogAt.Load()
+		if now-last >= 15 && p.lastUpRTCPLogAt.CAS(last, now) {
 			p.params.Logger.Infow("nat up RTCP forwarded to edge", "trackID", track.ID(), "ssrc", track.SSRC(), "pkts", len(pkts))
 		}
 		_ = ch.WriteRTCP(data)

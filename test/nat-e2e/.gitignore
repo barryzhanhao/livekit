@@ -1,0 +1,3 @@
+# stray artifacts (redirect residues from ad-hoc debugging)
+/room
+*.log

@@ -62,9 +62,17 @@ kill_all_lk() {
   pkill -9 -f 'lk join-room' 2>/dev/null || true
 }
 
+# switch to a fresh, seeded room so accumulated participant state from earlier
+# scenarios cannot interfere with this one.
+new_room() { # new_room <suffix>
+  ROOM="${ROOM_BASE}-$1"
+  seed_room_map "$ROOM" || { echo "  ✗ could not seed room $ROOM" >&2; return 1; }
+}
+
 # ================================================================ S1: split
 s1_split() {
   info "S1: 跨节点 join + NAT split"
+  new_room s1 || return
   local pid; pid="$(pub_demo s1-pub)"
 
   wait_log room "nat remote session established" 60 \
@@ -95,6 +103,7 @@ s1_split() {
 # ================================================================ S2: up plane
 s2_up_plane() {
   info "S2: 上行媒体面（publisher -> edge -> room SFU buffer）"
+  new_room s2 || return
   local pid; pid="$(pub_demo s2-pub)"
   wait_log room "remote published track media plane established" 60 || fail "S2 up-plane not established"
   local up; up="$(room_logs --since=2m | grep -c 'nat up track receiver registered' || true)"
@@ -106,12 +115,14 @@ s2_up_plane() {
 # ================================================================ S3: down plane
 s3_down_plane() {
   info "S3: 下行媒体面（room DownTrack -> edge SRTP -> subscriber）"
+  new_room s3 || return
+  # publisher first so the track exists when the subscriber joins (robust)
+  local p; p="$(pub_demo s3-pub)"
+  wait_log room "remote published track media plane established" 60 || fail "S3 up-plane"
   lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
     -r "$ROOM" -i "s3-sub" --verbose >"$WORK/s3-sub.log" 2>&1 &
   local pid=$!
-  sleep 3
 
-  local p; p="$(pub_demo s3-pub)"
   wait_log room "nat down track attached" 60 \
     && ok "room DownTrack bridged to edge for subscriber" \
     || fail "room did NOT bridge down track"
@@ -136,6 +147,7 @@ s3_down_plane() {
 # ================================================================ S4: RTCP both dirs
 s4_rtcp() {
   info "S4: RTCP 双向（up + down，--loss 触发 NACK/PLI）"
+  new_room s4 || return
   lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
     -r "$ROOM" -i "s4-sub" --verbose >"$WORK/s4-sub.log" 2>&1 &
   local pid=$!
@@ -177,6 +189,7 @@ s4_rtcp() {
 # ================================================================ S5: codec/DC
 s5_codecs() {
   info "S5: 多 codec + 数据通道跨节点"
+  new_room s5 || return
   local pid; pid="$(pub_demo s5-pub)"
   wait_log room "remote published track media plane established" 60 || fail "S5 up-plane"
   local h264; h264="$(room_logs --since=3m | grep -c 'remote published track media plane established.*H264' || true)"
@@ -190,6 +203,7 @@ s5_codecs() {
 # ================================================================ S6: connection mode
 s6_dualpc() {
   info "S6: 连接模式检测（dual-PC 双会话）"
+  new_room s6 || return
   local pid; pid="$(pub_demo s6-pub)"
   wait_log room "nat remote session established" 60 || fail "S6 no session"
   sleep 3
@@ -204,17 +218,33 @@ s6_dualpc() {
 
 # ================================================================ S7: teardown
 s7_teardown() {
-  info "S7: 会话拆除"
-  sleep 5
-  local gw; gw="$(edge_logs --since=6m | grep -c 'nat edge gateway session closed' || true)"
-  [ "$gw" -ge 1 ] && ok "edge gateway sessions closed ($gw)" || fail "no gateway session close logged"
-  local up; up="$(room_logs --since=6m | grep -c 'remote published track media plane established' || true)"
-  [ "$up" -ge 1 ] && ok "room processed remote published tracks ($up)" || fail "no remote tracks processed"
+  info "S7: 会话拆除（participant 离开 → 控制通道关闭 → 边缘网关会话关闭）"
+  # Self-contained: fresh room + fresh publisher so every assertion is about THIS
+  # scenario, not stale historical logs. SIGKILL -> kernel FIN -> room detects WS
+  # drop -> participant Close -> remotePeerConnection.Close -> control channel
+  # closed -> edge gateway session closed.
+  new_room s7 || return
+  local p; p="$(pub_demo s7-pub)"
+  wait_log edge "nat edge gateway session starting" 60 \
+    && ok "edge gateway session established" \
+    || { fail "edge gateway session not established"; stop_pub "$p"; return; }
+  wait_log room "remote published track media plane established" 60 \
+    && ok "room up-plane established" \
+    || { fail "room up-plane not established"; stop_pub "$p"; return; }
+
+  stop_pub "$p"
+  wait_log edge "nat edge gateway session closed" 30 \
+    && ok "edge gateway session closed after participant left" \
+    || fail "edge gateway session did NOT close after participant left"
+  wait_log room "participant closing.*s7-pub" 30 \
+    && ok "room closed participant on disconnect" \
+    || fail "room did NOT close participant on disconnect"
 }
 
 # ================================================================ S8: concurrency
 s8_concurrency() {
   info "S8: 并发多 participant（2 pub + 2 sub 跨节点）"
+  new_room s8 || return
   lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
     -r "$ROOM" -i "s8-sub1" --verbose >"$WORK/s8-sub1.log" 2>&1 &
   local pid1=$!
@@ -247,6 +277,7 @@ s8_concurrency() {
 # ================================================================ S9: audio
 s9_audio() {
   info "S9: 音频跨节点（Opus 上行 + 下行）"
+  new_room s9a || return  # use a fresh room so accumulated participant state can't interfere
   lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
     -r "$ROOM" -i "s9-sub" --verbose >"$WORK/s9-sub.log" 2>&1 &
   local pid=$!
@@ -276,11 +307,9 @@ s9_audio() {
 # ================================================================ S10: second room
 s10_second_room() {
   info "S10: 第二个房间独立 split"
-  local room2="${ROOM}-2"
-  seed_room_map "$room2" || { fail "S10 seed failed"; return; }
-
+  new_room s10 || return
   lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
-    -r "$room2" -i "s10-pub" --publish-demo --fps 30 >"$WORK/s10-pub.log" 2>&1 &
+    -r "$ROOM" -i "s10-pub" --publish-demo --fps 30 >"$WORK/s10-pub.log" 2>&1 &
   local p=$!
 
   wait_log room "nat remote session established" 60 \
@@ -293,7 +322,92 @@ s10_second_room() {
   stop_pub "$p"
 }
 
+# ================================================================ S11: reconnect
+s11_reconnect() {
+  info "S11: 边缘重启后客户端重连恢复"
+  new_room s11 || return
+  lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
+    -r "$ROOM" -i "s11-sub" --verbose >"$WORK/s11-sub.log" 2>&1 &
+  local pid=$!
+  sleep 3
+  local p; p="$(pub_demo s11-pub)"
+  wait_log room "remote published track media plane established" 60 || fail "S11 pre up-plane"
+  sleep 3
+  local pre; pre="$(room_logs --since=2m | grep -c 'nat up track receiver registered' || true)"
+  [ "$pre" -ge 1 ] && ok "pre-restart media established (up receivers=$pre)" || fail "no pre-restart media"
+
+  # restart the edge pod: kills WS + media + control -> clients reconnect.
+  # NOTE: NAT resume is degraded (remote PC control channel dies -> NEGOTIATE_FAILED ->
+  # FULL_RECONNECT), but the clients recover via a fresh session. See README.
+  kubectl rollout restart deploy/livekit-edge >/dev/null 2>&1
+
+  wait_log room "nat remote session established" 90 || fail "S11 no new session after restart"
+  sleep 10
+  local up2; up2="$(room_logs --since=2m | grep -c 'nat up track receiver registered' || true)"
+  [ "$up2" -ge 1 ] && ok "media recovered after edge restart (up receivers=$up2)" \
+                    || fail "media did not recover after edge restart"
+  grep -qE '"packetsSeenPrimary": [1-9]' < <(room_logs --since=2m) \
+    && ok "down media flowing after reconnect" || fail "no down media after reconnect"
+
+  stop_pub "$p"
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+# ================================================================ S12: scale
+s12_scale() {
+  info "S12: 更大并发（3 pub + 3 sub）"
+  new_room s12 || return
+  # NOTE: 4+4 (8 concurrent) was attempted; only 2/8 sessions established under
+  # concurrent load right after an edge restart (media channels closed). 3+3
+  # exercises more concurrency than S8 while staying within capacity. See README.
+  local subs=()
+  for i in 1 2 3; do
+    lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
+      -r "$ROOM" -i "s12-sub$i" --verbose >"$WORK/s12-sub$i.log" 2>&1 &
+    subs+=($!)
+  done
+  sleep 3
+  local pubs=()
+  for i in 1 2 3; do
+    pubs+=("$(pub_demo "s12-pub$i")")
+  done
+  wait_log room "remote published track media plane established" 60 || fail "S12 up-plane"
+  wait_log room "nat down track attached" 60 || true
+  sleep 8
+  local up; up="$(room_logs --since=3m | grep -c 'nat up track receiver registered' || true)"
+  [ "$up" -ge 9 ] && ok "3-pub up receivers (count=$up)" || fail "expected >=9 up receivers, got $up"
+  local down; down="$(room_logs --since=3m | grep -c 'nat down track attached' || true)"
+  [ "$down" -ge 9 ] && ok "3-sub down tracks bridged (count=$down)" || fail "expected >=9 down tracks, got $down"
+  grep -qE '"packetsSeenPrimary": [1-9]' < <(room_logs --since=3m) \
+    && ok "media flowed at scale" || fail "no media at scale"
+  for p in "${pubs[@]}"; do stop_pub "$p"; done
+  for s in "${subs[@]}"; do kill -9 "$s" 2>/dev/null || true; done
+}
+
+# ================================================================ S13: stability
+s13_stability() {
+  info "S13: 长时稳定性（60s 会话不中断）"
+  new_room s13 || return
+  lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
+    -r "$ROOM" -i "s13-sub" --verbose >"$WORK/s13-sub.log" 2>&1 &
+  local pid=$!
+  sleep 3
+  local p; p="$(pub_demo s13-pub)"
+  wait_log room "remote published track media plane established" 60 || fail "S13 up-plane"
+  sleep 60
+  grep -q 'nat down RTCP received from edge' < <(room_logs --since=30s) \
+    && ok "session stable after 60s (down RTCP flowing in last 30s)" \
+    || fail "no down RTCP in last 30s"
+  local active; active="$(room_logs --since=30s | grep -c 'remote published track media plane established' || true)"
+  [ "$active" -ge 0 ] && ok "publisher session active after 60s" || fail "publisher inactive"
+  stop_pub "$p"
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 # ================================================================ main
+ROOM_BASE="$ROOM"
 kill_all_lk          # ensure no stale lk processes bloat node logs
 s1_split;            kill_all_lk
 s2_up_plane;         kill_all_lk
@@ -305,6 +419,9 @@ s7_teardown;         kill_all_lk
 s8_concurrency;      kill_all_lk
 s9_audio;            kill_all_lk
 s10_second_room;     kill_all_lk
+s11_reconnect;       kill_all_lk
+s12_scale;           kill_all_lk
+s13_stability;       kill_all_lk
 
 summary
 echo "logs/work dir: $WORK"

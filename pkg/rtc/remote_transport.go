@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
@@ -27,6 +28,11 @@ import (
 	"github.com/livekit/livekit-server/pkg/rtc/transport"
 	"github.com/livekit/protocol/logger"
 )
+
+// remotePCRequestTimeout bounds a control-channel round-trip. Pion ops on the
+// edge complete in milliseconds; a timeout here only fires when the edge is
+// wedged, so the room's negotiation can fail cleanly instead of hanging.
+const remotePCRequestTimeout = 15 * time.Second
 
 // remotePCMessage is the JSON control envelope exchanged over a ControlChannel
 // between the room node (remotePeerConnection) and the edge node (MediaGateway
@@ -257,8 +263,21 @@ func (r *remotePeerConnection) request(op string, body any) (json.RawMessage, er
 		return nil, err
 	}
 
-	resp := <-respCh
-	return resp.body, resp.err
+	// Bound the round-trip: a wedged edge (alive control channel but stuck
+	// executor) must not block room-side negotiation forever. 15s is far above
+	// the sub-second pion ops the edge executes; the room's own negotiation
+	// timers fail first in the normal path, so this is purely a backstop.
+	timer := time.NewTimer(remotePCRequestTimeout)
+	defer timer.Stop()
+	select {
+	case resp := <-respCh:
+		return resp.body, resp.err
+	case <-timer.C:
+		r.mu.Lock()
+		delete(r.pending, id)
+		r.mu.Unlock()
+		return nil, fmt.Errorf("remote pc op %q timed out", op)
+	}
 }
 
 // ---- negotiation (fire-and-forget with error) ----

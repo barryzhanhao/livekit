@@ -126,6 +126,10 @@ func (g *MediaGateway) AddSubscriberTrack(trackID livekit.TrackID, codec webrtc.
 	}
 	if _, exists := g.downTracks[trackID]; exists {
 		g.mu.Unlock()
+		// Duplicate attach (e.g. renegotiation): the first channel owns the bridge;
+		// close the redundant channel so the room side's pump unblocks and the TCP
+		// connection is not leaked.
+		_ = ch.Close()
 		return nil
 	}
 	g.downTracks[trackID] = &gatewayDownTrack{local: local, ch: ch}
@@ -154,6 +158,9 @@ func (g *MediaGateway) AddPublisherTrack(trackID livekit.TrackID, remote rtpPack
 	}
 	if _, exists := g.upTracks[trackID]; exists {
 		g.mu.Unlock()
+		// Duplicate attach: the first channel owns the bridge; close the redundant
+		// channel (see AddSubscriberTrack).
+		_ = ch.Close()
 		return nil
 	}
 	g.upTracks[trackID] = &gatewayUpTrack{remote: remote, ch: ch}

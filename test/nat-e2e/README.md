@@ -43,12 +43,13 @@ cd test/nat-e2e
 ./01-cluster.sh        # 创建 kind 集群（control-plane + 2 worker：edge/room）
 ./02-build-image.sh    # 交叉编译 fork 的 livekit-server → 镜像 → 导入 kind
 ./03-deploy.sh         # 部署 Redis + 双 server pod（hostNetwork + advertise_ip）+ 钉房间到房主
-./04-e2e.sh            # 跑全部场景（约 3-4 分钟）
+./04-e2e.sh            # 跑全部 lk 场景（约 5-6 分钟）
 ./04-e2e.sh --loss 5   # 加 WAN 丢包模拟（netem 5%）验证质量反馈跨节点
+./06-client-e2e.sh     # 跑 Go 客户端场景（receive-before-publish / NACK / data / attributes）
 ./05-cleanup.sh        # 拆除集群
 ```
 
-每步独立、幂等。`04-e2e.sh` 结尾输出 PASS/FAIL 汇总。
+每步独立、幂等。`04-e2e.sh` 与 `06-client-e2e.sh` 结尾输出 PASS/FAIL 汇总。
 
 ## E2E 场景
 
@@ -64,14 +65,28 @@ cd test/nat-e2e
 | S8 | 并发多 participant | 2 pub + 2 sub 同房间并发：24 up receivers、75 down tracks、媒体实际流转 |
 | S9 | 音频跨节点 | Opus 上行接收器 + 下行 DownTrack 桥接 + 音频 RTP 实际转发 |
 | S10 | 第二个房间 | 独立房间（`nat-test-2`）同样触发 NAT split + up-plane |
+| S11 | 边缘重启重连 | 客户端经边缘重连后媒体恢复（resume 协商降级为全量重连，见下） |
+| S12 | 更大并发 | 3 pub + 3 sub（8 并发曾只建立 2/8 会话，见限制） |
+| S13 | 长时稳定性 | 60s 会话不中断、down RTCP 持续流动 |
 
-## 验证结果（真实节点实测）
+### Go 客户端场景（`06-client-e2e.sh`，复用仓库官方 `test/client` 包）
+
+| 场景 | 验证内容 |
+|---|---|
+| receive-before-publish | 订阅者先入空房间，发布者后加入发布 → 订阅者自动订阅并收包 |
+| **NACK 跨节点** | 订阅者客户端发真 RTCP NACK → 边缘 `pumpSenderRTCPToMediaChannel` → 房主 `DownTrack.ProcessRTCP`（实测边缘转发 6 个 nack 批） |
+| data | 数据通道消息（当前未跨节点桥接，§6.8 既定暂拆，记录行为） |
+| attributes | 发布者 `SetAttributes` → 房间广播 → 订阅者跨节点看到属性更新 |
+
+## 验证结果（真实节点实测，双节点 kind）
 
 ```
-=== 无丢包 ===
-SUMMARY: 27 passed, 0 failed
-=== --loss 5%（WAN 丢包模拟）===
+=== lk 套件（生产加固后二进制） ===
+SUMMARY: 37 passed, 0 failed
+=== lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
+=== Go 客户端 ===
+GO-CLIENT SUMMARY: 4 passed, 0 failed  (含 NACK 跨节点)
 ```
 
 覆盖的功能：
@@ -84,17 +99,51 @@ SUMMARY: 28 passed, 0 failed
 
 ## 已知限制
 
-- **NACK 跨节点**：NACK 是 RTCP 的一种类型，其跨节点路径与已验证的 up-RTCP（PLI/RR）和
-  down-RTCP（RR/XR）**完全相同**（房主 buffer 生成 → `onRTCP` → MediaChannel → 边缘
-  `pumpMediaChannelRTCPToPC` → `pc.WriteRTCP`；客户端 → 边缘 `pumpSenderRTCPToMediaChannel` →
-  房主 `DownTrack.ProcessRTCP`）。实测确认两点使"真实 NACK 包"难以 E2E 触发：
-  1) lk（livekit-cli）的 media-sdk 客户端**不发送 NACK**（无 NACK interceptor）；2) 上行
-  方向给边缘注入丢包会被边缘 pion PC 的 **RTX 重传修复**，房主 buffer 看不到空洞。
-  因此 NACK 的覆盖为：buffer 级生成（`TestNack` 单测）+ 跨节点 RTCP 路径（E2E 的
-  PLI/RR/RR/XR 证明同路径）+ `--loss` 质量反馈。如需真实 NACK E2E，需一个启用 NACK
-  interceptor 的客户端（如 livekit JS/Go SDK 接入场景）。
+- **NACK 跨节点**：已用 Go 客户端（`06-client-e2e.sh`）真实验证——客户端发 NACK → 边缘 →
+  房主 DownTrack。`--loss` 场景断言质量反馈下降。缓冲级 NACK 生成另有 `TestNack` 单测。
+- **重连语义（边缘重启）**：客户端可恢复（全量重连），但 resume 协商会失败一次
+  （远程 PC 控制通道关闭 → `create offer failed: media channel closed` → `NEGOTIATE_FAILED` →
+  `FULL_RECONNECT`）。生产级改进方向：远程 PC 检测到控制通道死亡后主动触发干净的全量重连，
+  而非先尝试失败的 resume。
+- **并发容量（8 会话）**：4+4 并发（8 个 participant × 2 会话）实测只建立 2/8（media
+  channel closed + TRANSPORT_FAILURE）。3+3 稳定。生产级改进方向：核查边缘控制 accept 的并发
+  建立与 room 的 establishRemoteSession 背压。
 - **数据通道消息**：跨节点只转发 SDP 协商（m=application）；DC 数据消息未桥接（§6.8 既定暂拆）。
 - **内网明文**：media_relay 明文 TCP，生产需内网隔离或 TLS（§9）。
+- **瞬时 ICE 抖动**：Go 客户端 `nack` 场景偶发订阅者 ICE/DTLS 10s 超时（`TRANSPORT_FAILURE`），
+  重跑即过（本机客户端经 Docker/VM 网卡候选 + srflx 的路径偶发抖动）。`06-client-e2e.sh` 以
+  `run_scenario` 直接判定，失败不重试——CI 上如偶发失败请重跑一次确认非回归。
+
+## 生产级加固（本轮随 E2E 验证落地）
+
+以下加固已在本轮双节点实测全绿（`04-e2e.sh` 37/37 + `06-client-e2e.sh` 4/4，含重连/并发/长稳）：
+
+- **远程控制通道请求超时**（`remote_transport.go`）：`request()` 增加 15s 上限，边缘 executor 卡死
+  时房主协商干净失败而非永久阻塞（原实现 `<-respCh` 无超时）。
+- **重复 attach 关闭冗余通道**（`mediagateway.go`）：同一 track 二次 attach（如重协商）时关闭
+  冗余 MediaChannel，避免 TCP 连接泄漏与 pacer 背压（原实现直接 return nil 泄漏通道）。
+- **畸形 padding 防护**（`mediachannelrtp.go`）：padding 长度字节大于 payload 时清 Padding 标志，
+  令 Marshal 成功而非每包报错（原实现 `Padding=true` + `PaddingSize=0` 触发 pion
+  `errInvalidRTPPadding`）。
+- **RTCP 日志限流**（`downtrack.go`/`participant.go`）：跨节点 RTCP 转发日志 15s CAS 限流，
+  防止 RR/XR 批次刷屏顶掉 kubectl logs 断言锚点。
+- **S7 拆台断言自洽化**（`04-e2e.sh`）：自建发布者→杀掉→等边缘网关会话关闭与房主 participant
+  closing，不再依赖 `--since=10m` 历史日志（原实现偶发时序抖动）。
+- **可复现部署**（`03-deploy.sh`）：新增 `kubectl rollout restart`，镜像 tag 不变时重跑也能滚动到
+  新二进制；`02-build-image.sh`/`06-client-e2e.sh` 修正 `REPO_ROOT` 层级（`../../..` → `../..`）。
+
+## 与上游 LiveKit K8s 部署的对比
+
+上游官方 K8s 多节点（[Helm chart](https://github.com/livekit/livekit-helm)）与 fork 的共同点
+已被本套件采用并验证：
+- `hostNetwork: true` + `dnsPolicy: ClusterFirstWithHostNet`（pod 直接绑节点端口、可解析集群服务）
+- Redis 作为多节点状态协调（`room_node_map` / `nodes` / PSRPC）
+- 客户端经 `advertise_ip`（上游 `use_external_ip: true`）连接；单节点零回归
+
+**关键差异**：上游是"所有节点同构，房间归属单一节点，媒体终止在房主节点"；fork 的
+"media follows signaling"让边缘节点终止媒体（真实 pion PC），房主持有 SFU，跨节点只传明文
+RTP/RTCP。上游没有此架构，fork 的测试是本架构的验证。客户端 NAT 穿透（TURN/srflx）在上游
+由 `use_external_ip` + TURN 处理，与 fork 的服务器侧 split 正交。
 
 ## 脚本说明
 

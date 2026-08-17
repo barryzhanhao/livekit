@@ -52,6 +52,12 @@ func (w *MediaChannelRTPWriter) WriteRTP(header *rtp.Header, payload []byte) (in
 		if int(sz) <= len(payload) {
 			pkt.PaddingSize = sz
 			pkt.Payload = payload[:len(payload)-int(sz)]
+		} else {
+			// Malformed padding (size byte larger than the payload): dropping the
+			// padding flag lets Marshal succeed rather than failing on
+			// errInvalidRTPPadding (which would otherwise drop the packet and spam
+			// "write rtp packet failed" for every such packet).
+			pkt.Padding = false
 		}
 	}
 	buf := make([]byte, pkt.MarshalSize())

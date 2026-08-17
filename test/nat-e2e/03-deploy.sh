@@ -77,6 +77,10 @@ EOF
 
 gen_server_deploy edge edge "$EDGE_IP"  | kubectl apply -f -
 gen_server_deploy room room "$ROOM_IP" | kubectl apply -f -
+# Image tag is stable ($IMG), so `apply` alone won't roll when the image was
+# rebuilt under the same tag — force a rollout so re-running this script always
+# runs the latest binary (Recreate strategy frees the hostNetwork ports).
+kubectl rollout restart deploy/livekit-edge deploy/livekit-room -n "$NAMESPACE"
 
 log "waiting for both server pods Ready..."
 kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=edge -n "$NAMESPACE" --timeout=180s

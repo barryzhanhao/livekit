@@ -5,7 +5,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$DIR/lib/common.sh"
 
-REPO_ROOT="$(cd "$DIR/../../.." && pwd)"   # livekit repo root
+REPO_ROOT="$(cd "$DIR/../.." && pwd)"   # livekit repo root (test/nat-e2e is 2 levels deep)
 BUILD_DIR="$(mktemp -d)"
 
 log "cross-compiling livekit-server (linux/amd64) from $REPO_ROOT ..."

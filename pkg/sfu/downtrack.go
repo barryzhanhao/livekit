@@ -2025,11 +2025,11 @@ func (d *DownTrack) getH264BlankFrame(_frameEndNeeded bool) ([]byte, error) {
 func (d *DownTrack) ProcessRTCP(data []byte) {
 	// rate-limit the log: RR/XR batches arrive every few seconds per track and
 	// would otherwise flood the node logs (and push assertion anchors out of the
-	// kubectl logs tail window under concurrency).
+	// kubectl logs tail window under concurrency). CAS so concurrent callers log
+	// at most once per window.
 	now := time.Now().Unix()
 	last := d.lastRTCPLogAt.Load()
-	if now-last >= 15 {
-		d.lastRTCPLogAt.Store(now)
+	if now-last >= 15 && d.lastRTCPLogAt.CAS(last, now) {
 		var codec string
 		if c, ok := d.codec.Load().(webrtc.RTPCodecCapability); ok {
 			codec = c.MimeType
