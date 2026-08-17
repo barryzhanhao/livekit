@@ -50,3 +50,41 @@ func (t *TrackRemoteFromSdp) Codec() webrtc.RTPCodecParameters {
 func (t *TrackRemoteFromSdp) RTCTrack() *webrtc.TrackRemote {
 	return t.TrackRemote
 }
+
+// TrackRemoteFromMetadata is a TrackRemote for NAT mode ("media follows
+// signaling"), where the room node has no pion TrackRemote (it lives on the edge
+// node). It carries the published track's metadata received from the edge's
+// pc.OnTrack event, and RTCTrack() returns nil.
+type TrackRemoteFromMetadata struct {
+	trackID  string
+	streamID string
+	rid      string
+	msid     string
+	ssrc     webrtc.SSRC
+	codec    webrtc.RTPCodecParameters
+	kind     webrtc.RTPCodecType
+}
+
+func NewTrackRemoteFromMetadata(id, streamID, rid, msid string, ssrc webrtc.SSRC, codec webrtc.RTPCodecParameters, kind webrtc.RTPCodecType) *TrackRemoteFromMetadata {
+	return &TrackRemoteFromMetadata{
+		trackID:  id,
+		streamID: streamID,
+		rid:      rid,
+		msid:     msid,
+		ssrc:     ssrc,
+		codec:    codec,
+		kind:     kind,
+	}
+}
+
+func (t *TrackRemoteFromMetadata) ID() string           { return t.trackID }
+func (t *TrackRemoteFromMetadata) RID() string          { return t.rid }
+func (t *TrackRemoteFromMetadata) Msid() string         { return t.msid }
+func (t *TrackRemoteFromMetadata) SSRC() webrtc.SSRC    { return t.ssrc }
+func (t *TrackRemoteFromMetadata) RtxSSRC() webrtc.SSRC { return 0 }
+func (t *TrackRemoteFromMetadata) StreamID() string     { return t.streamID }
+func (t *TrackRemoteFromMetadata) Kind() webrtc.RTPCodecType {
+	return t.kind
+}
+func (t *TrackRemoteFromMetadata) Codec() webrtc.RTPCodecParameters { return t.codec }
+func (t *TrackRemoteFromMetadata) RTCTrack() *webrtc.TrackRemote    { return nil }

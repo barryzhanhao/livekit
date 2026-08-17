@@ -37,7 +37,6 @@ var _ TrackReceiver = (*WebRTCReceiver)(nil)
 type WebRTCReceiver struct {
 	*ReceiverBase
 
-	receiver       *webrtc.RTPReceiver
 	onCloseHandler func()
 
 	onRTCP func([]rtcp.Packet)
@@ -95,7 +94,7 @@ func WithForwardStats(forwardStats *ForwardStats) ReceiverOpts {
 
 // NewWebRTCReceiver creates a new webrtc track receiver
 func NewWebRTCReceiver(
-	receiver *webrtc.RTPReceiver,
+	headerExtensions []webrtc.RTPHeaderExtensionParameter,
 	track TrackRemote,
 	trackInfo *livekit.TrackInfo,
 	logger logger.Logger,
@@ -104,8 +103,7 @@ func NewWebRTCReceiver(
 	opts ...ReceiverOpts,
 ) *WebRTCReceiver {
 	w := &WebRTCReceiver{
-		receiver: receiver,
-		onRTCP:   onRTCP,
+		onRTCP: onRTCP,
 	}
 
 	w.ReceiverBase = NewReceiverBase(
@@ -114,7 +112,7 @@ func NewWebRTCReceiver(
 			StreamID:                     track.StreamID(),
 			Kind:                         track.Kind(),
 			Codec:                        track.Codec(),
-			HeaderExtensions:             receiver.GetParameters().HeaderExtensions,
+			HeaderExtensions:             headerExtensions,
 			Logger:                       logger,
 			StreamTrackerManagerConfig:   streamTrackerManagerConfig,
 			StreamTrackerManagerListener: w,

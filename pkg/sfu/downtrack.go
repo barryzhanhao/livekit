@@ -355,7 +355,7 @@ type DownTrack struct {
 	playoutDelayExtID         int
 	absCaptureTimeExtID       int
 	transceiver               atomic.Pointer[webrtc.RTPTransceiver]
-	writeStream               webrtc.TrackLocalWriter
+	writeStream               pacer.RTPWriteStream
 	rtcpReader                *buffer.RTCPReader
 	rtcpReaderRTX             *buffer.RTCPReader
 
@@ -499,7 +499,49 @@ func NewDownTrack(params DownTrackParams) (*DownTrack, error) {
 // Bind is called by the PeerConnection after negotiation is complete
 // This asserts that the code requested is supported by the remote peer.
 // If so it sets up all the state (SSRC and PayloadType) to have a call
+// RemoteBindContext supplies the negotiated transport parameters for binding a
+// DownTrack in NAT mode ("media follows signaling"), where there is no local
+// pion TrackLocalContext. The room node holds these values from SDP negotiation
+// (SSRC/RTX/codec) and writes media to writeStream (a MediaChannelRTPWriter)
+// instead of pion's TrackLocal.
+type RemoteBindContext struct {
+	NegotiatedCodecParameters []webrtc.RTPCodecParameters
+	SSRC                      uint32
+	SSRCRTX                   uint32
+	WriteStream               pacer.RTPWriteStream
+}
+
 func (d *DownTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, error) {
+	return d.bind(
+		t.CodecParameters(),
+		uint32(t.SSRC()),
+		uint32(t.SSRCRetransmission()),
+		t.WriteStream(),
+		true,
+	)
+}
+
+// BindRemote binds a DownTrack in NAT mode using transport parameters resolved
+// from SDP negotiation rather than a pion TrackLocalContext. RTCP reader setup
+// is skipped: in remote mode RTCP flows over the MediaChannel, not the local
+// buffer factory (wired separately).
+func (d *DownTrack) BindRemote(ctx RemoteBindContext) (webrtc.RTPCodecParameters, error) {
+	return d.bind(ctx.NegotiatedCodecParameters, ctx.SSRC, ctx.SSRCRTX, ctx.WriteStream, false)
+}
+
+// BindRemoteSelf binds using the track's own upstream codecs as the negotiated
+// set. The edge node handles the real SDP negotiation; the room node's DownTrack
+// only needs a stable codec + SSRC to write plaintext RTP, which the edge's
+// TrackLocalStaticRTP rewrites before SRTP. NAT-mode down-direction convenience.
+func (d *DownTrack) BindRemoteSelf(writeStream pacer.RTPWriteStream, ssrc uint32) (webrtc.RTPCodecParameters, error) {
+	return d.BindRemote(RemoteBindContext{
+		NegotiatedCodecParameters: d.upstreamCodecs,
+		SSRC:                      ssrc,
+		WriteStream:               writeStream,
+	})
+}
+
+func (d *DownTrack) bind(negotiatedCodecParameters []webrtc.RTPCodecParameters, ssrc, ssrcRTX uint32, writeStream pacer.RTPWriteStream, setupRTCP bool) (webrtc.RTPCodecParameters, error) {
 	d.bindLock.Lock()
 	if d.bindState.Load() != bindStateUnbound {
 		d.bindLock.Unlock()
@@ -508,31 +550,8 @@ func (d *DownTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters,
 
 	// the TrackLocalContext's codec parameters will be set to the bound codec after Bind returns,
 	// so keep a copy of the codec parameters here to use it later
-	d.negotiatedCodecParameters = append([]webrtc.RTPCodecParameters{}, t.CodecParameters()...)
-	var codec, matchedUpstreamCodec webrtc.RTPCodecParameters
-	for _, c := range d.upstreamCodecs {
-		matchCodec, err := utils.CodecParametersFuzzySearch(c, d.negotiatedCodecParameters)
-		if err == nil {
-			codec = matchCodec
-			matchedUpstreamCodec = c
-			break
-		} else {
-			// for encrypyted tracks, should match on primary codec,
-			// i. e. codec at index 0 if the combination of upstream codecs is opus and RED
-			if d.params.IsEncrypted {
-				isRedAndOpus := true
-				for _, u := range d.upstreamCodecs {
-					if !mime.IsMimeTypeStringOpus(u.MimeType) || !mime.IsMimeTypeStringRED(u.MimeType) {
-						isRedAndOpus = false
-						break
-					}
-				}
-				if isRedAndOpus {
-					break
-				}
-			}
-		}
-	}
+	d.negotiatedCodecParameters = append([]webrtc.RTPCodecParameters{}, negotiatedCodecParameters...)
+	codec, matchedUpstreamCodec := d.resolveCodec()
 
 	if codec.MimeType == "" {
 		err := webrtc.ErrUnsupportedCodec
@@ -563,105 +582,7 @@ func (d *DownTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters,
 	go d.setRTPHeaderExtensions()
 
 	doBind := func() {
-		d.bindLock.Lock()
-		if d.IsClosed() {
-			d.bindLock.Unlock()
-			d.params.Logger.Debugw("DownTrack closed before bind")
-			return
-		}
-
-		isFECEnabled := false
-		if mime.IsMimeTypeStringRED(matchedUpstreamCodec.MimeType) {
-			d.isRED = true
-			for _, c := range d.upstreamCodecs {
-				isFECEnabled = strings.Contains(strings.ToLower(c.SDPFmtpLine), "useinbandfec=1")
-
-				// assume upstream primary codec is opus since we only support it for audio now
-				if mime.IsMimeTypeStringOpus(c.MimeType) {
-					d.upstreamPrimaryPT = uint8(c.PayloadType)
-					break
-				}
-			}
-			if d.upstreamPrimaryPT == 0 {
-				d.params.Logger.Errorw(
-					"failed to find upstream primary opus payload type for RED", nil,
-					"matchedCodec", codec,
-					"upstreamCodec", d.upstreamCodecs,
-				)
-			}
-
-			var primaryPT, secondaryPT int
-			if n, err := fmt.Sscanf(codec.SDPFmtpLine, "%d/%d", &primaryPT, &secondaryPT); err != nil || n != 2 {
-				d.params.Logger.Errorw(
-					"failed to parse primary and secondary payload type for RED", err,
-					"matchedCodec", codec,
-				)
-			}
-			d.primaryPT = uint8(primaryPT)
-		} else if mime.IsMimeTypeStringAudio(matchedUpstreamCodec.MimeType) {
-			isFECEnabled = strings.Contains(strings.ToLower(matchedUpstreamCodec.SDPFmtpLine), "fec")
-		}
-
-		logFields := []any{
-			"codecs", d.upstreamCodecs,
-			"matchCodec", codec,
-			"ssrc", t.SSRC(),
-			"ssrcRTX", t.SSRCRetransmission(),
-			"isFECEnabled", isFECEnabled,
-		}
-		if d.isRED {
-			logFields = append(
-				logFields,
-				"isRED", d.isRED,
-				"upstreamPrimaryPT", d.upstreamPrimaryPT,
-				"primaryPT", d.primaryPT,
-			)
-		}
-
-		d.ssrc = uint32(t.SSRC())
-		d.ssrcRTX = uint32(t.SSRCRetransmission())
-		d.payloadType.Store(uint32(codec.PayloadType))
-		d.payloadTypeRTX.Store(uint32(utils.FindRTXPayloadType(codec.PayloadType, d.negotiatedCodecParameters)))
-		logFields = append(
-			logFields,
-			"payloadType", d.payloadType.Load(),
-			"payloadTypeRTX", d.payloadTypeRTX.Load(),
-			"codecParameters", d.negotiatedCodecParameters,
-		)
-		d.params.Logger.Debugw("DownTrack.Bind", logFields...)
-
-		d.writeStream = t.WriteStream()
-		if rr := d.params.BufferFactory.GetOrNew(packetio.RTCPBufferPacket, d.ssrc).(*buffer.RTCPReader); rr != nil {
-			rr.OnPacket(func(pkt []byte) {
-				d.handleRTCP(pkt)
-			})
-			d.rtcpReader = rr
-		}
-		if d.ssrcRTX != 0 {
-			if rr := d.params.BufferFactory.GetOrNew(packetio.RTCPBufferPacket, d.ssrcRTX).(*buffer.RTCPReader); rr != nil {
-				rr.OnPacket(func(pkt []byte) {
-					d.handleRTCPRTX(pkt)
-				})
-				d.rtcpReaderRTX = rr
-			}
-		}
-
-		d.sequencer = newSequencer(d.params.MaxTrack, d.kind == webrtc.RTPCodecTypeVideo, d.params.Logger)
-
-		d.codec.Store(codec.RTPCodecCapability)
-		d.rtpStats.SetClockRate(codec.RTPCodecCapability.ClockRate)
-		d.rtpStatsRTX.SetClockRate(codec.RTPCodecCapability.ClockRate)
-
-		if d.onBinding != nil {
-			d.onBinding(nil)
-		}
-		d.setBindStateLocked(bindStateBound)
-		d.bindLock.Unlock()
-
-		receiver := d.Receiver()
-		d.forwarder.DetermineCodec(codec.RTPCodecCapability, receiver.HeaderExtensions(), receiver.VideoLayerMode())
-		d.connectionStats.Start(d.Mime(), isFECEnabled)
-		d.params.Logger.Debugw("downtrack bound")
+		d.finishBind(ssrc, ssrcRTX, writeStream, matchedUpstreamCodec, codec, setupRTCP)
 	}
 
 	isReceiverReady := d.isReceiverReady
@@ -678,6 +599,137 @@ func (d *DownTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters,
 		doBind()
 	}
 	return codec, nil
+}
+
+func (d *DownTrack) resolveCodec() (codec, matchedUpstreamCodec webrtc.RTPCodecParameters) {
+	for _, c := range d.upstreamCodecs {
+		matchCodec, err := utils.CodecParametersFuzzySearch(c, d.negotiatedCodecParameters)
+		if err == nil {
+			codec = matchCodec
+			matchedUpstreamCodec = c
+			break
+		} else {
+			// for encrypyted tracks, should match on primary codec,
+			// i. e. codec at index 0 if the combination of upstream codecs is opus and RED
+			if d.params.IsEncrypted {
+				isRedAndOpus := true
+				for _, u := range d.upstreamCodecs {
+					if !mime.IsMimeTypeStringOpus(u.MimeType) || !mime.IsMimeTypeStringRED(u.MimeType) {
+						isRedAndOpus = false
+						break
+					}
+				}
+				if isRedAndOpus {
+					break
+				}
+			}
+		}
+	}
+	return
+}
+
+func (d *DownTrack) finishBind(ssrc, ssrcRTX uint32, writeStream pacer.RTPWriteStream, matchedUpstreamCodec, codec webrtc.RTPCodecParameters, setupRTCP bool) {
+	d.bindLock.Lock()
+	if d.IsClosed() {
+		d.bindLock.Unlock()
+		d.params.Logger.Debugw("DownTrack closed before bind")
+		return
+	}
+
+	isFECEnabled := false
+	if mime.IsMimeTypeStringRED(matchedUpstreamCodec.MimeType) {
+		d.isRED = true
+		for _, c := range d.upstreamCodecs {
+			isFECEnabled = strings.Contains(strings.ToLower(c.SDPFmtpLine), "useinbandfec=1")
+
+			// assume upstream primary codec is opus since we only support it for audio now
+			if mime.IsMimeTypeStringOpus(c.MimeType) {
+				d.upstreamPrimaryPT = uint8(c.PayloadType)
+				break
+			}
+		}
+		if d.upstreamPrimaryPT == 0 {
+			d.params.Logger.Errorw(
+				"failed to find upstream primary opus payload type for RED", nil,
+				"matchedCodec", codec,
+				"upstreamCodec", d.upstreamCodecs,
+			)
+		}
+
+		var primaryPT, secondaryPT int
+		if n, err := fmt.Sscanf(codec.SDPFmtpLine, "%d/%d", &primaryPT, &secondaryPT); err != nil || n != 2 {
+			d.params.Logger.Errorw(
+				"failed to parse primary and secondary payload type for RED", err,
+				"matchedCodec", codec,
+			)
+		}
+		d.primaryPT = uint8(primaryPT)
+	} else if mime.IsMimeTypeStringAudio(matchedUpstreamCodec.MimeType) {
+		isFECEnabled = strings.Contains(strings.ToLower(matchedUpstreamCodec.SDPFmtpLine), "fec")
+	}
+
+	logFields := []any{
+		"codecs", d.upstreamCodecs,
+		"matchCodec", codec,
+		"ssrc", ssrc,
+		"ssrcRTX", ssrcRTX,
+		"isFECEnabled", isFECEnabled,
+	}
+	if d.isRED {
+		logFields = append(
+			logFields,
+			"isRED", d.isRED,
+			"upstreamPrimaryPT", d.upstreamPrimaryPT,
+			"primaryPT", d.primaryPT,
+		)
+	}
+
+	d.ssrc = ssrc
+	d.ssrcRTX = ssrcRTX
+	d.payloadType.Store(uint32(codec.PayloadType))
+	d.payloadTypeRTX.Store(uint32(utils.FindRTXPayloadType(codec.PayloadType, d.negotiatedCodecParameters)))
+	logFields = append(
+		logFields,
+		"payloadType", d.payloadType.Load(),
+		"payloadTypeRTX", d.payloadTypeRTX.Load(),
+		"codecParameters", d.negotiatedCodecParameters,
+	)
+	d.params.Logger.Debugw("DownTrack.Bind", logFields...)
+
+	d.writeStream = writeStream
+	if setupRTCP {
+		if rr := d.params.BufferFactory.GetOrNew(packetio.RTCPBufferPacket, d.ssrc).(*buffer.RTCPReader); rr != nil {
+			rr.OnPacket(func(pkt []byte) {
+				d.handleRTCP(pkt)
+			})
+			d.rtcpReader = rr
+		}
+		if d.ssrcRTX != 0 {
+			if rr := d.params.BufferFactory.GetOrNew(packetio.RTCPBufferPacket, d.ssrcRTX).(*buffer.RTCPReader); rr != nil {
+				rr.OnPacket(func(pkt []byte) {
+					d.handleRTCPRTX(pkt)
+				})
+				d.rtcpReaderRTX = rr
+			}
+		}
+	}
+
+	d.sequencer = newSequencer(d.params.MaxTrack, d.kind == webrtc.RTPCodecTypeVideo, d.params.Logger)
+
+	d.codec.Store(codec.RTPCodecCapability)
+	d.rtpStats.SetClockRate(codec.RTPCodecCapability.ClockRate)
+	d.rtpStatsRTX.SetClockRate(codec.RTPCodecCapability.ClockRate)
+
+	if d.onBinding != nil {
+		d.onBinding(nil)
+	}
+	d.setBindStateLocked(bindStateBound)
+	d.bindLock.Unlock()
+
+	receiver := d.Receiver()
+	d.forwarder.DetermineCodec(codec.RTPCodecCapability, receiver.HeaderExtensions(), receiver.VideoLayerMode())
+	d.connectionStats.Start(d.Mime(), isFECEnabled)
+	d.params.Logger.Debugw("downtrack bound")
 }
 
 func (d *DownTrack) setBindStateLocked(state bindState) {
@@ -1967,13 +2019,18 @@ func (d *DownTrack) getH264BlankFrame(_frameEndNeeded bool) ([]byte, error) {
 	return buf[:offset], nil
 }
 
+// ProcessRTCP feeds RTCP feedback (NACK/PLI/SR/RR) received over the
+// MediaChannel (NAT mode down direction) into the DownTrack's RTCP handling.
+func (d *DownTrack) ProcessRTCP(data []byte) {
+	d.handleRTCP(data)
+}
+
 func (d *DownTrack) handleRTCP(bytes []byte) {
 	pkts, err := rtcp.Unmarshal(bytes)
 	if err != nil {
 		d.params.Logger.Errorw("could not unmarshal rtcp receiver packet", err)
 		return
 	}
-
 	pliOnce := true
 	sendPliOnce := func() {
 		_, layer := d.forwarder.CheckSync()

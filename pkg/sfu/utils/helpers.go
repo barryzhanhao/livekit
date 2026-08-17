@@ -17,9 +17,12 @@ package utils
 import (
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/livekit/protocol/codecs/mime"
@@ -67,6 +70,53 @@ func GetHeaderExtensionID(extensions []interceptor.RTPHeaderExtension, extension
 		}
 	}
 	return 0
+}
+
+// ExtractHeaderExtensionsFromSDP parses a=extmap attributes from an SDP
+// (session and media level) into negotiated RTP header extension parameters. It
+// is used in NAT mode where the room node has no pion RTPReceiver to query, so
+// it reconstructs the negotiated extensions from its own remote description.
+func ExtractHeaderExtensionsFromSDP(sd *webrtc.SessionDescription) []webrtc.RTPHeaderExtensionParameter {
+	if sd == nil {
+		return nil
+	}
+	parsed, err := sd.Unmarshal()
+	if err != nil {
+		return nil
+	}
+
+	byID := make(map[int]webrtc.RTPHeaderExtensionParameter)
+	add := func(attrs []sdp.Attribute) {
+		for _, a := range attrs {
+			if a.Key != "extmap" {
+				continue
+			}
+			// value is "<id> <URI>" or "<id>/<direction> <URI>"
+			parts := strings.SplitN(a.Value, " ", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			idStr := parts[0]
+			if idx := strings.IndexByte(idStr, '/'); idx >= 0 {
+				idStr = idStr[:idx]
+			}
+			id, err := strconv.Atoi(idStr)
+			if err != nil {
+				continue
+			}
+			byID[id] = webrtc.RTPHeaderExtensionParameter{URI: parts[1], ID: id}
+		}
+	}
+	add(parsed.Attributes)
+	for _, m := range parsed.MediaDescriptions {
+		add(m.Attributes)
+	}
+
+	extensions := make([]webrtc.RTPHeaderExtensionParameter, 0, len(byID))
+	for _, ext := range byID {
+		extensions = append(extensions, ext)
+	}
+	return extensions
 }
 
 var (

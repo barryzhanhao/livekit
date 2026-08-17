@@ -40,6 +40,20 @@ func TestConfig_DefaultsKept(t *testing.T) {
 	require.Equal(t, uint32(10), conf.Room.EmptyTimeout)
 }
 
+func TestConfig_AdvertiseIP(t *testing.T) {
+	const content = `rtc:
+  use_external_ip: false
+  node_ip: 10.0.0.10
+  advertise_ip: 203.0.113.5`
+	conf, err := NewConfig(content, true, nil, nil)
+	require.NoError(t, err)
+
+	// node_ip is the internal routing IP, advertise_ip is the external media IP.
+	require.Equal(t, "10.0.0.10", conf.RTC.NodeIP.PrimaryIP())
+	require.Equal(t, "203.0.113.5", conf.RTC.AdvertiseIP.PrimaryIP())
+	require.NotEqual(t, conf.RTC.NodeIP.PrimaryIP(), conf.RTC.AdvertiseIP.PrimaryIP())
+}
+
 func TestConfig_UnknownKeys(t *testing.T) {
 	const content = `unknown: 10
 room:

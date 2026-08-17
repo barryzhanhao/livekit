@@ -20,7 +20,6 @@ import (
 
 	"github.com/livekit/livekit-server/pkg/sfu/ccutils"
 	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v4"
 )
 
 var (
@@ -32,6 +31,14 @@ var (
 )
 
 // --------------------------------------
+
+// RTPWriteStream is the narrow sink for outbound RTP packets. It is satisfied by
+// webrtc.TrackLocalWriter in single-node mode, and by a MediaChannel-backed
+// writer in NAT mode (media follows signaling), where the packet is marshalled
+// and forwarded to the edge node.
+type RTPWriteStream interface {
+	WriteRTP(header *rtp.Header, payload []byte) (int, error)
+}
 
 type PacerBehavior string
 
@@ -51,7 +58,7 @@ type Packet struct {
 	IsProbe            bool
 	AbsSendTimeExtID   uint8
 	TransportWideExtID uint8
-	WriteStream        webrtc.TrackLocalWriter
+	WriteStream        RTPWriteStream
 	Pool               *sync.Pool
 	PoolEntity         *[]byte
 }

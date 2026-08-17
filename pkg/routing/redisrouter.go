@@ -56,8 +56,6 @@ type RedisRouter struct {
 	ctx       context.Context
 	isStarted atomic.Bool
 
-	mediaRelay *MediaRelayManager
-
 	cancel func()
 }
 
@@ -68,7 +66,6 @@ func NewRedisRouter(lr *LocalRouter, rc redis.UniversalClient, kps rpc.Keepalive
 		kps:         kps,
 	}
 	rr.ctx, rr.cancel = context.WithCancel(context.Background())
-	rr.mediaRelay = NewMediaRelayManager(rc, lr.currentNode.NodeID(), lr.currentNode.NodeIP())
 	return rr
 }
 
@@ -155,16 +152,6 @@ func (r *RedisRouter) GetRoomParticipantNodes(_ context.Context, roomName liveki
 	return nodes, nil
 }
 
-// ---- Media Relay (NAT mode) ----
-
-func (r *RedisRouter) CreateRTPRelay(ctx context.Context, targetNodeID livekit.NodeID) (RTPRelay, error) {
-	return r.mediaRelay.SubscribeRemoteTrack(ctx, "", "", targetNodeID, "")
-}
-
-func (r *RedisRouter) CloseRTPRelay(targetNodeID livekit.NodeID) error {
-	return nil
-}
-
 func (r *RedisRouter) GetNode(nodeID livekit.NodeID) (*livekit.Node, error) {
 	data, err := r.rc.HGet(r.ctx, NodesKey, string(nodeID)).Result()
 	if err == redis.Nil {
@@ -223,11 +210,6 @@ func (r *RedisRouter) Start() error {
 	go r.statsWorker()
 	go r.keepaliveWorker(workerStarted)
 
-	// Start media relay manager for cross-node RTP forwarding (NAT mode)
-	if err := r.mediaRelay.Start(); err != nil {
-		return err
-	}
-
 	// wait until worker is running
 	return <-workerStarted
 }
@@ -245,7 +227,6 @@ func (r *RedisRouter) Stop() {
 	}
 	logger.Debugw("stopping RedisRouter")
 	_ = r.UnregisterNode()
-	r.mediaRelay.Stop()
 	r.cancel()
 }
 

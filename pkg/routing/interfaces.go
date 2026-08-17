@@ -140,33 +140,11 @@ type Router interface {
 	RemoveParticipantNode(ctx context.Context, roomName livekit.RoomName, participantID livekit.ParticipantID) error
 	GetRoomParticipantNodes(ctx context.Context, roomName livekit.RoomName) (map[livekit.ParticipantID]livekit.NodeID, error)
 
-	MediaRouter
-
 	GetRegion() string
 
 	Start() error
 	Drain()
 	Stop()
-}
-
-// MediaRouter manages cross-node RTP forwarding for NAT mode.
-// When a publisher and subscriber are on different nodes, the subscriber's
-// node pulls RTP from the publisher's node via an internal relay.
-type MediaRouter interface {
-	// CreateRTPRelay establishes a RTP forwarding channel to the target node.
-	CreateRTPRelay(ctx context.Context, targetNodeID livekit.NodeID) (RTPRelay, error)
-	// CloseRTPRelay tears down a RTP forwarding channel to the target node.
-	CloseRTPRelay(targetNodeID livekit.NodeID) error
-}
-
-// RTPRelay is a bidirectional RTP forwarding channel between nodes.
-type RTPRelay interface {
-	// WriteRTP sends an RTP packet to the remote node.
-	WriteRTP(trackID livekit.TrackID, payload []byte) error
-	// WriteRTCP sends an RTCP packet to the remote node.
-	WriteRTCP(trackID livekit.TrackID, payload []byte) error
-	// Close tears down the relay.
-	Close()
 }
 
 type StartParticipantSignalResults struct {

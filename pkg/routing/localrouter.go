@@ -83,17 +83,6 @@ func (r *LocalRouter) GetRoomParticipantNodes(_ context.Context, _ livekit.RoomN
 	return map[livekit.ParticipantID]livekit.NodeID{}, nil
 }
 
-// ---- Media Relay (NAT mode) ----
-// Single-node: all media local, relay is a no-op.
-
-func (r *LocalRouter) CreateRTPRelay(_ context.Context, _ livekit.NodeID) (RTPRelay, error) {
-	return nil, ErrNotFound
-}
-
-func (r *LocalRouter) CloseRTPRelay(_ livekit.NodeID) error {
-	return nil
-}
-
 func (r *LocalRouter) RegisterNode() error {
 	return nil
 }

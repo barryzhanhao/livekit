@@ -206,9 +206,68 @@ func (t trackDescription) MarshalLogObject(e zapcore.ObjectEncoder) error {
 // -------------------------------------------------------------------
 
 // PCTransport is a wrapper around PeerConnection, with some helper methods
+// peerConnection is the transport-facing surface of a pion PeerConnection used
+// by PCTransport. *webrtc.PeerConnection satisfies it (local mode); in NAT mode
+// ("media follows signaling") a remote proxy forwarding these operations to the
+// edge node's MediaGateway satisfies it instead.
+type peerConnection interface {
+	OnDataChannel(f func(*webrtc.DataChannel))
+	OnICECandidate(f func(*webrtc.ICECandidate))
+	OnICEGatheringStateChange(f func(webrtc.ICEGatheringState))
+	OnTrack(f func(*webrtc.TrackRemote, *webrtc.RTPReceiver))
+	OnICEConnectionStateChange(f func(webrtc.ICEConnectionState))
+	OnConnectionStateChange(f func(webrtc.PeerConnectionState))
+
+	CreateOffer(options *webrtc.OfferOptions) (webrtc.SessionDescription, error)
+	CreateAnswer(options *webrtc.AnswerOptions) (webrtc.SessionDescription, error)
+	SetLocalDescription(desc webrtc.SessionDescription) error
+	LocalDescription() *webrtc.SessionDescription
+	SetRemoteDescription(desc webrtc.SessionDescription) error
+	RemoteDescription() *webrtc.SessionDescription
+	AddICECandidate(candidate webrtc.ICECandidateInit) error
+
+	ICEConnectionState() webrtc.ICEConnectionState
+	ICEGatheringState() webrtc.ICEGatheringState
+	ConnectionState() webrtc.PeerConnectionState
+	SignalingState() webrtc.SignalingState
+
+	GetTransceivers() []*webrtc.RTPTransceiver
+	AddTrack(track webrtc.TrackLocal) (*webrtc.RTPSender, error)
+	RemoveTrack(sender *webrtc.RTPSender) error
+	AddTransceiverFromKind(kind webrtc.RTPCodecType, init ...webrtc.RTPTransceiverInit) (*webrtc.RTPTransceiver, error)
+	AddTransceiverFromTrack(track webrtc.TrackLocal, init ...webrtc.RTPTransceiverInit) (*webrtc.RTPTransceiver, error)
+
+	CreateDataChannel(label string, options *webrtc.DataChannelInit) (*webrtc.DataChannel, error)
+	WriteRTCP(pkts []rtcp.Packet) error
+
+	CurrentLocalDescription() *webrtc.SessionDescription
+	PendingLocalDescription() *webrtc.SessionDescription
+	CurrentRemoteDescription() *webrtc.SessionDescription
+	PendingRemoteDescription() *webrtc.SessionDescription
+
+	GetStats() webrtc.StatsReport
+	SCTP() *webrtc.SCTPTransport
+
+	// GatheringComplete returns a channel that closes when ICE gathering is
+	// complete. It wraps webrtc.GatheringCompletePromise for the local impl.
+	GatheringComplete() <-chan struct{}
+
+	Close() error
+}
+
+// localPeerConnection adapts a real pion PeerConnection to the peerConnection
+// interface by adding the GatheringComplete helper.
+type localPeerConnection struct {
+	*webrtc.PeerConnection
+}
+
+func (l *localPeerConnection) GatheringComplete() <-chan struct{} {
+	return webrtc.GatheringCompletePromise(l.PeerConnection)
+}
+
 type PCTransport struct {
 	params       TransportParams
-	pc           *webrtc.PeerConnection
+	pc           peerConnection
 	iceTransport *webrtc.ICETransport
 	me           *webrtc.MediaEngine
 
@@ -328,12 +387,18 @@ type TransportParams struct {
 	DatachannelMaxReceiverBufferSize int
 
 	EnableDataTracks bool
+
+	// RemotePeerConnection, when set, is used instead of creating a local pion
+	// PeerConnection. This is the NAT-mode ("media follows signaling") seam: the
+	// room node's PCTransport uses a remotePeerConnection (forwarding transport
+	// ops to the edge node) while keeping all SFU logic local.
+	RemotePeerConnection peerConnection
 }
 
 func newPeerConnection(
 	params TransportParams,
 	onBandwidthEstimator func(estimator cc.BandwidthEstimator),
-) (*webrtc.PeerConnection, *webrtc.MediaEngine, *sfuinterceptor.RTXInfoExtractorFactory, error) {
+) (peerConnection, *webrtc.MediaEngine, *sfuinterceptor.RTXInfoExtractorFactory, error) {
 	directionConfig := params.DirectionConfig
 	if params.AllowPlayoutDelay {
 		directionConfig.RTPHeaderExtension.Video = append(directionConfig.RTPHeaderExtension.Video, pd.PlayoutDelayURI)
@@ -533,7 +598,7 @@ func newPeerConnection(
 		webrtc.WithInterceptorRegistry(ir),
 	)
 	pc, err := api.NewPeerConnection(params.Config.Configuration)
-	return pc, me, rtxInfoExtractorFactory, err
+	return &localPeerConnection{pc}, me, rtxInfoExtractorFactory, err
 }
 
 func NewPCTransport(params TransportParams) (*PCTransport, error) {
@@ -606,6 +671,10 @@ func NewPCTransport(params TransportParams) (*PCTransport, error) {
 
 func (t *PCTransport) createPeerConnection() (cc.BandwidthEstimator, error) {
 	var bwe cc.BandwidthEstimator
+	if t.params.RemotePeerConnection != nil {
+		return t.setupRemotePeerConnection()
+	}
+
 	pc, me, rtxInfoExtractorFactory, err := newPeerConnection(t.params, func(estimator cc.BandwidthEstimator) {
 		bwe = estimator
 	})
@@ -644,6 +713,30 @@ func (t *PCTransport) createPeerConnection() (cc.BandwidthEstimator, error) {
 
 	t.me = me
 
+	t.rtxInfoExtractorFactory = rtxInfoExtractorFactory
+	return bwe, nil
+}
+
+// setupRemotePeerConnection wires up the NAT-mode remote peer connection: it
+// builds the SFU-side helpers (MediaEngine + RTX interceptor) and uses the
+// pre-established remotePeerConnection instead of a local pion PeerConnection.
+// The edge executor drives the real pion PC and forwards events via the
+// ControlChannel, so no local ICE transport or event registration is needed.
+func (t *PCTransport) setupRemotePeerConnection() (cc.BandwidthEstimator, error) {
+	var bwe cc.BandwidthEstimator
+	// newPeerConnection builds the MediaEngine + RTX interceptor; the local pion
+	// PC it also creates is a throwaway (immediately closed) so we can reuse
+	// those helpers without duplicating the configuration logic.
+	pc, me, rtxInfoExtractorFactory, err := newPeerConnection(t.params, func(estimator cc.BandwidthEstimator) {
+		bwe = estimator
+	})
+	if err != nil {
+		return bwe, err
+	}
+	_ = pc.Close()
+
+	t.pc = t.params.RemotePeerConnection
+	t.me = me
 	t.rtxInfoExtractorFactory = rtxInfoExtractorFactory
 	return bwe, nil
 }
@@ -1694,7 +1787,7 @@ func (t *PCTransport) GetAnswer() (webrtc.SessionDescription, uint32, error) {
 	}
 
 	// wait for gathering to complete to include all candidates in the answer
-	<-webrtc.GatheringCompletePromise(t.pc)
+	<-t.pc.GatheringComplete()
 
 	cld := t.pc.CurrentLocalDescription()
 
@@ -1897,7 +1990,7 @@ func (t *PCTransport) HandleICERestartSDPFragment(sdpFragment string) (string, e
 	}
 
 	// wait for gathering to complete to include all candidates in the answer
-	<-webrtc.GatheringCompletePromise(t.pc)
+	<-t.pc.GatheringComplete()
 
 	cld := t.pc.CurrentLocalDescription()
 

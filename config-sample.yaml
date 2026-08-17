@@ -78,6 +78,23 @@ rtc:
   # # in such cases, use this setting to set the public IP of the node
   # # use_external_ip takes precedence, for this to take effect, set use_external_ip to false
   # node_ip: <external-ip-of-node>
+  # # For NAT/K8s multi-node deployments, decouple the externally reachable media IP
+  # # from the internal node routing IP:
+  # #   node_ip      -> internal pod IP, used for inter-node PSRPC routing (set POD_IP env
+  # #                   var in K8s, or node_ip here)
+  # #   advertise_ip -> external LB / public IP, advertised to clients for ICE + TURN
+  # # When advertise_ip is set, ICE candidates advertise advertise_ip while nodes route
+  # # media over the internal network. Set POD_IP (or node_ip) to the pod IP and
+  # # advertise_ip to the externally reachable address.
+  # advertise_ip: <external-media-ip>
+  # # Media relay for NAT/K8s multi-node mode ("media follows signaling"). Each node
+  # # listens for plaintext RTP/RTCP (port) and pion PC control (control_port) over the
+  # # internal network; the room node dials the edge node to drive its WebRTC transport.
+  # # Only enable in multi-node NAT deployments. Ports must be reachable between pods.
+  # media_relay:
+  #   enabled: true
+  #   port: 7883
+  #   control_port: 7884
   # # when set, LiveKit will attempt to use a UDP mux so all UDP traffic goes through
   # # listed port(s). To maximize system performance, we recommend using a range of ports
   # # greater or equal to the number of vCPUs on the machine.

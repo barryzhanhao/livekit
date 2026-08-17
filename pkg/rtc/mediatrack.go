@@ -292,7 +292,10 @@ func (t *MediaTrack) ToProto() *livekit.TrackInfo {
 
 // AddReceiver adds a new RTP receiver to the track, returns true when receiver represents a new codec
 // and if a receiver was added successfully
-func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track sfu.TrackRemote, mid string) (bool, bool) {
+func (t *MediaTrack) AddReceiver(parameters webrtc.RTPParameters, track sfu.TrackRemote, mid string, onRTCP func([]rtcp.Packet)) (bool, bool) {
+	if onRTCP == nil {
+		onRTCP = t.params.OnRTCP
+	}
 	var newCodec bool
 	ssrc := uint32(track.SSRC())
 	buff, rtcpReader := t.params.BufferFactory.GetBufferPair(ssrc)
@@ -408,11 +411,11 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track sfu.TrackRe
 		}
 
 		newWR := sfu.NewWebRTCReceiver(
-			receiver,
+			parameters.HeaderExtensions,
 			track,
 			ti,
 			LoggerWithCodecMime(t.params.Logger, mimeType),
-			t.params.OnRTCP,
+			onRTCP,
 			t.params.VideoConfig.StreamTrackerManager,
 			sfu.WithPliThrottleConfig(t.params.PLIThrottleConfig),
 			sfu.WithAudioConfig(t.params.AudioConfig),
@@ -487,7 +490,6 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track sfu.TrackRe
 		if t.PrimaryReceiver() == nil {
 			// primary codec published, set potential codecs
 			potentialCodecs := make([]webrtc.RTPCodecParameters, 0, len(ti.Codecs))
-			parameters := receiver.GetParameters()
 			for _, c := range ti.Codecs {
 				for _, nc := range parameters.Codecs {
 					if mime.IsMimeTypeStringEqual(nc.MimeType, c.MimeType) {
@@ -557,7 +559,7 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track sfu.TrackRe
 	if layer >= 0 && len(layers) > int(layer) {
 		expectedBitrate = int(layers[layer].GetBitrate())
 	}
-	if err := buff.Bind(receiver.GetParameters(), track.Codec().RTPCodecCapability, expectedBitrate); err != nil {
+	if err := buff.Bind(parameters, track.Codec().RTPCodecCapability, expectedBitrate); err != nil {
 		t.params.Logger.Warnw(
 			"binding buffer failed", err,
 			"rid", track.RID(),

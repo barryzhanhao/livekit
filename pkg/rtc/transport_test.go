@@ -422,7 +422,7 @@ func TestFilteringCandidates(t *testing.T) {
 	offer, err := transport.pc.CreateOffer(nil)
 	require.NoError(t, err)
 
-	offerGatheringComplete := webrtc.GatheringCompletePromise(transport.pc)
+	offerGatheringComplete := transport.pc.GatheringComplete()
 	require.NoError(t, transport.pc.SetLocalDescription(offer))
 	<-offerGatheringComplete
 

@@ -156,6 +156,13 @@ type RTCConfig struct {
 	// When enabled, participants in the same room can be on different nodes
 	// and media is forwarded between nodes via internal network.
 	MediaRelay MediaRelayConfig `yaml:"media_relay,omitempty"`
+
+	// AdvertiseIP is the externally reachable IP advertised to clients for ICE
+	// candidates and TURN, decoupled from node_ip. In NAT/K8s deployments
+	// node_ip is the internal pod IP (used for inter-node PSRPC routing), while
+	// advertise_ip is the load balancer / external IP clients can actually reach
+	// for media. When empty, node_ip is used for both roles (non-NAT deployment).
+	AdvertiseIP rtcconfig.NodeIP `yaml:"advertise_ip,omitempty"`
 }
 
 // MediaRelayConfig configures cross-node RTP forwarding for NAT/K8s deployments.
@@ -168,12 +175,23 @@ type MediaRelayConfig struct {
 	Timeout time.Duration `yaml:"timeout,omitempty"`
 	// BufferSize is the size of the RTP packet buffer for relay.
 	BufferSize int `yaml:"buffer_size,omitempty"`
+	// Port is the TCP port each node listens on for inbound media relay
+	// connections (plaintext RTP/RTCP over the internal network). Nodes dial
+	// node_ip:port to reach a peer's relay. 0 binds an ephemeral port.
+	Port int `yaml:"port,omitempty"`
+	// ControlPort is the TCP port each node listens on for inbound control
+	// connections (pion PeerConnection operations, NAT mode "media follows
+	// signaling"). Nodes dial node_ip:control_port to drive an edge node's PC.
+	// 0 binds an ephemeral port.
+	ControlPort int `yaml:"control_port,omitempty"`
 }
 
 var DefaultMediaRelayConfig = MediaRelayConfig{
-	Enabled:    true,
-	Timeout:    10 * time.Second,
-	BufferSize: 4096,
+	Enabled:     true,
+	Timeout:     10 * time.Second,
+	BufferSize:  4096,
+	Port:        7883,
+	ControlPort: 7884,
 }
 
 type TURNServer struct {

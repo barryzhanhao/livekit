@@ -63,6 +63,7 @@ import (
 	"github.com/livekit/livekit-server/pkg/sfu/interceptor"
 	"github.com/livekit/livekit-server/pkg/sfu/pacer"
 	"github.com/livekit/livekit-server/pkg/sfu/streamallocator"
+	sfuutils "github.com/livekit/livekit-server/pkg/sfu/utils"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	sutils "github.com/livekit/livekit-server/pkg/utils"
@@ -174,18 +175,35 @@ type ParticipantParams struct {
 	PLIThrottleConfig       sfu.PLIThrottleConfig
 	CongestionControlConfig config.CongestionControlConfig
 	// codecs that are enabled for this room
-	PublishEnabledCodecs            []*livekit.Codec
-	SubscribeEnabledCodecs          []*livekit.Codec
-	Logger                          logger.Logger
-	LoggerResolver                  logger.DeferredFieldResolver
-	Reporter                        roomobs.ParticipantSessionReporter
-	ReporterResolver                roomobs.ParticipantReporterResolver
-	SimTracks                       map[uint32]interceptor.SimulcastTrackInfo
-	Grants                          *auth.ClaimGrants
-	InitialVersion                  uint32
-	ClientConf                      *livekit.ClientConfiguration
-	ClientInfo                      ClientInfo
-	Region                          string
+	PublishEnabledCodecs   []*livekit.Codec
+	SubscribeEnabledCodecs []*livekit.Codec
+	Logger                 logger.Logger
+	LoggerResolver         logger.DeferredFieldResolver
+	Reporter               roomobs.ParticipantSessionReporter
+	ReporterResolver       roomobs.ParticipantReporterResolver
+	SimTracks              map[uint32]interceptor.SimulcastTrackInfo
+	Grants                 *auth.ClaimGrants
+	InitialVersion         uint32
+	ClientConf             *livekit.ClientConfiguration
+	ClientInfo             ClientInfo
+	Region                 string
+	// SignalNodeID is the node the participant's WebSocket/signaling connection
+	// terminated on (the edge node). In single-node deployments it equals the
+	// current node; in NAT mode it is the node clients reach via the LB, where
+	// the actual WebRTC transport (ICE/DTLS/SRTP) runs.
+	SignalNodeID livekit.NodeID
+	// RemoteControlChannel, when set, carries a pre-established NAT-mode control
+	// connection to the edge node (setup handshake already done via
+	// DialGateway). The transport manager wraps it in a remotePeerConnection
+	// instead of creating a local pion PeerConnection.
+	RemoteControlChannel transport.ControlChannel
+	// SubscriberRemoteControlChannel, when set, carries a second NAT-mode control
+	// connection for the subscriber PC in dual-PC mode (RemoteControlChannel is
+	// the publisher). Nil in single-PC mode.
+	SubscriberRemoteControlChannel transport.ControlChannel
+	// MediaChannelDialer, when set, establishes per-track MediaChannels to the
+	// edge node in NAT mode (used by the subscription/up-track paths).
+	MediaChannelDialer              MediaChannelDialer
 	Migration                       bool
 	Reconnect                       bool
 	AdaptiveStream                  bool
@@ -514,6 +532,16 @@ func (p *ParticipantImpl) ID() livekit.ParticipantID {
 
 func (p *ParticipantImpl) Identity() livekit.ParticipantIdentity {
 	return p.params.Identity
+}
+
+func (p *ParticipantImpl) SignalNodeID() livekit.NodeID {
+	return p.params.SignalNodeID
+}
+
+// MediaChannelDialer returns the per-track media dialer for NAT mode, or nil in
+// single-node mode.
+func (p *ParticipantImpl) MediaChannelDialer() MediaChannelDialer {
+	return p.params.MediaChannelDialer
 }
 
 func (p *ParticipantImpl) State() livekit.ParticipantInfo_State {
@@ -1980,35 +2008,54 @@ func (p *ParticipantImpl) setupTransportManager() error {
 		pth = PrimaryTransportHandler{pth, p}
 	}
 
+	// NAT mode: a pre-established control channel means the WebRTC transport runs
+	// on the edge node. Wrap it in a remotePeerConnection (driving the edge PC)
+	// instead of a local pion PeerConnection.
+	var remotePC peerConnection
+	if p.params.RemoteControlChannel != nil {
+		remotePC = NewRemotePeerConnection(p.params.RemoteControlChannel)
+		if rpc, ok := remotePC.(*remotePeerConnection); ok && p.params.MediaChannelDialer != nil {
+			// On remote track metadata, establish the up-direction MediaChannel and
+			// pump plaintext RTP into the SFU buffer (see handleRemotePublishedTrack).
+			rpc.OnRemoteTrack(p.handleRemotePublishedTrack)
+		}
+	}
+	var subscriberRemotePC peerConnection
+	if p.params.SubscriberRemoteControlChannel != nil {
+		subscriberRemotePC = NewRemotePeerConnection(p.params.SubscriberRemoteControlChannel)
+	}
+
 	params := TransportManagerParams{
 		// primary connection does not change, canSubscribe can change if permission was updated
 		// after the participant has joined
-		SubscriberAsPrimary:           subscriberAsPrimary,
-		UseSinglePeerConnection:       p.params.UseSinglePeerConnection,
-		Config:                        p.params.Config,
-		Twcc:                          p.twcc,
-		ProtocolVersion:               p.params.ProtocolVersion,
-		CongestionControlConfig:       p.params.CongestionControlConfig,
-		EnabledPublishCodecs:          p.enabledPublishCodecs,
-		EnabledSubscribeCodecs:        p.enabledSubscribeCodecs,
-		SimTracks:                     p.params.SimTracks,
-		ClientInfo:                    p.params.ClientInfo,
-		Migration:                     p.params.Migration,
-		AllowTCPFallback:              p.params.AllowTCPFallback,
-		TCPFallbackRTTThreshold:       p.params.TCPFallbackRTTThreshold,
-		AllowUDPUnstableFallback:      p.params.AllowUDPUnstableFallback,
-		TURNSEnabled:                  p.params.TURNSEnabled,
-		AllowPlayoutDelay:             p.params.PlayoutDelay.GetEnabled(),
-		DataChannelMaxBufferedAmount:  p.params.DataChannelMaxBufferedAmount,
-		DatachannelSlowThreshold:      p.params.DatachannelSlowThreshold,
-		DatachannelLossyTargetLatency: p.params.DatachannelLossyTargetLatency,
-		Logger:                        p.params.Logger.WithComponent(sutils.ComponentTransport),
-		PublisherHandler:              pth,
-		SubscriberHandler:             sth,
-		DataChannelStats:              p.dataChannelStats,
-		UseOneShotSignallingMode:      p.params.UseOneShotSignallingMode,
-		FireOnTrackBySdp:              p.params.FireOnTrackBySdp,
-		EnableDataTracks:              p.params.EnableDataTracks,
+		SubscriberAsPrimary:            subscriberAsPrimary,
+		UseSinglePeerConnection:        p.params.UseSinglePeerConnection,
+		Config:                         p.params.Config,
+		Twcc:                           p.twcc,
+		ProtocolVersion:                p.params.ProtocolVersion,
+		CongestionControlConfig:        p.params.CongestionControlConfig,
+		EnabledPublishCodecs:           p.enabledPublishCodecs,
+		EnabledSubscribeCodecs:         p.enabledSubscribeCodecs,
+		SimTracks:                      p.params.SimTracks,
+		ClientInfo:                     p.params.ClientInfo,
+		Migration:                      p.params.Migration,
+		AllowTCPFallback:               p.params.AllowTCPFallback,
+		TCPFallbackRTTThreshold:        p.params.TCPFallbackRTTThreshold,
+		AllowUDPUnstableFallback:       p.params.AllowUDPUnstableFallback,
+		TURNSEnabled:                   p.params.TURNSEnabled,
+		AllowPlayoutDelay:              p.params.PlayoutDelay.GetEnabled(),
+		DataChannelMaxBufferedAmount:   p.params.DataChannelMaxBufferedAmount,
+		DatachannelSlowThreshold:       p.params.DatachannelSlowThreshold,
+		DatachannelLossyTargetLatency:  p.params.DatachannelLossyTargetLatency,
+		Logger:                         p.params.Logger.WithComponent(sutils.ComponentTransport),
+		PublisherHandler:               pth,
+		SubscriberHandler:              sth,
+		DataChannelStats:               p.dataChannelStats,
+		UseOneShotSignallingMode:       p.params.UseOneShotSignallingMode,
+		FireOnTrackBySdp:               p.params.FireOnTrackBySdp,
+		EnableDataTracks:               p.params.EnableDataTracks,
+		RemotePeerConnection:           remotePC,
+		SubscriberRemotePeerConnection: subscriberRemotePC,
 	}
 	if p.params.SyncStreams && p.params.PlayoutDelay.GetEnabled() && p.params.ClientInfo.isFirefox() {
 		// we will disable playout delay for Firefox if the user is expecting
@@ -3225,7 +3272,7 @@ func (p *ParticipantImpl) mediaTrackReceived(
 	}
 	p.pendingTracksLock.Unlock()
 
-	_, isReceiverAdded := mt.AddReceiver(rtpReceiver, track, mid)
+	_, isReceiverAdded := mt.AddReceiver(rtpReceiver.GetParameters(), track, mid, nil)
 
 	if newTrack {
 		go func() {
@@ -4128,6 +4175,9 @@ func (p *ParticipantImpl) AddTrackLocal(
 	trackLocal webrtc.TrackLocal,
 	params types.AddTrackParams,
 ) (*webrtc.RTPSender, *webrtc.RTPTransceiver, error) {
+	if p.params.RemoteControlChannel != nil {
+		return p.addTrackLocalRemote(trackLocal)
+	}
 	if p.params.UseSinglePeerConnection {
 		return p.TransportManager.AddTrackLocal(
 			trackLocal,
@@ -4138,6 +4188,163 @@ func (p *ParticipantImpl) AddTrackLocal(
 	} else {
 		return p.TransportManager.AddTrackLocal(trackLocal, params, nil, RTCPFeedbackConfig{})
 	}
+}
+
+// addTrackLocalRemote wires a subscriber (down) track in NAT mode: it establishes
+// a per-track MediaChannel to the edge node (hello frame), binds the DownTrack to
+// a MediaChannelRTPWriter, and returns no sender/transceiver (the edge node owns
+// the real pion sender/transceiver).
+func (p *ParticipantImpl) addTrackLocalRemote(trackLocal webrtc.TrackLocal) (*webrtc.RTPSender, *webrtc.RTPTransceiver, error) {
+	dialer := p.params.MediaChannelDialer
+	if dialer == nil {
+		return nil, nil, errors.New("remote media channel dialer not configured")
+	}
+	downTrack, ok := trackLocal.(*sfu.DownTrack)
+	if !ok {
+		return nil, nil, errors.New("remote AddTrack requires a *sfu.DownTrack")
+	}
+
+	hello := transport.MediaHello{
+		TrackID:   string(trackLocal.ID()),
+		Direction: transport.MediaDirectionDown,
+		Codec:     downTrack.Codec(),
+	}
+	ch, err := dialer(hello)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// The room node's SSRC is internal (the edge's TrackLocalStaticRTP rewrites it
+	// before SRTP); any non-zero value stable per track suffices for the write path.
+	ssrc := uint32(rand.Intn(1<<30) + 1)
+	if _, err := downTrack.BindRemoteSelf(transport.NewMediaChannelRTPWriter(ch), ssrc); err != nil {
+		_ = ch.Close()
+		return nil, nil, err
+	}
+	// Forward RTCP feedback (NACK/PLI/SR/RR) from the edge node back to the
+	// DownTrack (down-direction RTCP, NAT mode).
+	go func() {
+		for {
+			data, err := ch.ReadRTCP()
+			if err != nil {
+				return
+			}
+			downTrack.ProcessRTCP(data)
+		}
+	}()
+	return nil, nil, nil
+}
+
+// handleRemotePublishedTrack establishes the up-direction media plane for a
+// publisher track in NAT mode: it dials a MediaChannel to the edge node (hello
+// up), and pumps plaintext RTP from that channel into the SFU buffer for the
+// track's SSRC. The edge side already registered the TrackRemote (via
+// MediaGateway.OnPublishedTrack); Attach resolves it by SSRC.
+//
+// The SFU receiver registration (mediaTrackReceivedRemote / MediaTrack.
+// AddReceiver, which creates the WebRTCReceiver and forwards to subscribers)
+// is done in the remote-mode path below (3d-13), using the track metadata +
+// negotiated parameters directly instead of a pion RTPReceiver.
+func (p *ParticipantImpl) handleRemotePublishedTrack(ev remoteTrackEvent) {
+	dialer := p.params.MediaChannelDialer
+	if dialer == nil {
+		return
+	}
+
+	kind := webrtc.RTPCodecTypeAudio
+	if mime.IsMimeTypeStringVideo(ev.Codec.MimeType) {
+		kind = webrtc.RTPCodecTypeVideo
+	}
+	track := sfu.NewTrackRemoteFromMetadata(ev.TrackID, ev.StreamID, ev.RID, "", webrtc.SSRC(ev.SSRC), ev.Codec, kind)
+
+	ch, err := dialer(transport.MediaHello{
+		TrackID:   ev.TrackID,
+		Direction: transport.MediaDirectionUp,
+		Codec:     ev.Codec.RTPCodecCapability,
+		SSRC:      ev.SSRC,
+	})
+	if err != nil {
+		p.params.Logger.Errorw("failed to dial up-direction media channel", err, "trackID", ev.TrackID, "ssrc", ev.SSRC)
+		return
+	}
+
+	buff, _ := p.params.Config.BufferFactory.GetBufferPair(ev.SSRC)
+	if buff == nil {
+		_ = ch.Close()
+		p.params.Logger.Errorw("could not get buffer for remote published track", nil, "ssrc", ev.SSRC)
+		return
+	}
+
+	parameters := webrtc.RTPParameters{
+		Codecs:           []webrtc.RTPCodecParameters{ev.Codec},
+		HeaderExtensions: sfuutils.ExtractHeaderExtensionsFromSDP(p.TransportManager.LastPublisherOffer()),
+	}
+	p.mediaTrackReceivedRemote(track, ev.Mid, parameters, ch)
+
+	p.params.Logger.Debugw("remote published track media plane established", "trackID", ev.TrackID, "ssrc", ev.SSRC, "codec", ev.Codec.MimeType, "track", track.ID())
+	go transport.PumpRTP(ch, buff)
+}
+
+// mediaTrackReceivedRemote registers a publisher track received via remote
+// metadata (NAT mode up direction) with the SFU: it resolves the pending track,
+// adds the MediaTrack, and registers the receiver/buffer so the track is
+// forwarded to subscribers. It mirrors mediaTrackReceived but takes the mid and
+// RTP parameters directly (no pion RTPReceiver).
+func (p *ParticipantImpl) mediaTrackReceivedRemote(track sfu.TrackRemote, mid string, parameters webrtc.RTPParameters, ch transport.MediaChannel) {
+	if p.IsDisconnected() {
+		return
+	}
+
+	p.pendingTracksLock.Lock()
+	newTrack := false
+
+	mt, ok := p.getPublishedTrackBySdpCid(track.ID()).(*MediaTrack)
+	if !ok {
+		signalCid, ti, sdpRids, _, _ := p.getPendingTrack(track.ID(), ToProtoTrackKind(track.Kind()), true)
+		if ti == nil {
+			p.pendingTracksLock.Unlock()
+			p.pubLogger.Warnw("remote published track has no pending track", nil, "trackID", track.ID(), "ssrc", track.SSRC())
+			return
+		}
+
+		ti.MimeType = track.Codec().MimeType
+		if len(ti.Codecs) == 1 && ti.Codecs[0].MimeType == "" {
+			ti.Codecs[0].MimeType = track.Codec().MimeType
+		}
+		if utils.TimedVersionFromProto(ti.Version).IsZero() {
+			ti.Version = p.params.VersionGenerator.Next().ToProto()
+		}
+		mimeType := mime.NormalizeMimeType(ti.MimeType)
+		for _, layer := range ti.Layers {
+			layer.SpatialLayer = buffer.VideoQualityToSpatialLayer(mimeType, layer.Quality, ti)
+			layer.Rid = buffer.VideoQualityToRid(mimeType, layer.Quality, ti, sdpRids)
+		}
+
+		mt = p.addMediaTrack(signalCid, ti)
+		newTrack = true
+		p.dirty.Store(true)
+	}
+	p.pendingTracksLock.Unlock()
+
+	if mt == nil {
+		return
+	}
+
+	// Route RTCP (NACK/PLI/SR/RR) from the receiver back to the publisher via the
+	// up-direction MediaChannel (the edge node's pion PC sends it to the client).
+	onRTCP := func(pkts []rtcp.Packet) {
+		data, err := rtcp.Marshal(pkts)
+		if err != nil {
+			return
+		}
+		_ = ch.WriteRTCP(data)
+	}
+	if _, isReceiverAdded := mt.AddReceiver(parameters, track, mid, onRTCP); !isReceiverAdded && newTrack {
+		p.pubLogger.Warnw("could not add remote receiver for track", nil, "trackID", track.ID(), "ssrc", track.SSRC())
+		return
+	}
+
+	p.setIsPublisher(true)
 }
 
 func (p *ParticipantImpl) AddTransceiverFromTrackLocal(

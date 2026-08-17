@@ -57,6 +57,7 @@ type LivekitServer struct {
 	roomManager  *RoomManager
 	signalServer *SignalServer
 	turnServer   *turn.Server
+	mediaRelay   *MediaRelay
 	currentNode  routing.LocalNode
 	running      atomic.Bool
 	doneChan     chan struct{}
@@ -92,8 +93,13 @@ func NewLivekitServer(conf *config.Config,
 		// turn server starts automatically
 		turnServer:  turnServer,
 		currentNode: currentNode,
+		mediaRelay:  NewMediaRelay(currentNode.NodeIP(), conf.RTC.MediaRelay.Port, conf.RTC.MediaRelay.ControlPort),
 		closedChan:  make(chan struct{}),
 	}
+	// The media relay needs the node's WebRTC config to build edge gateway peer
+	// connections. roomManager constructs it in NewLocalRoomManager.
+	s.mediaRelay.SetRTCConfig(roomManager.RTCConfig())
+	roomManager.SetMediaRelay(s.mediaRelay)
 
 	middlewares := []negroni.Handler{
 		// always first
@@ -209,6 +215,12 @@ func (s *LivekitServer) Start() error {
 		return err
 	}
 
+	if s.config.RTC.MediaRelay.Enabled {
+		if err := s.mediaRelay.Start(); err != nil {
+			return err
+		}
+	}
+
 	if err := s.ioService.Start(); err != nil {
 		return err
 	}
@@ -261,6 +273,9 @@ func (s *LivekitServer) Start() error {
 	}
 	if s.config.Region != "" {
 		values = append(values, "region", s.config.Region)
+	}
+	if s.config.RTC.MediaRelay.Enabled {
+		values = append(values, "mediaRelayPort", s.config.RTC.MediaRelay.Port)
 	}
 	logger.Infow("starting LiveKit server", values...)
 	if runtime.GOOS == "windows" {
@@ -332,6 +347,9 @@ func (s *LivekitServer) Stop(force bool) {
 	}
 
 	s.router.Stop()
+	if s.mediaRelay != nil {
+		_ = s.mediaRelay.Stop()
+	}
 	close(s.doneChan)
 
 	// wait for fully closed
@@ -340,6 +358,12 @@ func (s *LivekitServer) Stop(force bool) {
 
 func (s *LivekitServer) RoomManager() *RoomManager {
 	return s.roomManager
+}
+
+// MediaRelay returns the cross-node media relay endpoint (nil-safe; may be
+// unstarted if media_relay.enabled is false).
+func (s *LivekitServer) MediaRelay() *MediaRelay {
+	return s.mediaRelay
 }
 
 func (s *LivekitServer) debugGoroutines(w http.ResponseWriter, _ *http.Request) {

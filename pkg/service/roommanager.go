@@ -42,6 +42,7 @@ import (
 	"github.com/livekit/protocol/utils/guid"
 	"github.com/livekit/protocol/utils/must"
 	"github.com/livekit/psrpc"
+	"github.com/livekit/psrpc/pkg/metadata"
 	"github.com/livekit/psrpc/pkg/middleware"
 
 	"github.com/livekit/livekit-server/pkg/agent"
@@ -52,6 +53,7 @@ import (
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/rtc"
+	"github.com/livekit/livekit-server/pkg/rtc/transport"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
@@ -90,6 +92,7 @@ type RoomManager struct {
 	versionGenerator  utils.TimedVersionGenerator
 	turnAuthHandler   *TURNAuthHandler
 	bus               psrpc.MessageBus
+	mediaRelay        *MediaRelay
 
 	rooms map[livekit.RoomName]*rtc.Room
 
@@ -186,6 +189,63 @@ func (r *RoomManager) GetRoom(_ context.Context, roomName livekit.RoomName) *rtc
 	r.lock.RLock()
 	defer r.lock.RUnlock()
 	return r.rooms[roomName]
+}
+
+// RTCConfig returns the node's WebRTC config, used by the media relay to build
+// edge gateway peer connections in NAT mode.
+func (r *RoomManager) RTCConfig() *rtc.WebRTCConfig {
+	return r.rtcConfig
+}
+
+// SetMediaRelay wires the node's media relay, used to dial edge nodes in NAT mode.
+func (r *RoomManager) SetMediaRelay(m *MediaRelay) {
+	r.mediaRelay = m
+}
+
+// nodeByID looks up a peer node's routing info by node ID.
+func (r *RoomManager) nodeByID(nodeID livekit.NodeID) (*livekit.Node, error) {
+	nodes, err := r.router.ListNodes()
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range nodes {
+		if livekit.NodeID(n.Id) == nodeID {
+			return n, nil
+		}
+	}
+	return nil, fmt.Errorf("node %q not found", nodeID)
+}
+
+// establishRemoteSession dials the edge node's control relay and performs the
+// gateway setup handshake, returning the control channel ready for the remote-PC
+// protocol plus a per-track media dialer bound to that edge node and session. The
+// caller owns the returned channel (closes it on teardown).
+func (r *RoomManager) establishRemoteSession(signalNodeID livekit.NodeID, sid livekit.ParticipantID, enabledCodecs []*livekit.Codec, isOfferer, useOneShotSignallingMode bool) (transport.ControlChannel, rtc.MediaChannelDialer, error) {
+	node, err := r.nodeByID(signalNodeID)
+	if err != nil {
+		return nil, nil, err
+	}
+	ch, err := r.mediaRelay.DialNodeControl(node)
+	if err != nil {
+		return nil, nil, err
+	}
+	setup := rtc.GatewaySetup{
+		SessionID:                string(sid),
+		PublishCodecs:            enabledCodecs,
+		SubscribeCodecs:          enabledCodecs,
+		IsOfferer:                isOfferer,
+		IsSendSide:               isOfferer,
+		UseOneShotSignallingMode: useOneShotSignallingMode,
+	}
+	if err := rtc.DialGateway(ch, setup); err != nil {
+		_ = ch.Close()
+		return nil, nil, err
+	}
+	dialer := func(hello transport.MediaHello) (transport.HelloMediaChannel, error) {
+		hello.SessionID = string(sid)
+		return r.mediaRelay.DialNodeHello(node, hello)
+	}
+	return ch, dialer, nil
 }
 
 // deleteRoom completely deletes all room information, including active sessions, room store, and routing info
@@ -292,6 +352,15 @@ func (r *RoomManager) StartSession(
 	useOneShotSignallingMode bool,
 ) error {
 	sessionStartTime := time.Now()
+
+	// The signal node is the node the client's WebSocket terminated on (the
+	// edge node). The signal relay carries the caller's node ID in the PSRPC
+	// request header (RemoteID); default to the current node for single-node
+	// deployments and for any code path lacking the header.
+	signalNodeID := r.currentNode.NodeID()
+	if hdr := metadata.IncomingHeader(ctx); hdr != nil && hdr.RemoteID != "" {
+		signalNodeID = livekit.NodeID(hdr.RemoteID)
+	}
 
 	createRoom := pi.CreateRoom
 	room, err := r.getOrCreateRoom(ctx, createRoom)
@@ -420,6 +489,7 @@ func (r *RoomManager) StartSession(
 		"starting RTC session",
 		"room", room.Name(),
 		"nodeID", r.currentNode.NodeID(),
+		"signalNodeID", signalNodeID,
 		"numParticipants", room.GetParticipantCount(),
 		"participantInit", &pi,
 	)
@@ -470,37 +540,72 @@ func (r *RoomManager) StartSession(
 		enabledCodecs = append(enabledCodecs, &livekit.Codec{Mime: mime.MimeTypeRTX.String()})
 	}
 
+	// NAT mode ("media follows signaling"): when the client's signal terminated on
+	// a different node (edge), establish control connection(s) to that node so the
+	// room node can drive the edge's pion PeerConnection(s) remotely. Single-PC /
+	// one-shot modes use one session; dual-PC uses two (publisher + subscriber).
+	var (
+		remoteControlChannel           transport.ControlChannel
+		subscriberRemoteControlChannel transport.ControlChannel
+		mediaChannelDialer             rtc.MediaChannelDialer
+	)
+	if r.mediaRelay != nil && signalNodeID != r.currentNode.NodeID() {
+		if pi.UseSinglePeerConnection || useOneShotSignallingMode {
+			remoteControlChannel, mediaChannelDialer, err = r.establishRemoteSession(signalNodeID, sid, enabledCodecs, false, useOneShotSignallingMode)
+			if err != nil {
+				pLogger.Errorw("failed to establish remote media session", err, "signalNodeID", signalNodeID)
+				return err
+			}
+		} else {
+			remoteControlChannel, mediaChannelDialer, err = r.establishRemoteSession(signalNodeID, sid, enabledCodecs, false, false)
+			if err != nil {
+				pLogger.Errorw("failed to establish remote publisher session", err, "signalNodeID", signalNodeID)
+				return err
+			}
+			subscriberRemoteControlChannel, _, err = r.establishRemoteSession(signalNodeID, sid, enabledCodecs, true, false)
+			if err != nil {
+				_ = remoteControlChannel.Close()
+				pLogger.Errorw("failed to establish remote subscriber session", err, "signalNodeID", signalNodeID)
+				return err
+			}
+		}
+	}
+
 	participant, err = rtc.NewParticipant(rtc.ParticipantParams{
-		Identity:                 pi.Identity,
-		Name:                     pi.Name,
-		SID:                      sid,
-		Config:                   &rtcConf,
-		Sink:                     responseSink,
-		AudioConfig:              r.config.Audio,
-		VideoConfig:              r.config.Video,
-		LimitConfig:              r.config.Limit,
-		ProtocolVersion:          pv,
-		SessionStartTime:         sessionStartTime,
-		SessionTimer:             observability.NewSessionTimer(sessionStartTime),
-		TelemetryListener:        room.ParticipantTelemetryListener(),
-		Trailer:                  room.Trailer(),
-		PLIThrottleConfig:        r.config.RTC.PLIThrottle,
-		CongestionControlConfig:  r.config.RTC.CongestionControl,
-		PublishEnabledCodecs:     enabledCodecs,
-		SubscribeEnabledCodecs:   enabledCodecs,
-		Grants:                   pi.Grants,
-		Reconnect:                pi.Reconnect,
-		Logger:                   pLogger,
-		Reporter:                 roomobs.NewNoopParticipantSessionReporter(),
-		ClientConf:               clientConf,
-		ClientInfo:               rtc.ClientInfo{ClientInfo: pi.Client},
-		Region:                   pi.Region,
-		AdaptiveStream:           pi.AdaptiveStream,
-		AllowTCPFallback:         allowFallback,
-		TCPFallbackRTTThreshold:  r.config.RTC.TCPFallbackRTTThreshold,
-		AllowUDPUnstableFallback: r.config.RTC.AllowUDPUnstableFallback,
-		TURNSEnabled:             r.config.IsTURNSEnabled(),
-		ParticipantListener:      room.LocalParticipantListener(),
+		Identity:                       pi.Identity,
+		Name:                           pi.Name,
+		SID:                            sid,
+		Config:                         &rtcConf,
+		Sink:                           responseSink,
+		AudioConfig:                    r.config.Audio,
+		VideoConfig:                    r.config.Video,
+		LimitConfig:                    r.config.Limit,
+		ProtocolVersion:                pv,
+		SessionStartTime:               sessionStartTime,
+		SessionTimer:                   observability.NewSessionTimer(sessionStartTime),
+		TelemetryListener:              room.ParticipantTelemetryListener(),
+		Trailer:                        room.Trailer(),
+		PLIThrottleConfig:              r.config.RTC.PLIThrottle,
+		CongestionControlConfig:        r.config.RTC.CongestionControl,
+		PublishEnabledCodecs:           enabledCodecs,
+		SubscribeEnabledCodecs:         enabledCodecs,
+		Grants:                         pi.Grants,
+		Reconnect:                      pi.Reconnect,
+		Logger:                         pLogger,
+		Reporter:                       roomobs.NewNoopParticipantSessionReporter(),
+		ClientConf:                     clientConf,
+		ClientInfo:                     rtc.ClientInfo{ClientInfo: pi.Client},
+		Region:                         pi.Region,
+		SignalNodeID:                   signalNodeID,
+		RemoteControlChannel:           remoteControlChannel,
+		SubscriberRemoteControlChannel: subscriberRemoteControlChannel,
+		MediaChannelDialer:             mediaChannelDialer,
+		AdaptiveStream:                 pi.AdaptiveStream,
+		AllowTCPFallback:               allowFallback,
+		TCPFallbackRTTThreshold:        r.config.RTC.TCPFallbackRTTThreshold,
+		AllowUDPUnstableFallback:       r.config.RTC.AllowUDPUnstableFallback,
+		TURNSEnabled:                   r.config.IsTURNSEnabled(),
+		ParticipantListener:            room.LocalParticipantListener(),
 		ParticipantHelper: &roomManagerParticipantHelper{
 			room:                     room,
 			codecRegressionThreshold: r.config.Video.CodecRegressionThreshold,
@@ -526,6 +631,9 @@ func (r *RoomManager) StartSession(
 		EnableRTPStreamRestartDetection: r.config.RTC.EnableRTPStreamRestartDetection,
 	})
 	if err != nil {
+		if remoteControlChannel != nil {
+			_ = remoteControlChannel.Close()
+		}
 		return err
 	}
 	iceConfig := r.setIceConfig(room.Name(), participant)
@@ -1038,10 +1146,14 @@ func (r *RoomManager) iceServersForParticipant(apiKey string, participant types.
 		if r.config.TURN.UDPPort > 0 && !tlsOnly {
 			// UDP TURN is used as STUN
 			hasSTUN = true
-			// Prefer TURN.Domain or EXTERNAL_HOST env var over NodeIP
+			// Prefer TURN.Domain, then EXTERNAL_HOST env var, then rtc.advertise_ip
+			// (external media IP) before falling back to node_ip (internal routing IP).
 			turnHost := r.config.TURN.Domain
 			if turnHost == "" {
 				turnHost = os.Getenv("EXTERNAL_HOST")
+			}
+			if turnHost == "" && !r.config.RTC.AdvertiseIP.IsEmpty() {
+				turnHost = r.config.RTC.AdvertiseIP.PrimaryIP()
 			}
 			if turnHost != "" {
 				urls = append(urls, fmt.Sprintf("turn:%s:%d?transport=udp", turnHost, r.config.TURN.UDPPort))

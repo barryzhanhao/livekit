@@ -98,6 +98,15 @@ type TransportManagerParams struct {
 	UseOneShotSignallingMode      bool
 	FireOnTrackBySdp              bool
 	EnableDataTracks              bool
+
+	// RemotePeerConnection, when set, is passed through to the publisher
+	// PCTransport so it uses a remote peer connection (NAT mode) instead of a
+	// local pion PeerConnection. In single-PC mode it also serves the subscriber.
+	RemotePeerConnection peerConnection
+	// SubscriberRemotePeerConnection, when set, is the remote peer connection for
+	// the subscriber PCTransport in dual-PC NAT mode. It is nil in single-PC mode
+	// (where RemotePeerConnection covers both).
+	SubscriberRemotePeerConnection peerConnection
 }
 
 type TransportManager struct {
@@ -168,6 +177,7 @@ func NewTransportManager(params TransportManagerParams) (*TransportManager, erro
 		DatachannelLossyTargetLatency: params.DatachannelLossyTargetLatency,
 		FireOnTrackBySdp:              params.FireOnTrackBySdp,
 		EnableDataTracks:              params.EnableDataTracks,
+		RemotePeerConnection:          params.RemotePeerConnection,
 	})
 	if err != nil {
 		return nil, err
@@ -194,6 +204,7 @@ func NewTransportManager(params TransportManagerParams) (*TransportManager, erro
 			Handler:                       TransportManagerTransportHandler{params.SubscriberHandler, t, lgr},
 			FireOnTrackBySdp:              params.FireOnTrackBySdp,
 			EnableDataTracks:              params.EnableDataTracks,
+			RemotePeerConnection:          params.SubscriberRemotePeerConnection,
 		})
 		if err != nil {
 			return nil, err
