@@ -81,9 +81,15 @@ SUMMARY: 20 passed, 0 failed
 
 ## 已知限制
 
-- **NACK 跨节点**：lk（livekit-cli）的 media-sdk 客户端不发送 NACK，故 `--loss` 场景断言
-  连接质量下降而非 NACK。NACK 生成/处理由单测覆盖（`DownTrack.ProcessRTCP` →
-  `handleRTCP`）。如需 E2E 级 NACK 验证，需要一个启用 NACK interceptor 的真实客户端。
+- **NACK 跨节点**：NACK 是 RTCP 的一种类型，其跨节点路径与已验证的 up-RTCP（PLI/RR）和
+  down-RTCP（RR/XR）**完全相同**（房主 buffer 生成 → `onRTCP` → MediaChannel → 边缘
+  `pumpMediaChannelRTCPToPC` → `pc.WriteRTCP`；客户端 → 边缘 `pumpSenderRTCPToMediaChannel` →
+  房主 `DownTrack.ProcessRTCP`）。实测确认两点使"真实 NACK 包"难以 E2E 触发：
+  1) lk（livekit-cli）的 media-sdk 客户端**不发送 NACK**（无 NACK interceptor）；2) 上行
+  方向给边缘注入丢包会被边缘 pion PC 的 **RTX 重传修复**，房主 buffer 看不到空洞。
+  因此 NACK 的覆盖为：buffer 级生成（`TestNack` 单测）+ 跨节点 RTCP 路径（E2E 的
+  PLI/RR/RR/XR 证明同路径）+ `--loss` 质量反馈。如需真实 NACK E2E，需一个启用 NACK
+  interceptor 的客户端（如 livekit JS/Go SDK 接入场景）。
 - **数据通道消息**：跨节点只转发 SDP 协商（m=application）；DC 数据消息未桥接（§6.8 既定暂拆）。
 - **内网明文**：media_relay 明文 TCP，生产需内网隔离或 TLS（§9）。
 
