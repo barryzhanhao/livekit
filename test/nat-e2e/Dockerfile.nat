@@ -1,0 +1,7 @@
+# Runtime-only image: the fork's livekit-server binary is cross-compiled on the
+# host (02-build-image.sh) and copied in. No in-docker go build => no network.
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates libgcc
+COPY livekit-server /livekit-server
+EXPOSE 7880 7881 7882/udp 7883 7884
+ENTRYPOINT ["/livekit-server"]

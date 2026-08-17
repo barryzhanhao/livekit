@@ -24,6 +24,7 @@ import (
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/rtc"
+	"github.com/livekit/livekit-server/pkg/rtc/transport"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/protocol/livekit"
 )
@@ -104,7 +105,7 @@ func TestMediaRelayControlSession(t *testing.T) {
 
 	// The gateway is registered under the session ID for media routing.
 	require.Eventually(t, func() bool {
-		return relay.gateway("sess-1") != nil
+		return relay.gatewayFor("sess-1", transport.MediaDirectionUp) != nil
 	}, 2*time.Second, 10*time.Millisecond)
 
 	require.NoError(t, remote.Close())

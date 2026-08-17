@@ -17,11 +17,13 @@ package service
 import (
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/livekit/livekit-server/pkg/rtc"
 	"github.com/livekit/livekit-server/pkg/rtc/transport"
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
 )
 
 // MediaRelay is the cross-node endpoint for NAT mode ("media follows
@@ -169,22 +171,45 @@ func (m *MediaRelay) DialNodeHello(node *livekit.Node, hello transport.MediaHell
 	return transport.DialTCPMediaChannelHello(net.JoinHostPort(node.Ip, strconv.Itoa(m.port)), hello)
 }
 
-func (m *MediaRelay) registerGateway(sessionID string, gw *transport.MediaGateway) {
+func (m *MediaRelay) registerGateway(sessionID string, gw *transport.MediaGateway, isOfferer bool) {
 	m.mu.Lock()
-	m.gateways[sessionID] = gw
+	m.gateways[gatewayKey(sessionID, isOfferer)] = gw
 	m.mu.Unlock()
 }
 
-func (m *MediaRelay) unregisterGateway(sessionID string) {
+func (m *MediaRelay) unregisterGateway(sessionID string, isOfferer bool) {
 	m.mu.Lock()
-	delete(m.gateways, sessionID)
+	delete(m.gateways, gatewayKey(sessionID, isOfferer))
 	m.mu.Unlock()
 }
 
-func (m *MediaRelay) gateway(sessionID string) *transport.MediaGateway {
+// gatewayFor resolves the edge gateway for a media hello. In dual-PC mode the
+// publisher and subscriber PCs are separate gateways under the same sessionID:
+// the up (publisher) hello targets the answerer (!isOfferer) gateway, the down
+// (subscriber) hello the offerer one. In single-PC mode there is only one
+// gateway for the session, so fall back to it regardless of role.
+func (m *MediaRelay) gatewayFor(sessionID, direction string) *transport.MediaGateway {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.gateways[sessionID]
+	if gw := m.gateways[gatewayKey(sessionID, direction == transport.MediaDirectionDown)]; gw != nil {
+		return gw
+	}
+	// single-PC fallback: the only gateway registered for this session
+	prefix := sessionID + "|"
+	for k, gw := range m.gateways {
+		if strings.HasPrefix(k, prefix) {
+			return gw
+		}
+	}
+	return nil
+}
+
+func gatewayKey(sessionID string, isOfferer bool) string {
+	role := "subscriber" // offerer = subscriber PC
+	if !isOfferer {
+		role = "publisher" // answerer = publisher PC
+	}
+	return sessionID + "|" + role
 }
 
 func (m *MediaRelay) controlAcceptLoop() {
@@ -206,6 +231,7 @@ func (m *MediaRelay) handleControlSession(ch transport.ControlChannel) {
 	}
 	gw, setup, err := rtc.RunEdgeGatewaySession(ch, cfg, m.unregisterGateway)
 	if err != nil {
+		logger.Warnw("nat control session failed", err)
 		_ = ch.Close()
 		return
 	}
@@ -215,7 +241,8 @@ func (m *MediaRelay) handleControlSession(ch transport.ControlChannel) {
 		_ = ch.Close()
 		return
 	}
-	m.registerGateway(setup.SessionID, gw)
+	m.registerGateway(setup.SessionID, gw, setup.IsOfferer)
+	logger.Infow("nat control session established", "sessionID", setup.SessionID, "nodeIP", m.nodeIP)
 }
 
 func (m *MediaRelay) mediaAcceptLoop() {
@@ -232,12 +259,17 @@ func (m *MediaRelay) mediaAcceptLoop() {
 func (m *MediaRelay) handleMediaSession(ch transport.HelloMediaChannel) {
 	hello, err := ch.ReadHello()
 	if err != nil {
+		logger.Warnw("nat media session: failed to read hello", err)
 		_ = ch.Close()
 		return
 	}
-	gw := m.gateway(hello.SessionID)
+	logger.Debugw("nat media session hello",
+		"sessionID", hello.SessionID, "trackID", hello.TrackID,
+		"direction", hello.Direction, "ssrc", hello.SSRC, "codec", hello.Codec.MimeType)
+	gw := m.gatewayFor(hello.SessionID, hello.Direction)
 	if gw == nil {
 		// Unknown session: no gateway to attach to.
+		logger.Warnw("nat media session: unknown session", nil, "sessionID", hello.SessionID, "trackID", hello.TrackID)
 		_ = ch.Close()
 		return
 	}
@@ -245,6 +277,7 @@ func (m *MediaRelay) handleMediaSession(ch transport.HelloMediaChannel) {
 	// the TrackRemote, which the gateway discovers via OnTrack (wired in a later
 	// step), so pass nil for now.
 	if err := gw.Attach(hello, ch, nil); err != nil {
+		logger.Warnw("nat media session: attach failed", err, "sessionID", hello.SessionID, "trackID", hello.TrackID, "direction", hello.Direction)
 		_ = ch.Close()
 	}
 }

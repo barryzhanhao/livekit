@@ -1,0 +1,28 @@
+# LiveKit NAT multi-node E2E — base server config (identical on both nodes;
+# per-pod differences are injected via LIVEKIT_* env overrides in the pod spec).
+port: 7880
+rtc:
+  tcp_port: 7881
+  udp_port: 7882            # fixed external media port (NAT: advertise_ip:7882)
+  use_external_ip: false    # advertise_ip drives ICE via 1:1 NAT rewrite instead
+  node_ip: ""               # omitted: POD_IP env (hostNetwork -> node IP) is used
+  advertise_ip: ""          # set per pod via LIVEKIT_RTC_ADVERTISE_IP
+  stun_servers: []          # LAN test: no STUN/TURN; client reaches node IP directly
+  media_relay:
+    port: 7883              # internal plaintext RTP/RTCP (pod-to-pod)
+    control_port: 7884      # internal pion-PC control (pod-to-pod)
+keys:
+  devkey: secret            # standard LiveKit dev credentials (lk --dev-compatible)
+redis:
+  address: redis.default.svc:6379
+logging:
+  level: debug              # debug for NAT flow logging anchors
+  component_levels:         # suppress the SDP/trickle dumps that bloat kubectl logs
+    livekit.transport: info
+    livekit.pub: info
+    livekit.ice: info
+    livekit.sdp: info
+room:
+  auto_create: true
+  empty_timeout: 300
+  departure_timeout: 300

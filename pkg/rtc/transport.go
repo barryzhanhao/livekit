@@ -589,8 +589,12 @@ func newPeerConnection(
 		},
 		params.Logger,
 	)
-	// put rtx interceptor behind unhandle simulcast interceptor so it can get the correct mid & rid
-	ir.Add(rtxInfoExtractorFactory)
+	// The RTX extractor feeds the SFU receiver buffer. The edge node's gateway PC
+	// has no BufferFactory (media is buffered on the room node), so skip it there.
+	if params.Config.BufferFactory != nil {
+		// put rtx interceptor behind unhandle simulcast interceptor so it can get the correct mid & rid
+		ir.Add(rtxInfoExtractorFactory)
+	}
 
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(me),
@@ -736,6 +740,19 @@ func (t *PCTransport) setupRemotePeerConnection() (cc.BandwidthEstimator, error)
 	_ = pc.Close()
 
 	t.pc = t.params.RemotePeerConnection
+	// Wire the same state/ICE handlers the local path registers (createPeerConnection):
+	// the edge forwards its pion PC events over the ControlChannel, and these drive
+	// connectedAt / ICE state on the room node. Without them the transport never
+	// reaches isFullyEstablished and the participant times out at join.
+	if !t.params.UseOneShotSignallingMode {
+		t.pc.OnICEGatheringStateChange(t.onICEGatheringStateChange)
+		t.pc.OnICECandidate(t.onICECandidateTrickle)
+	}
+	t.pc.OnICEConnectionStateChange(t.onICEConnectionStateChange)
+	t.pc.OnConnectionStateChange(t.onPeerConnectionStateChange)
+	t.pc.OnDataChannel(t.onDataChannel)
+	t.pc.OnTrack(t.params.Handler.OnTrack)
+
 	t.me = me
 	t.rtxInfoExtractorFactory = rtxInfoExtractorFactory
 	return bwe, nil
@@ -1326,6 +1343,26 @@ func (t *PCTransport) CreateDataChannel(label string, dci *webrtc.DataChannelIni
 		return nil
 	}
 
+	if t.params.RemotePeerConnection != nil {
+		// NAT remote mode: the edge PC owns SCTP. Ask it to create the data
+		// channel (keeps the m=application section in the negotiated SDP); data
+		// message forwarding is deferred (§6.8). Mark the channel "opened" so the
+		// transport can reach isFullyEstablished once ICE connects.
+		if _, err := t.pc.CreateDataChannel(label, dci); err != nil {
+			return err
+		}
+		t.lock.Lock()
+		switch label {
+		case ReliableDataChannel:
+			t.reliableDCOpened = true
+		case LossyDataChannel:
+			t.lossyDCOpened = true
+		}
+		t.lock.Unlock()
+		t.params.Logger.Debugw("nat remote mode: data channel created on edge", "label", label)
+		return nil
+	}
+
 	dc, err := t.pc.CreateDataChannel(label, dci)
 	if err != nil {
 		return err
@@ -1506,6 +1543,11 @@ func (t *PCTransport) CreateDataChannelIfEmpty(dcLabel string, dci *webrtc.DataC
 }
 
 func (t *PCTransport) GetRTT() (float64, bool) {
+	// NAT remote mode has no local pion ICE transport (the edge node owns ICE);
+	// return no RTT rather than dereferencing a nil transport.
+	if t.iceTransport == nil {
+		return 0.0, false
+	}
 	scps, ok := t.iceTransport.GetSelectedCandidatePairStats()
 	if !ok {
 		return 0.0, false

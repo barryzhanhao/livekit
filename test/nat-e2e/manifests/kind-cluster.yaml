@@ -1,0 +1,24 @@
+# kind cluster: control-plane + 2 workers.
+#   kind-worker  = EDGE node  (client WS + media terminate here)
+#   kind-worker2 = ROOM node  (Participant/TransportManager/SFU)
+# Pods are pinned with nodeSelector via labels set here.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: nat-test
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        apiVersion: kubeadm.k8s.io/v1beta3
+        kind: ClusterConfiguration
+        metadata:
+          name: config
+        networking:
+          podSubnet: "10.244.0.0/16"
+          serviceSubnet: "10.96.0.0/12"
+  - role: worker
+    labels:
+      nat-role: edge
+  - role: worker
+    labels:
+      nat-role: room

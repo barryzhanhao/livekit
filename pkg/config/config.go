@@ -73,6 +73,10 @@ type Config struct {
 	KeyFile        string                   `yaml:"key_file,omitempty"`
 	Keys           map[string]string        `yaml:"keys,omitempty"`
 	Region         string                   `yaml:"region,omitempty"`
+	// NodeID overrides the auto-generated random node ID. NAT/K8s deployments set
+	// this to a stable value (e.g. the pod name) so a node keeps its identity
+	// across restarts and no stale duplicate registrations accumulate.
+	NodeID string `yaml:"node_id,omitempty"`
 	SignalRelay    SignalRelayConfig        `yaml:"signal_relay,omitempty"`
 	PSRPC          rpc.PSRPCConfig          `yaml:"psrpc,omitempty"`
 	// Deprecated: LogLevel is deprecated

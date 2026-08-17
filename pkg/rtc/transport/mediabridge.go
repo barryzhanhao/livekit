@@ -15,10 +15,14 @@
 package transport
 
 import (
+	"fmt"
+
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+
+	"github.com/livekit/protocol/logger"
 )
 
 // rtpPacketWriter is the narrow sink for outbound RTP packets on the edge node.
@@ -91,6 +95,7 @@ func pumpSenderRTCPToMediaChannel(sender *webrtc.RTPSender, dst MediaChannel) {
 		if err != nil {
 			continue
 		}
+		logger.Debugw("nat edge -> room down RTCP forwarded", "pkts", len(pkts), "types", rtcpTypes(pkts))
 		if err := dst.WriteRTCP(data); err != nil {
 			return
 		}
@@ -110,8 +115,45 @@ func pumpMediaChannelRTCPToPC(src MediaChannel, pc *webrtc.PeerConnection) {
 		if err != nil {
 			continue
 		}
+		logger.Debugw("nat room -> edge up RTCP forwarded", "pkts", len(pkts), "types", rtcpTypes(pkts))
 		if err := pc.WriteRTCP(pkts); err != nil {
 			return
 		}
+	}
+}
+
+// rtcpTypes summarizes the packet type names of an RTCP batch for logging.
+func rtcpTypes(pkts []rtcp.Packet) []string {
+	types := make([]string, 0, len(pkts))
+	for _, p := range pkts {
+		types = append(types, rtcpTypeName(p))
+	}
+	return types
+}
+
+func rtcpTypeName(p rtcp.Packet) string {
+	switch p.(type) {
+	case *rtcp.PictureLossIndication:
+		return "pli"
+	case *rtcp.FullIntraRequest:
+		return "fir"
+	case *rtcp.ReceiverEstimatedMaximumBitrate:
+		return "remb"
+	case *rtcp.TransportLayerNack:
+		return "nack"
+	case *rtcp.ReceiverReport:
+		return "rr"
+	case *rtcp.SenderReport:
+		return "sr"
+	case *rtcp.SourceDescription:
+		return "sdes"
+	case *rtcp.Goodbye:
+		return "bye"
+	case *rtcp.ExtendedReport:
+		return "xr"
+	case *rtcp.TransportLayerCC:
+		return "twcc"
+	default:
+		return fmt.Sprintf("type%T", p)
 	}
 }

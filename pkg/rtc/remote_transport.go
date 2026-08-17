@@ -17,6 +17,7 @@ package rtc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/pion/rtcp"
@@ -24,6 +25,7 @@ import (
 	"go.uber.org/atomic"
 
 	"github.com/livekit/livekit-server/pkg/rtc/transport"
+	"github.com/livekit/protocol/logger"
 )
 
 // remotePCMessage is the JSON control envelope exchanged over a ControlChannel
@@ -62,6 +64,7 @@ const (
 	remotePCOpICEGatheringState        = "ice_gathering_state"
 	remotePCOpConnectionState          = "connection_state"
 	remotePCOpSignalingState           = "signaling_state"
+	remotePCOpCreateDataChannel        = "create_data_channel"
 	remotePCOpClose                    = "close"
 
 	// events (edge -> room)
@@ -83,8 +86,6 @@ type remoteTrackEvent struct {
 	Mid      string                    `json:"mid,omitempty"`
 	Codec    webrtc.RTPCodecParameters `json:"codec"`
 }
-
-var errRemotePCOpUnsupported = errors.New("remote pc operation not yet supported")
 
 type remotePCResponse struct {
 	body json.RawMessage
@@ -114,6 +115,10 @@ type remotePeerConnection struct {
 
 	gatheringComplete chan struct{}
 	gatheringOnce     sync.Once
+
+	descMu     sync.Mutex
+	localDesc  *webrtc.SessionDescription
+	remoteDesc *webrtc.SessionDescription
 }
 
 var _ peerConnection = (*remotePeerConnection)(nil)
@@ -206,6 +211,7 @@ func (r *remotePeerConnection) dispatchEvent(msg remotePCMessage) {
 		if r.onRemoteTrack != nil {
 			var ev remoteTrackEvent
 			if err := json.Unmarshal(msg.Body, &ev); err == nil {
+				logger.Debugw("nat room received remote track event", "trackID", ev.TrackID, "ssrc", ev.SSRC, "codec", ev.Codec.MimeType, "mid", ev.Mid, "rid", ev.RID)
 				r.onRemoteTrack(ev)
 			}
 		}
@@ -256,13 +262,19 @@ func (r *remotePeerConnection) request(op string, body any) (json.RawMessage, er
 }
 
 // ---- negotiation (fire-and-forget with error) ----
+// Local/remote descriptions are cached on Set so the getters never round-trip.
+// They must not block the ControlChannel read loop: callers inside the dispatch
+// path (e.g. handleRemotePublishedTrack -> LastPublisherOffer) would otherwise
+// deadlock waiting for a response that only the read loop can deliver.
 
 func (r *remotePeerConnection) SetRemoteDescription(desc webrtc.SessionDescription) error {
+	r.cacheRemoteDesc(desc)
 	_, err := r.request(remotePCOpSetRemoteDescription, desc)
 	return err
 }
 
 func (r *remotePeerConnection) SetLocalDescription(desc webrtc.SessionDescription) error {
+	r.cacheLocalDesc(desc)
 	_, err := r.request(remotePCOpSetLocalDescription, desc)
 	return err
 }
@@ -294,6 +306,30 @@ func (r *remotePeerConnection) CreateAnswer(options *webrtc.AnswerOptions) (webr
 	return sd, err
 }
 
+func (r *remotePeerConnection) cacheLocalDesc(sd webrtc.SessionDescription) {
+	r.descMu.Lock()
+	r.localDesc = &sd
+	r.descMu.Unlock()
+}
+
+func (r *remotePeerConnection) cacheRemoteDesc(sd webrtc.SessionDescription) {
+	r.descMu.Lock()
+	r.remoteDesc = &sd
+	r.descMu.Unlock()
+}
+
+func (r *remotePeerConnection) cachedLocalDesc() *webrtc.SessionDescription {
+	r.descMu.Lock()
+	defer r.descMu.Unlock()
+	return r.localDesc
+}
+
+func (r *remotePeerConnection) cachedRemoteDesc() *webrtc.SessionDescription {
+	r.descMu.Lock()
+	defer r.descMu.Unlock()
+	return r.remoteDesc
+}
+
 func (r *remotePeerConnection) sdpGetter(op string) *webrtc.SessionDescription {
 	body, err := r.request(op, nil)
 	if err != nil {
@@ -310,19 +346,19 @@ func (r *remotePeerConnection) sdpGetter(op string) *webrtc.SessionDescription {
 }
 
 func (r *remotePeerConnection) LocalDescription() *webrtc.SessionDescription {
-	return r.sdpGetter(remotePCOpLocalDescription)
+	return r.cachedLocalDesc()
 }
 
 func (r *remotePeerConnection) RemoteDescription() *webrtc.SessionDescription {
-	return r.sdpGetter(remotePCOpRemoteDescription)
+	return r.cachedRemoteDesc()
 }
 
 func (r *remotePeerConnection) CurrentLocalDescription() *webrtc.SessionDescription {
-	return r.sdpGetter(remotePCOpCurrentLocalDescription)
+	return r.cachedLocalDesc()
 }
 
 func (r *remotePeerConnection) CurrentRemoteDescription() *webrtc.SessionDescription {
-	return r.sdpGetter(remotePCOpCurrentRemoteDescription)
+	return r.cachedRemoteDesc()
 }
 
 func (r *remotePeerConnection) PendingLocalDescription() *webrtc.SessionDescription {
@@ -422,33 +458,45 @@ func (r *remotePeerConnection) Close() error {
 }
 
 // ---- not yet wired (require MediaChannel establishment) ----
+// Each stub reports the operation name so a production hit is diagnosable.
 
-func (r *remotePeerConnection) AddTrack(webrtc.TrackLocal) (*webrtc.RTPSender, error) {
-	return nil, errRemotePCOpUnsupported
+func (r *remotePeerConnection) AddTrack(t webrtc.TrackLocal) (*webrtc.RTPSender, error) {
+	return nil, fmt.Errorf("remote pc AddTrack(%s) not yet supported", t.ID())
 }
 
-func (r *remotePeerConnection) AddTransceiverFromTrack(webrtc.TrackLocal, ...webrtc.RTPTransceiverInit) (*webrtc.RTPTransceiver, error) {
-	return nil, errRemotePCOpUnsupported
+func (r *remotePeerConnection) AddTransceiverFromTrack(t webrtc.TrackLocal, init ...webrtc.RTPTransceiverInit) (*webrtc.RTPTransceiver, error) {
+	return nil, fmt.Errorf("remote pc AddTransceiverFromTrack(%s) not yet supported", t.ID())
 }
 
-func (r *remotePeerConnection) AddTransceiverFromKind(webrtc.RTPCodecType, ...webrtc.RTPTransceiverInit) (*webrtc.RTPTransceiver, error) {
-	return nil, errRemotePCOpUnsupported
+func (r *remotePeerConnection) AddTransceiverFromKind(kind webrtc.RTPCodecType, init ...webrtc.RTPTransceiverInit) (*webrtc.RTPTransceiver, error) {
+	return nil, fmt.Errorf("remote pc AddTransceiverFromKind(%s) not yet supported", kind)
 }
 
-func (r *remotePeerConnection) RemoveTrack(*webrtc.RTPSender) error {
-	return errRemotePCOpUnsupported
+func (r *remotePeerConnection) RemoveTrack(s *webrtc.RTPSender) error {
+	return fmt.Errorf("remote pc RemoveTrack not yet supported")
 }
 
 func (r *remotePeerConnection) GetTransceivers() []*webrtc.RTPTransceiver {
 	return nil
 }
 
-func (r *remotePeerConnection) CreateDataChannel(string, *webrtc.DataChannelInit) (*webrtc.DataChannel, error) {
-	return nil, errRemotePCOpUnsupported
+func (r *remotePeerConnection) CreateDataChannel(label string, init *webrtc.DataChannelInit) (*webrtc.DataChannel, error) {
+	// The edge node owns SCTP in NAT mode: ask it to create the data channel so
+	// the negotiated SDP keeps its m=application section. The returned local
+	// *webrtc.DataChannel is a facade only (message forwarding is deferred, §6.8).
+	if _, err := r.request(remotePCOpCreateDataChannel, remotePCCreateDataChannelRequest{Label: label, Init: init}); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+type remotePCCreateDataChannelRequest struct {
+	Label string                  `json:"label"`
+	Init  *webrtc.DataChannelInit `json:"init,omitempty"`
 }
 
 func (r *remotePeerConnection) WriteRTCP([]rtcp.Packet) error {
-	return errRemotePCOpUnsupported
+	return fmt.Errorf("remote pc WriteRTCP not yet supported")
 }
 
 func (r *remotePeerConnection) GetStats() webrtc.StatsReport {

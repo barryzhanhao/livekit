@@ -16,10 +16,13 @@ package rtc
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	"github.com/pion/webrtc/v4"
 
 	"github.com/livekit/livekit-server/pkg/rtc/transport"
+	"github.com/livekit/protocol/logger"
 )
 
 // RunRemotePCExecutor is the edge-node side of the remote control plane. It
@@ -39,21 +42,36 @@ type remotePCExecutor struct {
 
 func (e *remotePCExecutor) registerEvents() {
 	e.pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		// pion signals the end of gathering with a nil candidate; skip it (the
+		// room learns about completion via the gathering-state event).
+		if c == nil {
+			return
+		}
 		body, _ := json.Marshal(c)
 		e.sendEvent(remotePCOpEventICECandidate, body)
+		logger.Debugw("nat edge ICE candidate", "candidate", c.String())
 	})
 	e.pc.OnICEGatheringStateChange(func(s webrtc.ICEGatheringState) {
 		body, _ := json.Marshal(int(s))
 		e.sendEvent(remotePCOpEventICEGatheringStateChange, body)
+		logger.Debugw("nat edge ICE gathering state", "state", s)
 	})
 	e.pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
 		body, _ := json.Marshal(int(s))
 		e.sendEvent(remotePCOpEventICEConnectionStateChange, body)
+		logger.Infow("nat edge ICE connection state", "state", s)
 	})
 	e.pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		body, _ := json.Marshal(int(s))
 		e.sendEvent(remotePCOpEventConnectionStateChange, body)
+		logger.Infow("nat edge peer connection state", "state", s)
 	})
+}
+
+// hasMediaKind reports whether the SDP contains a media section of the given
+// kind (used for concise negotiation logging).
+func hasMediaKind(sd webrtc.SessionDescription, kind string) bool {
+	return strings.Contains(sd.SDP, "\nm="+kind+" ") || strings.Contains(sd.SDP, "\rm="+kind+" ") || strings.HasPrefix(sd.SDP, "m="+kind+" ")
 }
 
 func (e *remotePCExecutor) sendEvent(op string, body json.RawMessage) {
@@ -95,6 +113,7 @@ func (e *remotePCExecutor) apply(msg remotePCMessage) (json.RawMessage, error) {
 		if err := json.Unmarshal(msg.Body, &sd); err != nil {
 			return nil, err
 		}
+		logger.Debugw("nat edge SetRemoteDescription", "type", sd.Type, "hasVideo", hasMediaKind(sd, "video"), "hasAudio", hasMediaKind(sd, "audio"))
 		return nil, e.pc.SetRemoteDescription(sd)
 
 	case remotePCOpSetLocalDescription:
@@ -102,6 +121,7 @@ func (e *remotePCExecutor) apply(msg remotePCMessage) (json.RawMessage, error) {
 		if err := json.Unmarshal(msg.Body, &sd); err != nil {
 			return nil, err
 		}
+		logger.Debugw("nat edge SetLocalDescription", "type", sd.Type)
 		return nil, e.pc.SetLocalDescription(sd)
 
 	case remotePCOpAddICECandidate:
@@ -109,6 +129,7 @@ func (e *remotePCExecutor) apply(msg remotePCMessage) (json.RawMessage, error) {
 		if err := json.Unmarshal(msg.Body, &c); err != nil {
 			return nil, err
 		}
+		logger.Debugw("nat edge AddICECandidate", "candidate", c.Candidate)
 		return nil, e.pc.AddICECandidate(c)
 
 	case remotePCOpCreateOffer:
@@ -116,6 +137,7 @@ func (e *remotePCExecutor) apply(msg remotePCMessage) (json.RawMessage, error) {
 		if err != nil {
 			return nil, err
 		}
+		logger.Debugw("nat edge CreateOffer", "hasVideo", hasMediaKind(sd, "video"))
 		return json.Marshal(sd)
 
 	case remotePCOpCreateAnswer:
@@ -123,6 +145,7 @@ func (e *remotePCExecutor) apply(msg remotePCMessage) (json.RawMessage, error) {
 		if err != nil {
 			return nil, err
 		}
+		logger.Debugw("nat edge CreateAnswer", "hasVideo", hasMediaKind(sd, "video"), "hasAudio", hasMediaKind(sd, "audio"))
 		return json.Marshal(sd)
 
 	case remotePCOpLocalDescription:
@@ -147,11 +170,27 @@ func (e *remotePCExecutor) apply(msg remotePCMessage) (json.RawMessage, error) {
 	case remotePCOpSignalingState:
 		return json.Marshal(int(e.pc.SignalingState()))
 
+	case remotePCOpCreateDataChannel:
+		var req remotePCCreateDataChannelRequest
+		if err := json.Unmarshal(msg.Body, &req); err != nil {
+			return nil, err
+		}
+		init := req.Init
+		if init == nil {
+			init = &webrtc.DataChannelInit{}
+		}
+		dc, err := e.pc.CreateDataChannel(req.Label, init)
+		if err != nil {
+			return nil, err
+		}
+		logger.Infow("nat edge created data channel", "label", req.Label, "id", dc.ID())
+		return json.Marshal(dc.ID())
+
 	case remotePCOpClose:
 		return nil, e.pc.Close()
 	}
 
-	return nil, errRemotePCOpUnsupported
+	return nil, fmt.Errorf("remote pc op %q not supported by edge executor", msg.Op)
 }
 
 func marshalSDP(sd *webrtc.SessionDescription) (json.RawMessage, error) {

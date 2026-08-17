@@ -50,6 +50,11 @@ type LocalNodeImpl struct {
 
 func NewLocalNode(conf *config.Config) (*LocalNodeImpl, error) {
 	nodeID := guid.New(utils.NodePrefix)
+	if conf != nil && conf.NodeID != "" {
+		// NAT/K8s: a stable node ID makes node identity survive pod restarts and
+		// avoids stale duplicate registrations in the Redis `nodes` hash.
+		nodeID = conf.NodeID
+	}
 	nowUnix := time.Now().Unix()
 	l := &LocalNodeImpl{
 		node: &livekit.Node{

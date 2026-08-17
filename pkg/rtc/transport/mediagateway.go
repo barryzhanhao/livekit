@@ -22,6 +22,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
 )
 
 // MediaGateway is the edge-node component of NAT mode ("media follows
@@ -36,7 +37,8 @@ import (
 // and all SFU logic stay on the room node. The gateway just executes the pion
 // PC and moves RTP/RTCP.
 type MediaGateway struct {
-	pc *webrtc.PeerConnection
+	pc        *webrtc.PeerConnection
+	sessionID string
 
 	mu         sync.RWMutex
 	downTracks map[livekit.TrackID]*gatewayDownTrack
@@ -88,6 +90,12 @@ func NewMediaGateway(pc *webrtc.PeerConnection) *MediaGateway {
 	return g
 }
 
+// SetSessionID tags this gateway with the participant session it serves, for
+// logging and diagnostics on the edge node (which hosts many sessions).
+func (g *MediaGateway) SetSessionID(sessionID string) {
+	g.sessionID = sessionID
+}
+
 // OnPublishedTrack registers a callback invoked for each publisher track the
 // pion PC receives. The edge service uses it to notify the room node (via the
 // control channel) so it can establish the up-direction MediaChannel.
@@ -131,6 +139,7 @@ func (g *MediaGateway) AddSubscriberTrack(trackID livekit.TrackID, codec webrtc.
 
 	go pumpMediaChannelToTrackLocal(ch, local)
 	go pumpSenderRTCPToMediaChannel(sender, ch)
+	logger.Debugw("nat gateway subscriber track attached", "trackID", trackID, "codec", codec.MimeType, "sessionID", g.sessionID)
 	return nil
 }
 
@@ -152,6 +161,11 @@ func (g *MediaGateway) AddPublisherTrack(trackID livekit.TrackID, remote rtpPack
 
 	go pumpTrackToMediaChannel(remote, ch)
 	go pumpMediaChannelRTCPToPC(ch, g.pc)
+	ssrc := uint32(0)
+	if tr, ok := remote.(*webrtc.TrackRemote); ok {
+		ssrc = uint32(tr.SSRC())
+	}
+	logger.Debugw("nat gateway publisher track attached", "trackID", trackID, "ssrc", ssrc, "sessionID", g.sessionID)
 	return nil
 }
 

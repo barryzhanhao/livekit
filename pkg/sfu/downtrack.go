@@ -2022,6 +2022,11 @@ func (d *DownTrack) getH264BlankFrame(_frameEndNeeded bool) ([]byte, error) {
 // ProcessRTCP feeds RTCP feedback (NACK/PLI/SR/RR) received over the
 // MediaChannel (NAT mode down direction) into the DownTrack's RTCP handling.
 func (d *DownTrack) ProcessRTCP(data []byte) {
+	var codec string
+	if c, ok := d.codec.Load().(webrtc.RTPCodecCapability); ok {
+		codec = c.MimeType
+	}
+	d.params.Logger.Debugw("nat down RTCP received from edge", "pkts", len(data), "codec", codec, "trackID", d.id)
 	d.handleRTCP(data)
 }
 

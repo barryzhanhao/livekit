@@ -125,7 +125,7 @@ func DialEdgeGatewaySession(ch transport.ControlChannel, setup GatewaySetup) (*r
 // remote-PC executor runs in the background and tears down the PC and gateway
 // when the channel closes; onClose (if set) is invoked with the session ID
 // immediately before teardown so the caller can unregister the gateway.
-func RunEdgeGatewaySession(ch transport.ControlChannel, cfg *WebRTCConfig, onClose func(sessionID string)) (*transport.MediaGateway, GatewaySetup, error) {
+func RunEdgeGatewaySession(ch transport.ControlChannel, cfg *WebRTCConfig, onClose func(sessionID string, isOfferer bool)) (*transport.MediaGateway, GatewaySetup, error) {
 	raw, err := ch.Receive()
 	if err != nil {
 		return nil, GatewaySetup{}, err
@@ -149,6 +149,8 @@ func RunEdgeGatewaySession(ch transport.ControlChannel, cfg *WebRTCConfig, onClo
 	sendGatewayAck(ch, nil)
 
 	gw := transport.NewMediaGateway(pc)
+	gw.SetSessionID(setup.SessionID)
+	logger.Debugw("nat edge gateway session starting", "sessionID", setup.SessionID, "isOfferer", setup.IsOfferer, "isSendSide", setup.IsSendSide, "oneShot", setup.UseOneShotSignallingMode)
 	// Forward published tracks (publisher, up direction) to the room node as
 	// control events; the room node then establishes the up-direction MediaChannel
 	// and pumps RTP into its SFU buffer.
@@ -173,8 +175,9 @@ func RunEdgeGatewaySession(ch transport.ControlChannel, cfg *WebRTCConfig, onClo
 		gw.Close()
 		_ = pc.Close()
 		if onClose != nil {
-			onClose(setup.SessionID)
+			onClose(setup.SessionID, setup.IsOfferer)
 		}
+		logger.Infow("nat edge gateway session closed", "sessionID", setup.SessionID)
 	}()
 	return gw, setup, nil
 }

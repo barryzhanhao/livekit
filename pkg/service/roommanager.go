@@ -241,6 +241,9 @@ func (r *RoomManager) establishRemoteSession(signalNodeID livekit.NodeID, sid li
 		_ = ch.Close()
 		return nil, nil, err
 	}
+	logger.Infow("nat remote session established",
+		"signalNodeID", signalNodeID, "signalNodeIP", node.Ip,
+		"participant", sid, "isOfferer", isOfferer, "oneShot", useOneShotSignallingMode)
 	dialer := func(hello transport.MediaHello) (transport.HelloMediaChannel, error) {
 		hello.SessionID = string(sid)
 		return r.mediaRelay.DialNodeHello(node, hello)

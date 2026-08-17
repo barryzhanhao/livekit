@@ -30,6 +30,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/pion/rtcp"
 	"github.com/pion/sdp/v3"
+	"github.com/pion/transport/v4/packetio"
 	"github.com/pion/webrtc/v4"
 	"github.com/pkg/errors"
 	"go.uber.org/atomic"
@@ -2019,10 +2020,14 @@ func (p *ParticipantImpl) setupTransportManager() error {
 			// pump plaintext RTP into the SFU buffer (see handleRemotePublishedTrack).
 			rpc.OnRemoteTrack(p.handleRemotePublishedTrack)
 		}
+		p.params.Logger.Infow("nat participant uses remote peer connection (NAT split)",
+			"signalNodeID", p.params.SignalNodeID, "useSinglePC", p.params.UseSinglePeerConnection)
 	}
 	var subscriberRemotePC peerConnection
 	if p.params.SubscriberRemoteControlChannel != nil {
 		subscriberRemotePC = NewRemotePeerConnection(p.params.SubscriberRemoteControlChannel)
+		p.params.Logger.Infow("nat participant uses remote subscriber peer connection (dual-PC)",
+			"signalNodeID", p.params.SignalNodeID)
 	}
 
 	params := TransportManagerParams{
@@ -4221,12 +4226,14 @@ func (p *ParticipantImpl) addTrackLocalRemote(trackLocal webrtc.TrackLocal) (*we
 		_ = ch.Close()
 		return nil, nil, err
 	}
+	p.params.Logger.Infow("nat down track attached (room -> edge)", "trackID", trackLocal.ID(), "ssrc", ssrc, "codec", hello.Codec.MimeType)
 	// Forward RTCP feedback (NACK/PLI/SR/RR) from the edge node back to the
 	// DownTrack (down-direction RTCP, NAT mode).
 	go func() {
 		for {
 			data, err := ch.ReadRTCP()
 			if err != nil {
+				p.params.Logger.Infow("nat down track RTCP loop ended", "trackID", trackLocal.ID())
 				return
 			}
 			downTrack.ProcessRTCP(data)
@@ -4268,7 +4275,13 @@ func (p *ParticipantImpl) handleRemotePublishedTrack(ev remoteTrackEvent) {
 		return
 	}
 
-	buff, _ := p.params.Config.BufferFactory.GetBufferPair(ev.SSRC)
+	buffFactory := p.params.Config.BufferFactory
+	// Remote mode has no local pion RTPReceiver to trigger buffer creation via
+	// the SettingEngine callback; create the RTP + RTCP buffers explicitly before
+	// the receiver binds (AddReceiver does buff.Bind with the negotiated codec).
+	buffFactory.GetOrNew(packetio.RTPBufferPacket, ev.SSRC)
+	buffFactory.GetOrNew(packetio.RTCPBufferPacket, ev.SSRC)
+	buff, _ := buffFactory.GetBufferPair(ev.SSRC)
 	if buff == nil {
 		_ = ch.Close()
 		p.params.Logger.Errorw("could not get buffer for remote published track", nil, "ssrc", ev.SSRC)
@@ -4281,7 +4294,7 @@ func (p *ParticipantImpl) handleRemotePublishedTrack(ev remoteTrackEvent) {
 	}
 	p.mediaTrackReceivedRemote(track, ev.Mid, parameters, ch)
 
-	p.params.Logger.Debugw("remote published track media plane established", "trackID", ev.TrackID, "ssrc", ev.SSRC, "codec", ev.Codec.MimeType, "track", track.ID())
+	p.params.Logger.Infow("remote published track media plane established", "trackID", ev.TrackID, "ssrc", ev.SSRC, "codec", ev.Codec.MimeType, "track", track.ID())
 	go transport.PumpRTP(ch, buff)
 }
 
@@ -4337,6 +4350,7 @@ func (p *ParticipantImpl) mediaTrackReceivedRemote(track sfu.TrackRemote, mid st
 		if err != nil {
 			return
 		}
+		p.params.Logger.Infow("nat up RTCP forwarded to edge", "trackID", track.ID(), "ssrc", track.SSRC(), "pkts", len(pkts))
 		_ = ch.WriteRTCP(data)
 	}
 	if _, isReceiverAdded := mt.AddReceiver(parameters, track, mid, onRTCP); !isReceiverAdded && newTrack {
@@ -4344,7 +4358,16 @@ func (p *ParticipantImpl) mediaTrackReceivedRemote(track sfu.TrackRemote, mid st
 		return
 	}
 
+	if newTrack {
+		// Mirror the local publish path: notify the room's track manager, broadcast
+		// the participant update, and subscribe existing participants (otherwise
+		// ResolveMediaTrackForSubscriber finds no track and subscriptions fail).
+		// Run async like the local path to avoid blocking the control read loop.
+		go p.handleTrackPublished(mt, false)
+	}
+
 	p.setIsPublisher(true)
+	p.params.Logger.Infow("nat up track receiver registered", "trackID", track.ID(), "ssrc", track.SSRC(), "mid", mid, "codec", track.Codec().MimeType)
 }
 
 func (p *ParticipantImpl) AddTransceiverFromTrackLocal(
