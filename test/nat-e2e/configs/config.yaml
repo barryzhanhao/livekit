@@ -26,3 +26,8 @@ room:
   auto_create: true
   empty_timeout: 300
   departure_timeout: 300
+turn:
+  enabled: true            # in-process TURN: exercise iceServersForParticipant +
+  udp_port: 3478           # TURN credential issuance in the join response
+  relay_range_start: 50000
+  relay_range_end: 50100

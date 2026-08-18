@@ -118,6 +118,10 @@ type RTCClient struct {
 	disconnected        atomic.Bool
 	activeSpeakers      atomic.Pointer[[]*livekit.SpeakerInfo]
 	connectionQuality   atomic.Pointer[[]*livekit.ConnectionQualityInfo]
+
+	// iceServers from the Join response (TURN credentials), exposed for the
+	// turn-credentials E2E scenario
+	joinIceServers atomic.Pointer[[]*livekit.ICEServer]
 }
 
 var (
@@ -529,6 +533,10 @@ func (c *RTCClient) handleSignalResponse(res *livekit.SignalResponse) error {
 				Credential: is.Credential,
 			})
 		}
+		c.lock.Lock()
+		joinServers := append([]*livekit.ICEServer(nil), msg.Join.IceServers...)
+		c.joinIceServers.Store(&joinServers)
+		c.lock.Unlock()
 		if len(iceServers) == 0 {
 			iceServers = rtcConf.ICEServers
 		}
@@ -760,6 +768,16 @@ func (c *RTCClient) ActiveSpeakers() []*livekit.SpeakerInfo {
 // nil if none was received.
 func (c *RTCClient) LastConnectionQuality() []*livekit.ConnectionQualityInfo {
 	p := c.connectionQuality.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// JoinIceServers returns the ICE servers (STUN/TURN incl. TURN credentials) from
+// the Join response, or nil if none was received.
+func (c *RTCClient) JoinIceServers() []*livekit.ICEServer {
+	p := c.joinIceServers.Load()
 	if p == nil {
 		return nil
 	}

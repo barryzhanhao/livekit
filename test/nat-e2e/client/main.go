@@ -1067,7 +1067,30 @@ func scenarioConnectionQuality(url, apiKey, apiSecret, room string) {
 	os.Exit(1)
 }
 
-// waitRemoteIdentity polls until c sees a remote participant with the identity.
+// scenarioTurnCredentials: with the in-process TURN server enabled, every join
+// response must carry a TURN server (iceServersForParticipant) with valid,
+// non-empty credentials (TURN auth handler). The client need not connect through
+// TURN — asserting the issued credentials exercises the server's TURN path.
+func scenarioTurnCredentials(url, apiKey, apiSecret, room string) {
+	c := newClient(url, apiKey, apiSecret, room, "go-turn-pub")
+	waitConnected(c)
+
+	servers := c.JoinIceServers()
+	for _, is := range servers {
+		for _, u := range is.Urls {
+			if strings.HasPrefix(u, "turn:") || strings.HasPrefix(u, "turns:") {
+				if is.Username == "" || is.Credential == "" {
+					fmt.Println("TURN_CREDENTIALS: FAIL TURN server", u, "has empty credentials")
+					os.Exit(1)
+				}
+				fmt.Println("TURN_CREDENTIALS: PASS (join issued TURN", u, "user", is.Username, ")")
+				return
+			}
+		}
+	}
+	fmt.Println("TURN_CREDENTIALS: FAIL no TURN server in join response", servers)
+	os.Exit(1)
+}
 func waitRemoteIdentity(c *testclient.RTCClient, identity string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1649,6 +1672,8 @@ func main() {
 		scenarioSyncState(*url, *apiKey, *apiSecret, *room)
 	case "connection-quality":
 		scenarioConnectionQuality(*url, *apiKey, *apiSecret, *room)
+	case "turn-credentials":
+		scenarioTurnCredentials(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

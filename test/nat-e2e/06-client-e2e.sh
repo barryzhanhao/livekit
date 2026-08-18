@@ -283,6 +283,10 @@ if run_scenario sync-state yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 # cross-node (SignalResponse_ConnectionQuality over the relay).
 if run_scenario connection-quality yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
+# turn-credentials: with the in-process TURN server enabled, the join response
+# must carry a TURN server (iceServersForParticipant) with valid credentials.
+if run_scenario turn-credentials yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
 # health: HTTP / on both nodes (defaultHandler → healthCheck, node-stats
 # heartbeat freshness). Client-facing edge + room node must both answer 200 OK.
 if curl -s -m 5 "http://$(edge_node_ip):7880/" | grep -q '^OK$' && curl -s -m 5 "http://$(room_node_ip):7880/" | grep -q '^OK$'; then
