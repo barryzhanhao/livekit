@@ -11,6 +11,7 @@ rtc:
   media_relay:
     port: 7883              # internal plaintext RTP/RTCP (pod-to-pod)
     control_port: 7884      # internal pion-PC control (pod-to-pod)
+    secret: nat-e2e-relay-secret   # shared cross-node auth (P0-1); empty = no auth
 keys:
   devkey: secret            # standard LiveKit dev credentials (lk --dev-compatible)
 webhook:

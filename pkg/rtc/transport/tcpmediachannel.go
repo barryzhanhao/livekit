@@ -224,17 +224,25 @@ func readFrame(r io.Reader) (byte, []byte, error) {
 }
 
 // TCPMediaChannelListener accepts TCP connections and wraps each as a MediaChannel.
+// When created with a non-empty shared secret, every accepted connection must
+// complete the node-to-node auth handshake before it is usable.
 type TCPMediaChannelListener struct {
-	ln net.Listener
+	ln     net.Listener
+	secret string
 }
 
-// ListenTCPMediaChannel binds a TCP listener on addr (e.g. ":7883").
-func ListenTCPMediaChannel(addr string) (*TCPMediaChannelListener, error) {
+// ListenTCPMediaChannel binds a TCP listener on addr (e.g. ":7883"). Pass an
+// optional shared secret to require cross-node auth on every accepted connection.
+func ListenTCPMediaChannel(addr string, secret ...string) (*TCPMediaChannelListener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	return &TCPMediaChannelListener{ln: ln}, nil
+	sec := ""
+	if len(secret) > 0 {
+		sec = secret[0]
+	}
+	return &TCPMediaChannelListener{ln: ln, secret: sec}, nil
 }
 
 // Addr returns the listener's bound address.
@@ -248,6 +256,10 @@ func (l *TCPMediaChannelListener) Accept() (MediaChannel, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := authHandshake(conn, l.secret, true); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	return NewTCPMediaChannel(conn), nil
 }
 
@@ -256,6 +268,10 @@ func (l *TCPMediaChannelListener) Accept() (MediaChannel, error) {
 func (l *TCPMediaChannelListener) AcceptHello() (HelloMediaChannel, error) {
 	conn, err := l.ln.Accept()
 	if err != nil {
+		return nil, err
+	}
+	if err := authHandshake(conn, l.secret, true); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 	return newTCPHelloMediaChannel(conn), nil
@@ -267,19 +283,38 @@ func (l *TCPMediaChannelListener) Close() error {
 }
 
 // DialTCPMediaChannel dials addr and returns the connection as a MediaChannel.
-func DialTCPMediaChannel(addr string) (MediaChannel, error) {
+// Pass the same shared secret the peer's listener was created with to complete
+// the cross-node auth handshake.
+func DialTCPMediaChannel(addr string, secret ...string) (MediaChannel, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
+		return nil, err
+	}
+	sec := ""
+	if len(secret) > 0 {
+		sec = secret[0]
+	}
+	if err := authHandshake(conn, sec, false); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 	return NewTCPMediaChannel(conn), nil
 }
 
-// DialTCPMediaChannelHello dials addr, sends the hello frame, and returns the
-// hello-capable channel. The peer must accept with AcceptHello and call ReadHello.
-func DialTCPMediaChannelHello(addr string, hello MediaHello) (HelloMediaChannel, error) {
+// DialTCPMediaChannelHello dials addr, completes the auth handshake, sends the
+// hello frame, and returns the hello-capable channel. The peer must accept with
+// AcceptHello and call ReadHello.
+func DialTCPMediaChannelHello(addr string, hello MediaHello, secret ...string) (HelloMediaChannel, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
+		return nil, err
+	}
+	sec := ""
+	if len(secret) > 0 {
+		sec = secret[0]
+	}
+	if err := authHandshake(conn, sec, false); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 	c := newTCPHelloMediaChannel(conn)

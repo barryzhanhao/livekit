@@ -95,7 +95,7 @@ func NewLivekitServer(conf *config.Config,
 		// turn server starts automatically
 		turnServer:  turnServer,
 		currentNode: currentNode,
-		mediaRelay:  NewMediaRelay(currentNode.NodeIP(), conf.RTC.MediaRelay.Port, conf.RTC.MediaRelay.ControlPort),
+		mediaRelay:  NewMediaRelay(currentNode.NodeIP(), conf.RTC.MediaRelay.Port, conf.RTC.MediaRelay.ControlPort, conf.RTC.MediaRelay.Secret),
 		closedChan:  make(chan struct{}),
 	}
 	// The media relay needs the node's WebRTC config to build edge gateway peer

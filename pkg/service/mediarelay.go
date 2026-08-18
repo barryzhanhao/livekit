@@ -15,6 +15,7 @@
 package service
 
 import (
+	"errors"
 	"net"
 	"strconv"
 	"strings"
@@ -35,10 +36,16 @@ import (
 // address is node.Ip:<port> (media) / node.Ip:<control_port> (control). The
 // dialed node.Ip is the internal pod IP (see routing.NewLocalNode), so control
 // and media flow over the internal network.
+//
+// When a non-empty secret is configured, every inbound channel must complete the
+// shared-secret auth handshake (see transport.authHandshake) before media/control
+// frames are exchanged — the internal TCP channels are otherwise plaintext, so a
+// cluster must either set this secret or rely on strict network isolation.
 type MediaRelay struct {
 	nodeIP      string
 	port        int
 	controlPort int
+	secret      string
 
 	cfgMu sync.RWMutex
 	cfg   *rtc.WebRTCConfig
@@ -53,11 +60,16 @@ type MediaRelay struct {
 	wg   sync.WaitGroup
 }
 
-func NewMediaRelay(nodeIP string, port, controlPort int) *MediaRelay {
+func NewMediaRelay(nodeIP string, port, controlPort int, secret ...string) *MediaRelay {
+	sec := ""
+	if len(secret) > 0 {
+		sec = secret[0]
+	}
 	return &MediaRelay{
 		nodeIP:      nodeIP,
 		port:        port,
 		controlPort: controlPort,
+		secret:      sec,
 		gateways:    make(map[string]*transport.MediaGateway),
 		done:        make(chan struct{}),
 	}
@@ -84,13 +96,13 @@ func (m *MediaRelay) Start() error {
 		return nil
 	}
 
-	ln, err := transport.ListenTCPMediaChannel(net.JoinHostPort(m.nodeIP, strconv.Itoa(m.port)))
+	ln, err := transport.ListenTCPMediaChannel(net.JoinHostPort(m.nodeIP, strconv.Itoa(m.port)), m.secret)
 	if err != nil {
 		return err
 	}
 	m.mediaListener = ln
 
-	cln, err := transport.ListenTCPControlChannel(net.JoinHostPort(m.nodeIP, strconv.Itoa(m.controlPort)))
+	cln, err := transport.ListenTCPControlChannel(net.JoinHostPort(m.nodeIP, strconv.Itoa(m.controlPort)), m.secret)
 	if err != nil {
 		_ = m.mediaListener.Close()
 		m.mediaListener = nil
@@ -155,20 +167,20 @@ func (m *MediaRelay) AcceptHello() (transport.HelloMediaChannel, error) {
 // DialNode dials a peer node's media relay (node.Ip:<port>) and returns the
 // connection as a MediaChannel.
 func (m *MediaRelay) DialNode(node *livekit.Node) (transport.MediaChannel, error) {
-	return transport.DialTCPMediaChannel(net.JoinHostPort(node.Ip, strconv.Itoa(m.port)))
+	return transport.DialTCPMediaChannel(net.JoinHostPort(node.Ip, strconv.Itoa(m.port)), m.secret)
 }
 
 // DialNodeControl dials a peer node's control relay (node.Ip:<control_port>) and
 // returns the connection as a ControlChannel.
 func (m *MediaRelay) DialNodeControl(node *livekit.Node) (transport.ControlChannel, error) {
-	return transport.DialTCPControlChannel(net.JoinHostPort(node.Ip, strconv.Itoa(m.controlPort)))
+	return transport.DialTCPControlChannel(net.JoinHostPort(node.Ip, strconv.Itoa(m.controlPort)), m.secret)
 }
 
 // DialNodeHello dials a peer node's media relay (node.Ip:<port>), sends the hello
 // frame, and returns the hello-capable channel. This is the per-track media
 // establishment primitive used by the room node's subscription/up-track paths.
 func (m *MediaRelay) DialNodeHello(node *livekit.Node, hello transport.MediaHello) (transport.HelloMediaChannel, error) {
-	return transport.DialTCPMediaChannelHello(net.JoinHostPort(node.Ip, strconv.Itoa(m.port)), hello)
+	return transport.DialTCPMediaChannelHello(net.JoinHostPort(node.Ip, strconv.Itoa(m.port)), hello, m.secret)
 }
 
 func (m *MediaRelay) registerGateway(sessionID string, gw *transport.MediaGateway, isOfferer bool) {
@@ -217,7 +229,15 @@ func (m *MediaRelay) controlAcceptLoop() {
 	for {
 		ch, err := m.controlListener.Accept()
 		if err != nil {
-			return
+			// A per-connection auth rejection (wrong/absent secret) returns an
+			// error from Accept — this must NOT kill the accept loop, or a single
+			// unauthenticated dial would permanently disable the node's control
+			// plane. Only a listener close is fatal.
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logger.Warnw("nat control accept rejected", err)
+			continue
 		}
 		go m.handleControlSession(ch)
 	}
@@ -250,7 +270,13 @@ func (m *MediaRelay) mediaAcceptLoop() {
 	for {
 		ch, err := m.mediaListener.AcceptHello()
 		if err != nil {
-			return
+			// see controlAcceptLoop: an auth-rejected connection must not kill
+			// the accept loop; only a listener close is fatal.
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logger.Warnw("nat media accept rejected", err)
+			continue
 		}
 		go m.handleMediaSession(ch)
 	}

@@ -474,6 +474,11 @@ ROOM_ICE="${ROOM_GO}-icerestart"
 seed_room_map "$ROOM_ICE"
 if run_scenario simulate-ice-restart yes "$ROOM_ICE"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
+# security-auth: the cross-node media_relay + control channels require the shared
+# secret (media_relay.secret, P0-1). A wrong-secret dial to the EDGE's relays must
+# be rejected by the auth handshake. Self-contained client assertion (needs no room).
+if run_scenario security-auth yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
 # multi-edge: two clients signal to DIFFERENT edge nodes (edge1 + edge2) for the
 # SAME room hosted on the room node. Media must follow signaling on BOTH edges —
 # pub(edge1)→sub(edge2) AND sub(edge2)→pub(edge1) both flow (each via the room

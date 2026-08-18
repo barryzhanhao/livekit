@@ -152,18 +152,26 @@ func (c *tcpControlChannel) Close() error {
 	return nil
 }
 
-// TCPControlChannelListener accepts TCP connections and wraps each as a ControlChannel.
+// TCPControlChannelListener accepts TCP connections and wraps each as a
+// ControlChannel. When created with a non-empty shared secret, every accepted
+// connection must complete the node-to-node auth handshake before use.
 type TCPControlChannelListener struct {
-	ln net.Listener
+	ln     net.Listener
+	secret string
 }
 
-// ListenTCPControlChannel binds a TCP listener on addr for inbound control connections.
-func ListenTCPControlChannel(addr string) (*TCPControlChannelListener, error) {
+// ListenTCPControlChannel binds a TCP listener on addr for inbound control
+// connections. Pass an optional shared secret to require cross-node auth.
+func ListenTCPControlChannel(addr string, secret ...string) (*TCPControlChannelListener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	return &TCPControlChannelListener{ln: ln}, nil
+	sec := ""
+	if len(secret) > 0 {
+		sec = secret[0]
+	}
+	return &TCPControlChannelListener{ln: ln, secret: sec}, nil
 }
 
 // Addr returns the listener's bound address.
@@ -177,6 +185,10 @@ func (l *TCPControlChannelListener) Accept() (ControlChannel, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := authHandshake(conn, l.secret, true); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	return NewTCPControlChannel(conn), nil
 }
 
@@ -185,10 +197,20 @@ func (l *TCPControlChannelListener) Close() error {
 	return l.ln.Close()
 }
 
-// DialTCPControlChannel dials addr and returns the connection as a ControlChannel.
-func DialTCPControlChannel(addr string) (ControlChannel, error) {
+// DialTCPControlChannel dials addr and returns the connection as a
+// ControlChannel. Pass the same shared secret the peer's listener was created
+// with to complete the cross-node auth handshake.
+func DialTCPControlChannel(addr string, secret ...string) (ControlChannel, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
+		return nil, err
+	}
+	sec := ""
+	if len(secret) > 0 {
+		sec = secret[0]
+	}
+	if err := authHandshake(conn, sec, false); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 	return NewTCPControlChannel(conn), nil

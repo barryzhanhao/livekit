@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/twitchtv/twirp"
 
+	"github.com/livekit/livekit-server/pkg/rtc/transport"
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	testclient "github.com/livekit/livekit-server/test/client"
 )
@@ -1520,6 +1522,26 @@ func scenarioSimulateICERestart(url, apiKey, apiSecret, room string) {
 	}
 	fmt.Println("SIMULATE_ICE_RESTART: PASS (media continued on both sides after server-driven ICE restart)")
 }
+
+// scenarioSecurityAuth: the cross-node media_relay + control channels require the
+// shared secret (media_relay.secret, P0-1). Dialing the EDGE node's relays with a
+// WRONG secret must be rejected by the auth handshake — proving the internal TCP
+// channels are not open to unauthenticated peers.
+func scenarioSecurityAuth(url, apiKey, apiSecret, room string) {
+	edgeHost := mustParseURL(url).Hostname()
+
+	_, err := transport.DialTCPControlChannel(net.JoinHostPort(edgeHost, "7884"), "wrong-secret")
+	if err == nil {
+		fmt.Println("SECURITY_AUTH: FAIL control relay accepted a wrong-secret dial")
+		os.Exit(1)
+	}
+	_, err = transport.DialTCPMediaChannel(net.JoinHostPort(edgeHost, "7883"), "wrong-secret")
+	if err == nil {
+		fmt.Println("SECURITY_AUTH: FAIL media relay accepted a wrong-secret dial")
+		os.Exit(1)
+	}
+	fmt.Println("SECURITY_AUTH: PASS (cross-node relays reject unauthenticated dials)")
+}
 func waitRemoteIdentity(c *testclient.RTCClient, identity string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -2038,7 +2060,7 @@ func main() {
 	apiKey := flag.String("api-key", "devkey", "API key")
 	apiSecret := flag.String("api-secret", "secret", "API secret")
 	room := flag.String("room", "nat-go", "room name")
-	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events|subscriber-pli|media-follows-signaling|multi-edge|simulate-ice-restart")
+	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events|subscriber-pli|media-follows-signaling|multi-edge|simulate-ice-restart|security-auth")
 	flag.Parse()
 
 	switch *scenario {
@@ -2126,6 +2148,8 @@ func main() {
 		scenarioMultiEdge(*url, *apiKey, *apiSecret, *room, *url2)
 	case "simulate-ice-restart":
 		scenarioSimulateICERestart(*url, *apiKey, *apiSecret, *room)
+	case "security-auth":
+		scenarioSecurityAuth(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

@@ -188,6 +188,12 @@ type MediaRelayConfig struct {
 	// signaling"). Nodes dial node_ip:control_port to drive an edge node's PC.
 	// 0 binds an ephemeral port.
 	ControlPort int `yaml:"control_port,omitempty"`
+	// Secret is a shared cluster secret used to authenticate node-to-node TCP
+	// connections (media_relay + control). When set, every inbound channel must
+	// complete the shared-secret handshake before media/control frames are
+	// exchanged; a node that dials without the secret is rejected. Leave empty
+	// only when the internal network is strictly isolated.
+	Secret string `yaml:"secret,omitempty"`
 }
 
 var DefaultMediaRelayConfig = MediaRelayConfig{
