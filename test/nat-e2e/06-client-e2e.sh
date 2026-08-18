@@ -90,7 +90,8 @@ if run_scenario receive-before-publish yes; then PASS=$((PASS+1)); else FAIL=$((
 # RTCP to the room's DownTrack AND (b) the room's DownTrack actually retransmitted
 # (nackAcks >= 1 in its rtp stats on close) — the full cross-node NACK→RTX round-trip.
 if run_scenario nack yes; then
-  if wait_log edge 'nat edge -> room down RTCP forwarded.*nack' 40 && wait_log room 'rtp stats' 60; then
+  if wait_log edge 'nat edge -> room down RTCP forwarded.*nack' 40 \
+  && wait_log room 'rtp stats.*go-nack-sub' 60; then
     n="$(edge_logs --since=3m | grep -c 'nat edge -> room down RTCP forwarded.*nack' || true)"
     n="${n:-0}"
     na="$(room_logs --since=3m | grep 'rtp stats' | grep 'go-nack-sub' | grep -o '"nackAcks": [0-9]*' | grep -o '[0-9]*' | awk '$1>0' | head -1 || true)"
@@ -102,7 +103,7 @@ if run_scenario nack yes; then
       echo "  ✗ NACK: forwarded=$n retransmit(nackAcks)=${na:-none}"; FAIL=$((FAIL+1))
     fi
   else
-    echo "  ✗ NACK: no nack-typed down RTCP reached the room, or no DownTrack stats"; FAIL=$((FAIL+1))
+    echo "  ✗ NACK: no nack-typed down RTCP reached the room, or no go-nack-sub DownTrack stats"; FAIL=$((FAIL+1))
   fi
 else
   FAIL=$((FAIL+1))
@@ -427,6 +428,38 @@ if run_scenario webhook-events yes "$ROOM_WEB"; then
 else
   FAIL=$((FAIL+1))
 fi
+
+# subscriber-pli: the down-direction RTCP PLI path (keyframe-request variant of
+# the down-RTCP loop, complementary to NACK). The subscriber sends a PLI; the
+# room's DownTrack must process it and request a publisher keyframe (`sending PLI
+# RTCP` — this is the SSRC-rewrite fix's PLI proof; before the fix the edge-rewritten
+# MediaSSRC was dropped at `p.MediaSSRC == d.ssrc`). FRESH room; scoped to go-pli-sub.
+ROOM_PLI="${ROOM_GO}-pli"
+seed_room_map "$ROOM_PLI"
+if run_scenario subscriber-pli yes "$ROOM_PLI"; then
+  if wait_log room 'sending PLI RTCP' 40; then
+    npl="$(room_logs --since=3m | grep 'sending PLI RTCP' | grep -c 'go-pli-sub' || true)"; npl="${npl:-0}"
+    if [ "$npl" -ge 1 ]; then
+      echo "  ✓ SUBSCRIBER-PLI: room DownTrack processed the subscriber PLI (x$npl) and requested a keyframe"
+      PASS=$((PASS+1))
+    else
+      echo "  ✗ SUBSCRIBER-PLI: 'sending PLI RTCP' present but not scoped to go-pli-sub"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ✗ SUBSCRIBER-PLI: room DownTrack did not process the subscriber PLI"; FAIL=$((FAIL+1))
+  fi
+else
+  FAIL=$((FAIL+1))
+fi
+
+# media-follows-signaling: the core boundary — media terminates on the EDGE node
+# the client signaled to. The server's PCs run on the edge (advertise_ip), so the
+# client's remote ICE candidates must carry the edge IP (= the WS hostname), never
+# the room node's. Self-contained client assertion (candidate IP + media flowed).
+# FRESH room (shared room slows joins late in the suite).
+ROOM_MFS="${ROOM_GO}-mfs"
+seed_room_map "$ROOM_MFS"
+if run_scenario media-follows-signaling yes "$ROOM_MFS"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
 # health: HTTP / on both nodes (defaultHandler → healthCheck, node-stats
 # heartbeat freshness). Client-facing edge + room node must both answer 200 OK.

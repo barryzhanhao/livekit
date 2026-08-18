@@ -113,6 +113,8 @@ cd test/nat-e2e
 | simulcast-switch | 真实 3 层 simulcast（`lk --publish-demo` 发 3-SSRC H264）+ Go 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`，MediaGateway 修复的证明）+ DownTrack max-subscribed 层随请求 0/1/2（层选择路径）；下切可真实生效（客户端码率骤降）、上切受层锁 PLI 限制（见已知限制） |
 | reconnect-resume | `reconnect=true` resume 协商路径：断信令后同 SID resume → 服务端走 `resuming RTC session`（`ResumeParticipant`）→ 客户端观察到**干净 resume**（`SignalResponse_Reconnect`，媒体继续）或干净拒绝（`SignalResponse_Leave` RECONNECT → 全量重连回退），媒体必恢复、绝不挂起 |
 | webhook-events | 服务端 webhook（HTTP 回调）路径：加入/发布/离开触发 `participant_joined`/`track_published`/`track_unpublished`/`participant_left`，POST 到集群内 receiver pod（`webhook-receiver.default.svc:8080/webhook`），receiver **验证 JWT sha256 签名**（0 rejected）后逐条记录（HMAC 签名验证端到端） |
+| subscriber-pli | 下行 RTCP 的 **PLI 路径**（keyframe 请求变体，与 NACK 互补）：订阅者发真 PLI → 房主 DownTrack 处理并请求发布者 keyframe（`sending PLI RTCP`，SSRC 重写修复的 PLI 证明——修复前边缘重写 SSRC 被 `p.MediaSSRC == d.ssrc` 丢弃） |
+| media-follows-signaling | 核心边界 IP 级证明：**媒体终止于信令节点（边缘）**——服务端 PC 跑在边缘（advertise_ip），客户端收到的远端 ICE candidate 必须携带边缘 IP（= WS hostname），绝不含房主 IP；断言 candidate 含边缘 IP + 媒体实际流动 |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
 
@@ -143,7 +145,7 @@ SUMMARY: 37 passed, 0 failed
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 39 passed, 0 failed
+GO-CLIENT SUMMARY: 41 passed, 0 failed
   (receive-before-publish / NACK / data / attributes / metadata / mute /
    multitrack / single-pc / whip / manual-subscribe / participant-name /
    room-admin / track-pause / room-lifecycle / service-apis /
@@ -152,7 +154,8 @@ GO-CLIENT SUMMARY: 39 passed, 0 failed
    room-move-forward / whip-ice-restart / health / simulate-speaker /
    simulate-node-failure / simulate-server-leave / sub-perm-revoke /
    participant-leave-visible / sync-state / connection-quality / turn-credentials /
-   reconnect / perform-rpc / simulcast-switch / reconnect-resume / webhook-events)
+   reconnect / perform-rpc / simulcast-switch / reconnect-resume / webhook-events /
+   subscriber-pli / media-follows-signaling)
 ```
 
 覆盖的功能：
@@ -280,7 +283,9 @@ GO-CLIENT SUMMARY: 39 passed, 0 failed
   `ActiveSpeakers`/`LastConnectionQuality`/`ResumeAccepted` 访问器，以及 resume 支持：
   `Options.Reconnect`/`Options.ReconnectSID`（WS URL 带 `reconnect=true&sid=`）与
   `RTCClient.Resume(host, token, opts)`（重连信令 WS、复用既有 PC，真实客户端 resume 行为），
-  支撑 simulate / speaker / 质量 / reconnect-resume 场景的客户端侧断言。speaker delta 是
+  支撑 simulate / speaker / 质量 / reconnect-resume 场景的客户端侧断言。另新增 `SendPLI`
+  （发真 RTCP PictureLossIndication，subscriber-pli 场景）与 `RemoteCandidateIPs` +
+  Trickle candidate 捕获（media-follows-signaling 场景断言边缘 IP）。speaker delta 是
   **按订阅者收窄**的（`SendSpeakerUpdate(force=false)` 只发给已订阅该发言者的参与者或发言者
   本人），simulate-speaker 场景先建立订阅再触发模拟。媒体 track 的"取消发布"需重协商移除
   transceiver（`writer.Stop()` 只停发送、服务端不因此取消发布），dual-PC NAT 下驱动不可靠，

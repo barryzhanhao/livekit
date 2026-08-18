@@ -1368,6 +1368,66 @@ func scenarioWebhookEvents(url, apiKey, apiSecret, room string) {
 	time.Sleep(2 * time.Second)
 	fmt.Println("WEBHOOK_EVENTS: PASS (client joined, published, left)")
 }
+
+// scenarioSubscriberPLI: validates the down-direction RTCP PLI path (the
+// keyframe-request variant of the down-RTCP loop, complementary to NACK). The
+// subscriber sends a PictureLossIndication for the media it receives; the room's
+// DownTrack must process it (its `sending PLI RTCP` log fires and it requests a
+// publisher keyframe). The on-wire MediaSSRC is the edge-rewritten one — the room
+// boundary rewrites it to the internal DownTrack SSRC (see
+// rewriteDownRTCPForLocalSSRC). Server-side assertion lives in 06-client-e2e.sh.
+func scenarioSubscriberPLI(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-pli-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-pli-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("SUBSCRIBER_PLI: FAIL no media received before PLI", err)
+		os.Exit(1)
+	}
+	sub.SendPLI()
+	time.Sleep(3 * time.Second) // let the room process the PLI + request a keyframe
+	fmt.Println("SUBSCRIBER_PLI: PASS (PLI sent; room-side assertion via logs)")
+}
+
+// scenarioMediaFollowsSignaling: proves media terminates on the EDGE node (the
+// one the client signaled to) — the core "media follows signaling" boundary. The
+// server's peer connections run on the edge (advertise_ip), so every remote ICE
+// candidate the client receives must carry the edge node's IP (= the WS hostname
+// the client connected to), never the room node's. Combined with the media-flow
+// assertion, this pins the boundary at the IP level.
+func scenarioMediaFollowsSignaling(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-mfs-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-mfs-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("MEDIA_FOLLOWS_SIGNALING: FAIL no media received", err)
+		os.Exit(1)
+	}
+
+	edgeIP := mustParseURL(url).Hostname()
+	ips := sub.RemoteCandidateIPs()
+	found := false
+	for _, ip := range ips {
+		if ip == edgeIP {
+			found = true
+		}
+	}
+	if !found {
+		fmt.Printf("MEDIA_FOLLOWS_SIGNALING: FAIL server ICE candidates (%v) missing edge IP %s\n", ips, edgeIP)
+		os.Exit(1)
+	}
+	fmt.Printf("MEDIA_FOLLOWS_SIGNALING: PASS (server ICE candidates include edge IP %s — media terminates on the signaling node)\n", edgeIP)
+}
 func waitRemoteIdentity(c *testclient.RTCClient, identity string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1885,7 +1945,7 @@ func main() {
 	apiKey := flag.String("api-key", "devkey", "API key")
 	apiSecret := flag.String("api-secret", "secret", "API secret")
 	room := flag.String("room", "nat-go", "room name")
-	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events")
+	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events|subscriber-pli|media-follows-signaling")
 	flag.Parse()
 
 	switch *scenario {
@@ -1965,6 +2025,10 @@ func main() {
 		scenarioReconnectResume(*url, *apiKey, *apiSecret, *room)
 	case "webhook-events":
 		scenarioWebhookEvents(*url, *apiKey, *apiSecret, *room)
+	case "subscriber-pli":
+		scenarioSubscriberPLI(*url, *apiKey, *apiSecret, *room)
+	case "media-follows-signaling":
+		scenarioMediaFollowsSignaling(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

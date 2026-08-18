@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -123,6 +124,11 @@ type RTCClient struct {
 	// iceServers from the Join response (TURN credentials), exposed for the
 	// turn-credentials E2E scenario
 	joinIceServers atomic.Pointer[[]*livekit.ICEServer]
+
+	// remote ICE candidate connection addresses received from the server (Trickle),
+	// exposed for the media-follows-signaling E2E scenario: the server's PC runs on
+	// the EDGE node, so its candidates must carry the edge's advertise_ip.
+	remoteCandidates []string
 }
 
 var (
@@ -598,6 +604,13 @@ func (c *RTCClient) handleSignalResponse(res *livekit.SignalResponse) error {
 		candidateInit, err := signalling.FromProtoTrickle(msg.Trickle)
 		if err != nil {
 			return err
+		}
+		// record the server-side connection address (the edge node's advertise_ip
+		// in NAT mode) for the media-follows-signaling scenario.
+		if addr := remoteCandidateAddress(candidateInit.Candidate); addr != "" {
+			c.lock.Lock()
+			c.remoteCandidates = append(c.remoteCandidates, addr)
+			c.lock.Unlock()
 		}
 		if msg.Trickle.Target == livekit.SignalTarget_PUBLISHER {
 			c.publisher.AddICECandidate(candidateInit)
@@ -1548,6 +1561,44 @@ func (c *RTCClient) SendNacks(count int) {
 	c.lock.Unlock()
 
 	_ = c.subscriber.WriteRTCP(packets)
+}
+
+// SendPLI sends a PictureLossIndication for the most recently received media of
+// every remote publisher (like SendNacks but the keyframe-request path). The
+// MediaSSRC is the on-wire (edge-rewritten) SSRC the client received; the room
+// rewrites it to the internal DownTrack SSRC before processing.
+func (c *RTCClient) SendPLI() {
+	var packets []rtcp.Packet
+	c.lock.Lock()
+	for _, pkt := range c.lastPackets {
+		packets = append(packets, &rtcp.PictureLossIndication{
+			SenderSSRC: 0,
+			MediaSSRC:  pkt.SSRC,
+		})
+	}
+	c.lock.Unlock()
+	_ = c.subscriber.WriteRTCP(packets)
+}
+
+// remoteCandidateAddress extracts the connection address from a `candidate:` SDP
+// string (field 4, zero-based: candidate:<foundation> <component> udp <prio>
+// <addr> <port> typ ...). Returns "" for the end-of-candidates marker.
+func remoteCandidateAddress(candidate string) string {
+	fields := strings.Fields(candidate)
+	if len(fields) < 6 || !strings.HasPrefix(fields[0], "candidate:") {
+		return ""
+	}
+	return fields[4]
+}
+
+// RemoteCandidateIPs returns the connection addresses of every remote ICE
+// candidate the server has sent (Trickle) for the peer connections. In NAT mode
+// the server's PC runs on the edge node, so these carry the edge's advertise_ip —
+// the media-follows-signaling proof.
+func (c *RTCClient) RemoteCandidateIPs() []string {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	return append([]string(nil), c.remoteCandidates...)
 }
 
 func encodeQueryParam(key, value string) string {
