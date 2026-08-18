@@ -28,10 +28,27 @@ run_scenario() { # run_scenario <name> <expect-exit-zero> [room]
   local rc=$?
   set -e
   if [ "$expect_zero" = "yes" ] && [ "$rc" -ne 0 ]; then
-    echo "  ✗ $name FAILED (exit $rc)"
+    # Transient ICE/DTLS flake (documented in README): the client connects from
+    # the host through a Docker/VM network path and occasionally times out a
+    # 30s connect. Retry ONCE in the SAME room after a short drain — real
+    # regressions fail deterministically on both attempts, so this only absorbs
+    # the transient environment flake (same pattern as 04-e2e.sh's S12 retry).
+    echo "  ! $name failed (exit $rc); waiting 10s and retrying once"
+    sleep 10
+    set +e
+    /tmp/nat-client -url "$WS_URL" -api-key "$API_KEY" -api-secret "$API_SECRET" \
+      -room "$room" -scenario "$name"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      echo "  ✓ $name client exit $rc (after retry)"
+      return 0
+    fi
+    echo "  ✗ $name FAILED (exit $rc, also on retry)"
     return 1
   fi
   echo "  ✓ $name client exit $rc"
+  return 0
 }
 
 wait_log() { # wait_log <edge|room> <pattern> <timeout_sec> (same as 04-e2e.sh)
@@ -228,6 +245,31 @@ if run_scenario whip yes "$ROOM_WHIP"; then
 else
   FAIL=$((FAIL+1))
 fi
+
+# simulate-speaker: publisher simulates active-speaker activity; the subscriber
+# must observe the speaker broadcast cross-node (SpeakersChanged over the relay).
+# FRESH room: speaker deltas only reach participants SUBSCRIBED to the speaker,
+# and the subscriber must not be distracted by other publishers' tracks.
+ROOM_SPK="${ROOM_GO}-speaker"
+seed_room_map "$ROOM_SPK"
+if run_scenario simulate-speaker yes "$ROOM_SPK"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# simulate-node-failure: server drops the participant (simulated node failure);
+# the client must observe the server-driven disconnect.
+if run_scenario simulate-node-failure yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# simulate-server-leave: server cleanly closes the participant (simulated server
+# leave); the client must observe the server-driven disconnect.
+if run_scenario simulate-server-leave yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# sub-perm-revoke: after media flows, the PUBLISHER revokes the subscriber's
+# access to its track (SubscriptionPermission deny-all → maybeRevokeSubscriptions
+# → RemoveSubscriber); the revoked subscriber's media must stop growing. Uses a
+# FRESH room: in the shared room the subscriber auto-subscribes to other
+# publishers' tracks, whose media keeps flowing after the revoke.
+ROOM_REV="${ROOM_GO}-revoke"
+seed_room_map "$ROOM_REV"
+if run_scenario sub-perm-revoke yes "$ROOM_REV"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
 # health: HTTP / on both nodes (defaultHandler → healthCheck, node-stats
 # heartbeat freshness). Client-facing edge + room node must both answer 200 OK.

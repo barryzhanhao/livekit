@@ -100,6 +100,10 @@ cd test/nat-e2e
 | room-move-forward | `MoveParticipant`/`ForwardParticipant`：同房被拒（invalid_argument）、跨房路由到 RoomManager stub（not implemented） |
 | whip-ice-restart | WHIP 生命周期：POST+媒体 → PATCH(ICE restart) 被干净拒绝（见下方已知限制）→ DELETE 拆会话；节点不崩溃 |
 | health | 双节点 HTTP `/`（defaultHandler → healthCheck + 节点心跳新鲜度）均返回 200 OK |
+| simulate-speaker | 发布者模拟 N 秒 active-speaker（`SimulateScenario_SpeakerUpdate`）→ 房主广播 speaker delta → 订阅者跨节点看到发布者 active（`SpeakersChanged`，仅发给已订阅者） |
+| simulate-node-failure | 参与者模拟节点故障（`SimulateScenario_NodeFailure`）→ 服务端丢弃参与者并断开信令 → 客户端观察到服务端驱动断连 |
+| simulate-server-leave | 参与者模拟服务端 leave（`SimulateScenario_ServerLeave`）→ 服务端干净关闭参与者 → 客户端观察到服务端驱动断连 |
+| sub-perm-revoke | 媒体流动后**发布者**撤销订阅者对自身 track 的订阅权限（`SubscriptionPermission{AllParticipants:false}` → maybeRevokeSubscriptions → RemoveSubscriber）→ 被撤销者媒体冻结（下行 track 跨节点关闭） |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
 
@@ -128,13 +132,14 @@ SUMMARY: 37 passed, 0 failed
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 26 passed, 0 failed
+GO-CLIENT SUMMARY: 30 passed, 0 failed
   (receive-before-publish / NACK / data / attributes / metadata / mute /
    multitrack / single-pc / whip / manual-subscribe / participant-name /
    room-admin / track-pause / room-lifecycle / service-apis /
    subscription-permission / quality-request / rtc-validate / update-video-track /
    update-audio-track / data-track-publish / hidden-participant / subscriber-only /
-   room-move-forward / whip-ice-restart / health)
+   room-move-forward / whip-ice-restart / health / simulate-speaker /
+   simulate-node-failure / simulate-server-leave / sub-perm-revoke)
 ```
 
 覆盖的功能：
@@ -168,9 +173,12 @@ GO-CLIENT SUMMARY: 26 passed, 0 failed
   E2E `whip-ice-restart` 场景验证"PATCH 干净拒绝 + 节点存活 + DELETE 仍成功"。真正的
   ICE restart 打通需修复上游库（改遍历时删除为过滤重建），本 fork 暂以兜底错误收敛。
 - **内网明文**：media_relay 明文 TCP，生产需内网隔离或 TLS（§9）。
-- **瞬时 ICE 抖动**：Go 客户端 `nack` 场景偶发订阅者 ICE/DTLS 10s 超时（`TRANSPORT_FAILURE`），
-  重跑即过（本机客户端经 Docker/VM 网卡候选 + srflx 的路径偶发抖动）。`06-client-e2e.sh` 以
-  `run_scenario` 直接判定，失败不重试——CI 上如偶发失败请重跑一次确认非回归。
+- **瞬时 ICE 抖动**：Go 客户端偶发订阅者/发布者 ICE/DTLS 连接超时（`TRANSPORT_FAILURE`），
+  重跑即过（本机客户端经 Docker/VM 网卡候选 + srflx 的路径偶发抖动）。`run_scenario` 对
+  `expect-exit-zero` 场景内建**一次同房间重试**（失败等 10s 清场后重跑同一场景，与
+  `04-e2e.sh` S12 同模式）：确定性回归两次都失败、仍会被捕获；瞬态抖动第二次即过，套件输出
+  标注 "after retry"。新场景 `simulate-speaker`/`sub-perm-revoke` 使用独立房间（speaker delta
+  只发给已订阅者、撤销场景需排除同房其他发布者的媒体干扰）。
 
 ## 生产级加固（本轮随 E2E 验证落地）
 
@@ -226,6 +234,11 @@ GO-CLIENT SUMMARY: 26 passed, 0 failed
   （低噪声、不轮转）上验证"单会话/无 dual-PC offerer"与"one-shot"——边缘日志全量保留，锚点
   确定性可达。`07-coverage.sh` `--report` 分支的顶层 `return 0` 改为 `exit 0`（顶层 `return`
   无效，会导致脚本在汇总时误报）。
+- **test/client SDK 扩展**（`client.go`）：新增 `SignalResponse_Leave` 与
+  `SignalResponse_SpeakersChanged` 处理 + `WaitUntilDisconnected`/`DisconnectReason`/
+  `ActiveSpeakers` 访问器，支撑 simulate 场景的客户端侧断言（服务端驱动断连、speaker 广播）。
+  speaker delta 是**按订阅者收窄**的（`SendSpeakerUpdate(force=false)` 只发给已订阅该发言者的
+  参与者或发言者本人），simulate-speaker 场景先建立订阅再触发模拟。
 
 ## 与上游 LiveKit K8s 部署的对比
 

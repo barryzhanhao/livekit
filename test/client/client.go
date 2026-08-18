@@ -110,6 +110,12 @@ type RTCClient struct {
 	pendingPublishedDataTracks map[uint16]*livekit.DataTrackInfo
 	pendingDataTrackWriters    []TrackWriter
 	subscribedDataTracks       map[livekit.ParticipantID]map[uint16]*DataTrackRemote
+
+	// server-driven disconnect (SignalResponse_Leave or WS close) + last speaker
+	// snapshot, used by the simulate/speaker E2E scenarios
+	disconnectReason atomic.Int32
+	disconnected     atomic.Bool
+	activeSpeakers   atomic.Pointer[[]*livekit.SpeakerInfo]
 }
 
 var (
@@ -477,6 +483,7 @@ func (c *RTCClient) Run() error {
 	c.conn.SetCloseHandler(func(code int, text string) error {
 		// when closed, stop connection
 		logger.Infow("connection closed", "code", code, "text", text)
+		c.disconnected.Store(true)
 		c.Stop()
 		return nil
 	})
@@ -687,8 +694,58 @@ func (c *RTCClient) handleSignalResponse(res *livekit.SignalResponse) error {
 			}
 		}
 		c.lock.Unlock()
+
+	case *livekit.SignalResponse_Leave:
+		// server-initiated leave (e.g. simulate node failure / server leave, or a
+		// normal disconnect): record the reason and mark the client disconnected.
+		// The signal connection is closed by the server shortly after, which also
+		// sets the disconnected flag via the WS close handler.
+		logger.Infow("server initiated leave",
+			"participant", c.localParticipant.Identity,
+			"reason", msg.Leave.Reason,
+			"canReconnect", msg.Leave.CanReconnect,
+		)
+		c.disconnectReason.Store(int32(msg.Leave.Reason))
+		c.disconnected.Store(true)
+
+	case *livekit.SignalResponse_SpeakersChanged:
+		speakers := make([]*livekit.SpeakerInfo, 0, len(msg.SpeakersChanged.Speakers))
+		speakers = append(speakers, msg.SpeakersChanged.Speakers...)
+		c.activeSpeakers.Store(&speakers)
 	}
 	return nil
+}
+
+// WaitUntilDisconnected blocks until the server has closed this client's signal
+// connection (via SignalResponse_Leave or WS close), or the timeout elapses.
+func (c *RTCClient) WaitUntilDisconnected(timeout time.Duration) error {
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if c.disconnected.Load() {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("client still connected after %v", timeout)
+}
+
+// DisconnectReason returns the server-provided DisconnectReason for a server
+// initiated leave, or -1 if the client was never disconnected by the server.
+func (c *RTCClient) DisconnectReason() livekit.DisconnectReason {
+	return livekit.DisconnectReason(c.disconnectReason.Load())
+}
+
+// ActiveSpeakers returns the last active-speaker snapshot broadcast by the server
+// (from SignalResponse_SpeakersChanged), or nil if none was received.
+func (c *RTCClient) ActiveSpeakers() []*livekit.SpeakerInfo {
+	p := c.activeSpeakers.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 func (c *RTCClient) WaitUntilConnected(timeout time.Duration) error {

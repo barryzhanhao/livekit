@@ -828,6 +828,139 @@ func scenarioSubscriptionPermission(url, apiKey, apiSecret, room string) {
 	fmt.Println("SUBSCRIPTION_PERMISSION: PASS (permission granted; media flowed)")
 }
 
+// scenarioSimulateSpeaker: the publisher simulates N seconds of active-speaker
+// activity (SimulateScenario_SpeakerUpdate). The room broadcasts active-speaker
+// changes to all participants; the subscriber must observe the publisher as an
+// ACTIVE speaker cross-node (SignalResponse_SpeakersChanged over the relay).
+func scenarioSimulateSpeaker(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-spk-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-spk-pub")
+	waitConnected(pub)
+
+	// speaker deltas are scoped: SendSpeakerUpdate(force=false) only reaches
+	// participants SUBSCRIBED to the speaker (or the speaker itself). Publish a
+	// track and confirm the subscriber receives media so the subscription exists
+	// before the simulated speaker update.
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+	if err := waitBytes(sub, 1024, 30*time.Second); err != nil {
+		fmt.Println("SIMULATE_SPEAKER: FAIL no media before speaker update", err)
+		os.Exit(1)
+	}
+
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_Simulate{
+			Simulate: &livekit.SimulateScenario{
+				Scenario: &livekit.SimulateScenario_SpeakerUpdate{SpeakerUpdate: 3},
+			},
+		},
+	}))
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, s := range sub.ActiveSpeakers() {
+			if s.Active && s.Sid == string(pub.ID()) {
+				fmt.Println("SIMULATE_SPEAKER: PASS (subscriber saw publisher active speaker cross-node)")
+				return
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	fmt.Println("SIMULATE_SPEAKER: FAIL subscriber never saw active speaker", sub.ActiveSpeakers())
+	os.Exit(1)
+}
+
+// scenarioSimulateNodeFailure: the participant simulates a node failure
+// (SimulateScenario_NodeFailure); the server drops the participant (reconnect
+// allowed) and closes the signal connection. The client must observe the
+// server-driven disconnect.
+func scenarioSimulateNodeFailure(url, apiKey, apiSecret, room string) {
+	pub := newClient(url, apiKey, apiSecret, room, "go-nf-pub")
+	waitConnected(pub)
+
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_Simulate{
+			Simulate: &livekit.SimulateScenario{
+				Scenario: &livekit.SimulateScenario_NodeFailure{NodeFailure: true},
+			},
+		},
+	}))
+
+	if err := pub.WaitUntilDisconnected(15 * time.Second); err != nil {
+		fmt.Println("SIMULATE_NODE_FAILURE: FAIL participant not disconnected", err)
+		os.Exit(1)
+	}
+	fmt.Println("SIMULATE_NODE_FAILURE: PASS (participant disconnected, reason", pub.DisconnectReason(), ")")
+}
+
+// scenarioSimulateServerLeave: the participant simulates a server leave
+// (SimulateScenario_ServerLeave); the server cleanly closes the participant and
+// the signal connection. The client must observe the server-driven disconnect.
+func scenarioSimulateServerLeave(url, apiKey, apiSecret, room string) {
+	pub := newClient(url, apiKey, apiSecret, room, "go-sl-pub")
+	waitConnected(pub)
+
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_Simulate{
+			Simulate: &livekit.SimulateScenario{
+				Scenario: &livekit.SimulateScenario_ServerLeave{ServerLeave: true},
+			},
+		},
+	}))
+
+	if err := pub.WaitUntilDisconnected(15 * time.Second); err != nil {
+		fmt.Println("SIMULATE_SERVER_LEAVE: FAIL participant not disconnected", err)
+		os.Exit(1)
+	}
+	fmt.Println("SIMULATE_SERVER_LEAVE: PASS (participant disconnected, reason", pub.DisconnectReason(), ")")
+}
+
+// scenarioSubPermRevoke: after media flows, the PUBLISHER revokes the
+// subscriber's access to its track (SubscriptionPermission{AllParticipants:
+// false} → maybeRevokeSubscriptions → RemoveSubscriber). The revoked subscriber's
+// media must STOP growing (down track closed cross-node). Note the publisher —
+// not the subscriber — sends SubscriptionPermission: it controls who may
+// subscribe to its own tracks.
+func scenarioSubPermRevoke(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-rev-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-rev-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	// baseline: the subscriber must receive media before the revoke
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("SUB_PERM_REVOKE: FAIL no media before revoke", err)
+		os.Exit(1)
+	}
+
+	// the publisher denies ALL subscribers for its tracks
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_SubscriptionPermission{
+			SubscriptionPermission: &livekit.SubscriptionPermission{
+				AllParticipants: false,
+				TrackPermissions: []*livekit.TrackPermission{},
+			},
+		},
+	}))
+
+	// let the revoke propagate (server closes the down track, edge removes the
+	// SRTP sender), then measure that the subscriber's byte count stopped growing
+	time.Sleep(3 * time.Second)
+	before := sub.BytesReceived()
+	time.Sleep(3 * time.Second)
+	after := sub.BytesReceived()
+	if after-before > 500 {
+		fmt.Printf("SUB_PERM_REVOKE: FAIL media still flowing after revoke (%d bytes over 3s)\n", after-before)
+		os.Exit(1)
+	}
+	fmt.Printf("SUB_PERM_REVOKE: PASS (media froze after revoke: +%d bytes over 3s)\n", after-before)
+}
+
 // scenarioQualityRequest: the subscriber sets the max video quality of a
 // subscribed track (UpdateTrackSettings.Quality), exercising the room's
 // dynacast/layer-selection path; media must keep flowing at the requested tier.
@@ -1371,6 +1504,14 @@ func main() {
 		scenarioRoomMoveForward(*url, *apiKey, *apiSecret, *room)
 	case "whip-ice-restart":
 		scenarioWhipIceRestart(*url, *apiKey, *apiSecret, *room)
+	case "simulate-speaker":
+		scenarioSimulateSpeaker(*url, *apiKey, *apiSecret, *room)
+	case "simulate-node-failure":
+		scenarioSimulateNodeFailure(*url, *apiKey, *apiSecret, *room)
+	case "simulate-server-leave":
+		scenarioSimulateServerLeave(*url, *apiKey, *apiSecret, *room)
+	case "sub-perm-revoke":
+		scenarioSubPermRevoke(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)
