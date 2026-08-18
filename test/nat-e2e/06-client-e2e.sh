@@ -465,6 +465,15 @@ ROOM_MFS="${ROOM_GO}-mfs"
 seed_room_map "$ROOM_MFS"
 if run_scenario media-follows-signaling yes "$ROOM_MFS"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
+# simulate-ice-restart: server-driven ICE restart (SimulateScenario_
+# SwitchCandidateProtocol → participant.ICERestart, the same path resume uses).
+# The publisher's transports renegotiate cross-node; media must continue on BOTH
+# sides (the publisher's restarted subscriber PC + the subscriber's untouched PC).
+# FRESH room (self-contained bidirectional media).
+ROOM_ICE="${ROOM_GO}-icerestart"
+seed_room_map "$ROOM_ICE"
+if run_scenario simulate-ice-restart yes "$ROOM_ICE"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
 # multi-edge: two clients signal to DIFFERENT edge nodes (edge1 + edge2) for the
 # SAME room hosted on the room node. Media must follow signaling on BOTH edges —
 # pub(edge1)→sub(edge2) AND sub(edge2)→pub(edge1) both flow (each via the room

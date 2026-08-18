@@ -1465,6 +1465,61 @@ func scenarioMultiEdge(url, apiKey, apiSecret, room, url2 string) {
 	}
 	fmt.Println("MULTI_EDGE: PASS (media crossed edge1↔edge2 via the room node)")
 }
+
+// scenarioSimulateICERestart: the server-driven ICE restart path (the same
+// `participant.ICERestart` the resume flow uses, driven directly via
+// SimulateScenario_SwitchCandidateProtocol). Both peers publish+subscribe; the
+// publisher triggers the restart on its transports, so its SUBSCRIBER PC (the
+// room→edge→client receive path) renegotiates cross-node. Media must continue on
+// BOTH sides after the restart completes — proving the cross-node ICE-restart /
+// renegotiation path end-to-end.
+func scenarioSimulateICERestart(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-icerestart-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-icerestart-pub")
+	waitConnected(pub)
+
+	w1, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer w1.Stop()
+	w2, err := sub.AddStaticTrack("video/vp8", "video", "camera2")
+	must(err)
+	defer w2.Stop()
+
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("SIMULATE_ICE_RESTART: FAIL subscriber not receiving before restart", err)
+		os.Exit(1)
+	}
+	if err := waitBytes(pub, 2048, 30*time.Second); err != nil {
+		fmt.Println("SIMULATE_ICE_RESTART: FAIL publisher not receiving before restart", err)
+		os.Exit(1)
+	}
+
+	// server-driven ICE restart on the publisher's transports (UDP protocol — the
+	// working path; the restart itself + the cross-node renegotiation is the test)
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_Simulate{
+			Simulate: &livekit.SimulateScenario{
+				Scenario: &livekit.SimulateScenario_SwitchCandidateProtocol{
+					SwitchCandidateProtocol: livekit.CandidateProtocol_UDP,
+				},
+			},
+		},
+	}))
+	time.Sleep(3 * time.Second) // let the renegotiation + ICE restart complete
+
+	beforePub := pub.BytesReceived()
+	if err := waitBytes(pub, beforePub+2048, 30*time.Second); err != nil {
+		fmt.Println("SIMULATE_ICE_RESTART: FAIL publisher stopped receiving after restart", err)
+		os.Exit(1)
+	}
+	beforeSub := sub.BytesReceived()
+	if err := waitBytes(sub, beforeSub+2048, 30*time.Second); err != nil {
+		fmt.Println("SIMULATE_ICE_RESTART: FAIL subscriber stopped receiving after restart", err)
+		os.Exit(1)
+	}
+	fmt.Println("SIMULATE_ICE_RESTART: PASS (media continued on both sides after server-driven ICE restart)")
+}
 func waitRemoteIdentity(c *testclient.RTCClient, identity string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1983,7 +2038,7 @@ func main() {
 	apiKey := flag.String("api-key", "devkey", "API key")
 	apiSecret := flag.String("api-secret", "secret", "API secret")
 	room := flag.String("room", "nat-go", "room name")
-	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events|subscriber-pli|media-follows-signaling|multi-edge")
+	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events|subscriber-pli|media-follows-signaling|multi-edge|simulate-ice-restart")
 	flag.Parse()
 
 	switch *scenario {
@@ -2069,6 +2124,8 @@ func main() {
 		scenarioMediaFollowsSignaling(*url, *apiKey, *apiSecret, *room)
 	case "multi-edge":
 		scenarioMultiEdge(*url, *apiKey, *apiSecret, *room, *url2)
+	case "simulate-ice-restart":
+		scenarioSimulateICERestart(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

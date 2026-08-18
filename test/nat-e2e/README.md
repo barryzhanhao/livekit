@@ -121,6 +121,7 @@ cd test/nat-e2e
 | subscriber-pli | 下行 RTCP 的 **PLI 路径**（keyframe 请求变体，与 NACK 互补）：订阅者发真 PLI → 房主 DownTrack 处理并请求发布者 keyframe（`sending PLI RTCP`，SSRC 重写修复的 PLI 证明——修复前边缘重写 SSRC 被 `p.MediaSSRC == d.ssrc` 丢弃） |
 | media-follows-signaling | 核心边界 IP 级证明：**媒体终止于信令节点（边缘）**——服务端 PC 跑在边缘（advertise_ip），客户端收到的远端 ICE candidate 必须携带边缘 IP（= WS hostname），绝不含房主 IP；断言 candidate 含边缘 IP + 媒体实际流动 |
 | multi-edge | **多边缘核心属性**：pub 连边缘1、sub 连边缘2（同一房间钉在房主节点）→ 媒体双向跨越边缘1↔边缘2（各经房主节点），两个边缘各出现网关会话（多边缘需要 `01-cluster.sh` 建 3 worker，无 worker3 时自动跳过） |
+| simulate-ice-restart | **服务端 ICE restart 核心路径**（`SimulateScenario_SwitchCandidateProtocol` → `participant.ICERestart`，与 resume 同一路径）：双向发布/订阅的双方在服务端重启后**各自收流继续**（被重启的订阅者 PC 跨节点重协商 + 未触碰的 PC 不受影响），证明跨节点 ICERestart/重协商端到端 |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
 
@@ -151,7 +152,7 @@ SUMMARY: 37 passed, 0 failed
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 42 passed, 0 failed
+GO-CLIENT SUMMARY: 43 passed, 0 failed
   (receive-before-publish / NACK / data / attributes / metadata / mute /
    multitrack / single-pc / whip / manual-subscribe / participant-name /
    room-admin / track-pause / room-lifecycle / service-apis /
@@ -161,7 +162,7 @@ GO-CLIENT SUMMARY: 42 passed, 0 failed
    simulate-node-failure / simulate-server-leave / sub-perm-revoke /
    participant-leave-visible / sync-state / connection-quality / turn-credentials /
    reconnect / perform-rpc / simulcast-switch / reconnect-resume / webhook-events /
-   subscriber-pli / media-follows-signaling / multi-edge)
+   subscriber-pli / media-follows-signaling / multi-edge / simulate-ice-restart)
 ```
 
 覆盖的功能：
