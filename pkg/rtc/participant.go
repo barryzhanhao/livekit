@@ -2021,6 +2021,12 @@ func (p *ParticipantImpl) setupTransportManager() error {
 			// On remote track metadata, establish the up-direction MediaChannel and
 			// pump plaintext RTP into the SFU buffer (see handleRemotePublishedTrack).
 			rpc.OnRemoteTrack(p.handleRemotePublishedTrack)
+			// Data-channel messages from the client arrive at the edge node's pion PC
+			// and are forwarded over the control channel (NAT DC bridging); deliver
+			// them through the same entry the local publisher transport uses.
+			rpc.OnDataMessage(func(kind livekit.DataPacket_Kind, data []byte) {
+				p.onReceivedDataMessage(kind, data)
+			})
 		}
 		p.params.Logger.Infow("nat participant uses remote peer connection (NAT split)",
 			"signalNodeID", p.params.SignalNodeID, "useSinglePC", p.params.UseSinglePeerConnection)

@@ -81,7 +81,7 @@ cd test/nat-e2e
 |---|---|
 | receive-before-publish | 订阅者先入空房间，发布者后加入发布 → 订阅者自动订阅并收包 |
 | **NACK 跨节点（含 RTX 重传）** | 订阅者客户端发真 RTCP NACK → 边缘 `pumpSenderRTCPToMediaChannel` → 房主 `DownTrack.ProcessRTCP`（`nacks`）→ **实际重传**（`nackAcks`，实测 nacks=15/nackAcks=1）。RTCP 下行回环修复见生产加固 |
-| data | 数据通道消息（当前未跨节点桥接，§6.8 既定暂拆，记录行为） |
+| data | 数据通道消息**跨节点桥接**（P0-2）：发布者 `PublishData` → 边缘 DC → 控制通道 → 房主广播 → 订阅者 DC 收到（断言逐字送达） |
 | attributes | 发布者 `SetAttributes` → 房间广播 → 订阅者跨节点看到属性更新 |
 | metadata | 发布者更新 `Metadata` → 订阅者跨节点看到（`UpdateParticipantMetadata` 信号） |
 | mute | 发布者对已发布 track 发 `MuteTrack` → 订阅者跨节点看到 `Muted=true` |
@@ -187,7 +187,7 @@ GO-CLIENT SUMMARY: 43 passed, 0 failed
   并发建立偶发失败（同为控制链路并发建立竞态），已内置**一次自动重试**（等 10s 后用新房间
   重跑）使其确定性通过。生产级改进方向：核查边缘控制 accept 的并发建立与 room 的
   `establishRemoteSession` 背压。
-- **数据通道消息**：跨节点只转发 SDP 协商（m=application）；DC 数据消息未桥接（§6.8 既定暂拆）。
+- **数据通道（已桥接，P0-2）**：客户端 DC 消息 → 边缘 pion DC → 控制通道（`event_data_message`）→ 房主 participant `onReceivedDataMessage` → 房间广播 → 各订阅者经其边缘 DC 送达；反向（房主→客户端）经 `send_data_message` 写回边缘 DC。`data` 场景断言订阅者跨节点收到 DC 消息。测试客户端 `PublishData` 的 DC 载荷为 marshaled DataPacket，逐字透传。
 - **simulcast 上切受限（精确诊断）**：MediaGateway 修复后 3 层 RTP 已能全部跨节点（`available
   layers changed` 达 `[0,1,2]`），且 **下切**（HIGH→LOW）可真实生效（客户端码率从 ~800kbps 骤降到
   ~150kbps）、DownTrack max-subscribed 层随请求 0/1/2 正确应用。**下切后再上切**（LOW→MEDIUM）卡进

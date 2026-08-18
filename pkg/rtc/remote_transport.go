@@ -26,6 +26,7 @@ import (
 	"go.uber.org/atomic"
 
 	"github.com/livekit/livekit-server/pkg/rtc/transport"
+	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 )
 
@@ -72,6 +73,7 @@ const (
 	remotePCOpConnectionState          = "connection_state"
 	remotePCOpSignalingState           = "signaling_state"
 	remotePCOpCreateDataChannel        = "create_data_channel"
+	remotePCOpSendDataMessage          = "send_data_message"
 	remotePCOpClose                    = "close"
 
 	// events (edge -> room)
@@ -80,6 +82,7 @@ const (
 	remotePCOpEventICEConnectionStateChange = "event_ice_connection_state_change"
 	remotePCOpEventConnectionStateChange    = "event_connection_state_change"
 	remotePCOpEventOnTrack                  = "event_on_track"
+	remotePCOpEventDataMessage              = "event_data_message"
 )
 
 // remoteTrackEvent is the metadata for a publisher track the edge node received
@@ -119,6 +122,7 @@ type remotePeerConnection struct {
 	onTrack                    func(*webrtc.TrackRemote, *webrtc.RTPReceiver)
 	onRemoteTrack              func(remoteTrackEvent)
 	onDataChannel              func(*webrtc.DataChannel)
+	onDataMessage              func(kind livekit.DataPacket_Kind, data []byte)
 
 	gatheringComplete chan struct{}
 	gatheringOnce     sync.Once
@@ -226,7 +230,19 @@ func (r *remotePeerConnection) dispatchEvent(msg remotePCMessage) {
 				r.onRemoteTrack(ev)
 			}
 		}
+	case remotePCOpEventDataMessage:
+		if r.onDataMessage != nil {
+			var ev remotePCDataMessageEvent
+			if err := json.Unmarshal(msg.Body, &ev); err == nil {
+				r.onDataMessage(livekit.DataPacket_Kind(ev.Kind), ev.Data)
+			}
+		}
 	}
+}
+
+type remotePCDataMessageEvent struct {
+	Kind int32  `json:"kind"`
+	Data []byte `json:"data"`
 }
 
 func (r *remotePeerConnection) closePending() {
@@ -467,6 +483,29 @@ func (r *remotePeerConnection) OnDataChannel(f func(*webrtc.DataChannel)) {
 	r.cbMu.Lock()
 	defer r.cbMu.Unlock()
 	r.onDataChannel = f
+}
+
+// OnDataMessage registers the callback invoked when a data-channel message from a
+// client arrives at the edge node and is forwarded over the control channel
+// (NAT-mode data-channel bridging). kind is the client's data packet kind
+// (RELIABLE/LOSSY) inferred from the edge data channel label.
+func (r *remotePeerConnection) OnDataMessage(f func(kind livekit.DataPacket_Kind, data []byte)) {
+	r.cbMu.Lock()
+	defer r.cbMu.Unlock()
+	r.onDataMessage = f
+}
+
+// SendDataMessage forwards a data-channel message to the edge node's data channel
+// (the reverse direction of OnDataMessage). The edge executor resolves the data
+// channel by the kind-derived label and writes the payload.
+func (r *remotePeerConnection) SendDataMessage(kind livekit.DataPacket_Kind, data []byte) error {
+	_, err := r.request(remotePCOpSendDataMessage, remotePCSendDataMessageRequest{Kind: int32(kind), Data: data})
+	return err
+}
+
+type remotePCSendDataMessageRequest struct {
+	Kind int32  `json:"kind"`
+	Data []byte `json:"data"`
 }
 
 func (r *remotePeerConnection) GatheringComplete() <-chan struct{} {

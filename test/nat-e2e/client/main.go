@@ -1677,18 +1677,31 @@ func scenarioData(url, apiKey, apiSecret, room string) {
 	waitConnected(sub)
 	pub := newClient(url, apiKey, apiSecret, room, "go-data-pub")
 	waitConnected(pub)
+
+	// data-channel messages are now bridged cross-node (P0-2): a client message
+	// arrives at the edge's pion data channel and is forwarded over the control
+	// channel to the room participant, which broadcasts it to the subscriber.
+	received := make(chan string, 1)
+	sub.OnDataReceived = func(data []byte, sid string) {
+		select {
+		case received <- string(data):
+		default:
+		}
+	}
 	time.Sleep(1 * time.Second)
 
 	must(pub.PublishData([]byte("nat-e2e-data-message"), livekit.DataPacket_RELIABLE))
-	time.Sleep(3 * time.Second)
 
-	if sub.BytesReceived() > 0 {
-		// BytesReceived counts RTP only; data arrives via the DC handler. The
-		// reliable DC isn't bridged cross-node yet, so this path is expected to
-		// stay empty.
-		fmt.Println("DATA: subscriber received bytes (unexpected for unbridged DC)")
-	} else {
-		fmt.Println("DATA: message sent; subscriber DC not bridged cross-node (documented §6.8 limitation)")
+	select {
+	case msg := <-received:
+		if msg != "nat-e2e-data-message" {
+			fmt.Println("DATA: FAIL unexpected payload", msg)
+			os.Exit(1)
+		}
+		fmt.Println("DATA: PASS (subscriber received the data-channel message cross-node)")
+	case <-time.After(15 * time.Second):
+		fmt.Println("DATA: FAIL subscriber did not receive the data-channel message")
+		os.Exit(1)
 	}
 }
 

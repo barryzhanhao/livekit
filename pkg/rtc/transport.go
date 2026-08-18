@@ -212,6 +212,7 @@ func (t trackDescription) MarshalLogObject(e zapcore.ObjectEncoder) error {
 // edge node's MediaGateway satisfies it instead.
 type peerConnection interface {
 	OnDataChannel(f func(*webrtc.DataChannel))
+	OnDataMessage(f func(kind livekit.DataPacket_Kind, data []byte))
 	OnICECandidate(f func(*webrtc.ICECandidate))
 	OnICEGatheringStateChange(f func(webrtc.ICEGatheringState))
 	OnTrack(f func(*webrtc.TrackRemote, *webrtc.RTPReceiver))
@@ -225,6 +226,12 @@ type peerConnection interface {
 	SetRemoteDescription(desc webrtc.SessionDescription) error
 	RemoteDescription() *webrtc.SessionDescription
 	AddICECandidate(candidate webrtc.ICECandidateInit) error
+
+	// SendDataMessage sends a data-channel message across the transport. For a
+	// remote (NAT) peer connection this is forwarded to the edge node's data
+	// channel; a local peer connection routes through its own data-channel
+	// writers in PCTransport instead (this is a stub for those).
+	SendDataMessage(kind livekit.DataPacket_Kind, data []byte) error
 
 	ICEConnectionState() webrtc.ICEConnectionState
 	ICEGatheringState() webrtc.ICEGatheringState
@@ -263,6 +270,16 @@ type localPeerConnection struct {
 
 func (l *localPeerConnection) GatheringComplete() <-chan struct{} {
 	return webrtc.GatheringCompletePromise(l.PeerConnection)
+}
+
+// OnDataMessage is a no-op for a local peer connection: data-channel messages are
+// delivered through the PCTransport's own data-channel writers, not this seam.
+func (l *localPeerConnection) OnDataMessage(f func(kind livekit.DataPacket_Kind, data []byte)) {}
+
+// SendDataMessage is a stub for a local peer connection: PCTransport.SendDataMessage
+// routes through its own data-channel writers instead of this seam.
+func (l *localPeerConnection) SendDataMessage(kind livekit.DataPacket_Kind, data []byte) error {
+	return errors.New("local peer connection data messages are handled by PCTransport")
 }
 
 type PCTransport struct {
@@ -1580,6 +1597,13 @@ func (t *PCTransport) WriteRTCP(pkts []rtcp.Packet) error {
 }
 
 func (t *PCTransport) SendDataMessage(kind livekit.DataPacket_Kind, data []byte) error {
+	// NAT mode: the publisher transport's peer connection is a remotePeerConnection
+	// (the real pion PC + data channels live on the edge node). Route the message
+	// through the control plane so the edge writes it to the client's data channel.
+	if remote, ok := t.pc.(*remotePeerConnection); ok {
+		return remote.SendDataMessage(kind, data)
+	}
+
 	convertFromUserPacket := false
 	var dc *datachannel.DataChannelWriter[*webrtc.DataChannel]
 	t.lock.RLock()

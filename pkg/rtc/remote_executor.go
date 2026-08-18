@@ -18,10 +18,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/pion/webrtc/v4"
 
 	"github.com/livekit/livekit-server/pkg/rtc/transport"
+	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 )
 
@@ -30,7 +32,7 @@ import (
 // PeerConnection owned by the edge MediaGateway), sends responses, and forwards
 // the pc's events back over ch. It blocks until the channel closes.
 func RunRemotePCExecutor(ch transport.ControlChannel, pc *webrtc.PeerConnection) {
-	e := &remotePCExecutor{ch: ch, pc: &localPeerConnection{pc}}
+	e := &remotePCExecutor{ch: ch, pc: &localPeerConnection{pc}, dataChs: make(map[string]*webrtc.DataChannel)}
 	e.registerEvents()
 	e.loop()
 }
@@ -38,6 +40,9 @@ func RunRemotePCExecutor(ch transport.ControlChannel, pc *webrtc.PeerConnection)
 type remotePCExecutor struct {
 	ch transport.ControlChannel
 	pc peerConnection
+
+	dataChMu sync.Mutex
+	dataChs  map[string]*webrtc.DataChannel // data channel label -> DC (NAT DC bridging)
 }
 
 func (e *remotePCExecutor) registerEvents() {
@@ -65,6 +70,18 @@ func (e *remotePCExecutor) registerEvents() {
 		body, _ := json.Marshal(int(s))
 		e.sendEvent(remotePCOpEventConnectionStateChange, body)
 		logger.Infow("nat edge peer connection state", "state", s)
+	})
+	// Data channels created on the edge pion PC carry client→room data messages;
+	// forward them over the control channel so the room node can broadcast them
+	// (NAT-mode data-channel bridging).
+	e.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		label := dc.Label()
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			kind := dataChannelLabelKind(label)
+			body, _ := json.Marshal(remotePCDataMessageEvent{Kind: int32(kind), Data: msg.Data})
+			e.sendEvent(remotePCOpEventDataMessage, body)
+			logger.Debugw("nat edge forwarded data message", "label", label, "kind", kind, "bytes", len(msg.Data))
+		})
 	})
 }
 
@@ -183,8 +200,29 @@ func (e *remotePCExecutor) apply(msg remotePCMessage) (json.RawMessage, error) {
 		if err != nil {
 			return nil, err
 		}
+		e.dataChMu.Lock()
+		e.dataChs[req.Label] = dc
+		e.dataChMu.Unlock()
 		logger.Infow("nat edge created data channel", "label", req.Label, "id", dc.ID())
 		return json.Marshal(dc.ID())
+
+	case remotePCOpSendDataMessage:
+		var req remotePCSendDataMessageRequest
+		if err := json.Unmarshal(msg.Body, &req); err != nil {
+			return nil, err
+		}
+		label := dataChannelKindLabel(livekit.DataPacket_Kind(req.Kind))
+		e.dataChMu.Lock()
+		dc := e.dataChs[label]
+		e.dataChMu.Unlock()
+		if dc == nil {
+			return nil, fmt.Errorf("nat edge data channel %q not created", label)
+		}
+		if err := dc.SendText(string(req.Data)); err != nil {
+			return nil, err
+		}
+		logger.Debugw("nat edge sent data message", "label", label, "bytes", len(req.Data))
+		return nil, nil
 
 	case remotePCOpClose:
 		return nil, e.pc.Close()
@@ -198,4 +236,21 @@ func marshalSDP(sd *webrtc.SessionDescription) (json.RawMessage, error) {
 		return json.RawMessage("null"), nil
 	}
 	return json.Marshal(sd)
+}
+
+// dataChannelKindLabel maps a DataPacket kind to the edge data channel label
+// (matches the PCTransport's ReliableDataChannel/LossyDataChannel convention).
+func dataChannelKindLabel(kind livekit.DataPacket_Kind) string {
+	if kind == livekit.DataPacket_LOSSY {
+		return LossyDataChannel
+	}
+	return ReliableDataChannel
+}
+
+// dataChannelLabelKind is the inverse of dataChannelKindLabel.
+func dataChannelLabelKind(label string) livekit.DataPacket_Kind {
+	if label == LossyDataChannel {
+		return livekit.DataPacket_LOSSY
+	}
+	return livekit.DataPacket_RELIABLE
 }
