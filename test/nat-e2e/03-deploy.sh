@@ -17,6 +17,10 @@ log "edge node ip: $EDGE_IP   room node ip: $ROOM_IP"
 kubectl apply -f "$DIR/manifests/redis.yaml"
 wait_for "redis running" 120 kubectl get deploy/redis -o jsonpath='{.status.readyReplicas}' | grep -q 1
 
+# ---- webhook receiver (E2E) ----
+kubectl apply -f "$DIR/manifests/webhook-receiver.yaml"
+wait_for "webhook receiver running" 120 kubectl get pod/webhook-receiver -o jsonpath='{.status.phase}' | grep -qi Running
+
 # Clear stale node registrations from previous runs (restarts leave random
 # node IDs behind; stable IDs below prevent future duplicates).
 kubectl exec deploy/redis -- redis-cli DEL nodes room_node_map >/dev/null 2>&1 || true

@@ -17,5 +17,13 @@ docker build -t "$IMG" -f "$DIR/Dockerfile.nat" "$BUILD_DIR"
 log "loading image into kind '$CLUSTER_NAME' ..."
 kind load docker-image "$IMG" --name "$CLUSTER_NAME"
 
+# webhook receiver (E2E): tiny static HTTP server the server nodes POST webhook
+# events to. Built into its own scratch image + loaded into kind.
+log "cross-compiling webhook-receiver (linux/amd64) ..."
+(cd "$REPO_ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$BUILD_DIR/webhook-receiver" ./test/nat-e2e/webhook-receiver)
+WEBHOOK_IMG="${WEBHOOK_IMG:-webhook-recv:dev}"
+docker build -t "$WEBHOOK_IMG" -f "$DIR/Dockerfile.webhook-recv" "$BUILD_DIR"
+kind load docker-image "$WEBHOOK_IMG" --name "$CLUSTER_NAME"
+
 rm -rf "$BUILD_DIR"
-log "image $IMG ready in cluster"
+log "images $IMG + $WEBHOOK_IMG ready in cluster"

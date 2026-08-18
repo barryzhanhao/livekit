@@ -1346,6 +1346,28 @@ func scenarioReconnectResume(url, apiKey, apiSecret, room string) {
 	fmt.Println("RECONNECT_RESUME: FAIL resume outcome unresolved within 25s (neither accept nor leave)")
 	os.Exit(1)
 }
+
+// scenarioWebhookEvents: drives the server-side webhook (HTTP callback) path
+// cross-node. The server POSTs signed events (Authorization Bearer JWT carrying
+// the sha256 of the body) to the configured webhook URL; the receiver pod verifies
+// the signature and logs each event. The bash harness asserts the receiver
+// observed participant_joined / track_published / participant_left /
+// track_unpublished for this identity. Here the client just joins, publishes, and
+// leaves — firing the lifecycle events deterministically.
+func scenarioWebhookEvents(url, apiKey, apiSecret, room string) {
+	pub := newClient(url, apiKey, apiSecret, room, "go-webhook-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	// give the server a beat to dispatch join + publish events, then leave so
+	// participant_left / track_unpublished fire deterministically
+	time.Sleep(3 * time.Second)
+	pub.Stop()
+	time.Sleep(2 * time.Second)
+	fmt.Println("WEBHOOK_EVENTS: PASS (client joined, published, left)")
+}
 func waitRemoteIdentity(c *testclient.RTCClient, identity string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1465,6 +1487,10 @@ func scenarioNack(url, apiKey, apiSecret, room string) {
 		sub.SendNacks(5) // NACK the last 5 received packets, 3 rounds
 		time.Sleep(200 * time.Millisecond)
 	}
+	// keep the session alive so the room's DownTrack processes the final NACK
+	// round and increments its retransmit counter (nackAcks) before this client
+	// leaves and its DownTrack closes (the close logs the rtp stats).
+	time.Sleep(3 * time.Second)
 	fmt.Println("NACK: sent 3 rounds of 5 NACKs (assert server-side via room logs)")
 }
 
@@ -1859,7 +1885,7 @@ func main() {
 	apiKey := flag.String("api-key", "devkey", "API key")
 	apiSecret := flag.String("api-secret", "secret", "API secret")
 	room := flag.String("room", "nat-go", "room name")
-	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume")
+	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events")
 	flag.Parse()
 
 	switch *scenario {
@@ -1937,6 +1963,8 @@ func main() {
 		scenarioSimulcastSwitch(*url, *apiKey, *apiSecret, *room)
 	case "reconnect-resume":
 		scenarioReconnectResume(*url, *apiKey, *apiSecret, *room)
+	case "webhook-events":
+		scenarioWebhookEvents(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

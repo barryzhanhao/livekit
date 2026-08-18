@@ -4239,16 +4239,58 @@ func (p *ParticipantImpl) addTrackLocalRemote(trackLocal webrtc.TrackLocal) (*we
 	// Forward RTCP feedback (NACK/PLI/SR/RR) from the edge node back to the
 	// DownTrack (down-direction RTCP, NAT mode).
 	go func() {
+		// The edge node's TrackLocalStaticRTP rewrites the RTP SSRC to the pion
+		// sender's own before SRTP (track_local_static.go: packet.Header.SSRC =
+		// b.ssrc), so the subscriber NACKs/PLIs/reports that EDGE SSRC, not the
+		// room's internal DownTrack SSRC. The per-track MediaChannel carries only
+		// this track's RTCP, so rewrite every MediaSSRC/SSRC field the DownTrack
+		// filters on to the internal SSRC — otherwise NACK/PLI/RR are dropped at
+		// the `p.MediaSSRC == d.ssrc` / `r.SSRC != d.ssrc` checks.
+		localSSRC := downTrack.SSRC()
 		for {
 			data, err := ch.ReadRTCP()
 			if err != nil {
 				p.params.Logger.Infow("nat down track RTCP loop ended", "trackID", trackLocal.ID())
 				return
 			}
+			if localSSRC != 0 {
+				data = rewriteDownRTCPForLocalSSRC(data, localSSRC)
+			}
 			downTrack.ProcessRTCP(data)
 		}
 	}()
 	return nil, nil, nil
+}
+
+// rewriteDownRTCPForLocalSSRC rewrites the MediaSSRC (PLI/FIR/NACK) and the
+// receiver-report source SSRC fields of a subscriber RTCP batch to localSSRC.
+// The batch is carried by a per-track MediaChannel, so every packet in it belongs
+// to the track whose local (room-side) SSRC is localSSRC; the edge's pion sender
+// may have rewritten the on-wire SSRC. Unknown/malformed packets pass through.
+func rewriteDownRTCPForLocalSSRC(data []byte, localSSRC uint32) []byte {
+	pkts, err := rtcp.Unmarshal(data)
+	if err != nil {
+		return data
+	}
+	for _, pkt := range pkts {
+		switch p := pkt.(type) {
+		case *rtcp.PictureLossIndication:
+			p.MediaSSRC = localSSRC
+		case *rtcp.FullIntraRequest:
+			p.MediaSSRC = localSSRC
+		case *rtcp.TransportLayerNack:
+			p.MediaSSRC = localSSRC
+		case *rtcp.ReceiverReport:
+			for i := range p.Reports {
+				p.Reports[i].SSRC = localSSRC
+			}
+		}
+	}
+	out, err := rtcp.Marshal(pkts)
+	if err != nil {
+		return data
+	}
+	return out
 }
 
 // handleRemotePublishedTrack establishes the up-direction media plane for a

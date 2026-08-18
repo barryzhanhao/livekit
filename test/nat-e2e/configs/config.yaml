@@ -13,6 +13,10 @@ rtc:
     control_port: 7884      # internal pion-PC control (pod-to-pod)
 keys:
   devkey: secret            # standard LiveKit dev credentials (lk --dev-compatible)
+webhook:
+  urls:
+    - http://webhook-receiver.default.svc:8080/webhook
+  api_key: devkey            # signing key: the receiver verifies the JWT sha256 claim
 redis:
   address: redis.default.svc:6379
 logging:

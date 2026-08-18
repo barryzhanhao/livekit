@@ -1,0 +1,5 @@
+# webhook-receiver: static (scratch) image for the E2E webhook receiver pod.
+# The binary is built by 02-build-image.sh (CGO_ENABLED=0) — no base image needed.
+FROM scratch
+COPY webhook-receiver /webhook-receiver
+ENTRYPOINT ["/webhook-receiver"]

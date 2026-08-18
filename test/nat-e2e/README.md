@@ -75,7 +75,7 @@ cd test/nat-e2e
 | 场景 | 验证内容 |
 |---|---|
 | receive-before-publish | 订阅者先入空房间，发布者后加入发布 → 订阅者自动订阅并收包 |
-| **NACK 跨节点** | 订阅者客户端发真 RTCP NACK → 边缘 `pumpSenderRTCPToMediaChannel` → 房主 `DownTrack.ProcessRTCP`（实测边缘转发 8 个 nack 批） |
+| **NACK 跨节点（含 RTX 重传）** | 订阅者客户端发真 RTCP NACK → 边缘 `pumpSenderRTCPToMediaChannel` → 房主 `DownTrack.ProcessRTCP`（`nacks`）→ **实际重传**（`nackAcks`，实测 nacks=15/nackAcks=1）。RTCP 下行回环修复见生产加固 |
 | data | 数据通道消息（当前未跨节点桥接，§6.8 既定暂拆，记录行为） |
 | attributes | 发布者 `SetAttributes` → 房间广播 → 订阅者跨节点看到属性更新 |
 | metadata | 发布者更新 `Metadata` → 订阅者跨节点看到（`UpdateParticipantMetadata` 信号） |
@@ -112,6 +112,7 @@ cd test/nat-e2e
 | perform-rpc | `RoomService.PerformRpc` 指向 NAT 参与者 → 跨节点 DC 数据未桥接（已记录限制）→ RPC **干净、有界**失败（`data channel is not available`，psrpc Internal，毫秒级返回，绝不挂起）——把文档化限制固化为确定性回归断言 |
 | simulcast-switch | 真实 3 层 simulcast（`lk --publish-demo` 发 3-SSRC H264）+ Go 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`，MediaGateway 修复的证明）+ DownTrack max-subscribed 层随请求 0/1/2（层选择路径）；下切可真实生效（客户端码率骤降）、上切受层锁 PLI 限制（见已知限制） |
 | reconnect-resume | `reconnect=true` resume 协商路径：断信令后同 SID resume → 服务端走 `resuming RTC session`（`ResumeParticipant`）→ 客户端观察到**干净 resume**（`SignalResponse_Reconnect`，媒体继续）或干净拒绝（`SignalResponse_Leave` RECONNECT → 全量重连回退），媒体必恢复、绝不挂起 |
+| webhook-events | 服务端 webhook（HTTP 回调）路径：加入/发布/离开触发 `participant_joined`/`track_published`/`track_unpublished`/`participant_left`，POST 到集群内 receiver pod（`webhook-receiver.default.svc:8080/webhook`），receiver **验证 JWT sha256 签名**（0 rejected）后逐条记录（HMAC 签名验证端到端） |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
 
@@ -136,15 +137,13 @@ cd test/nat-e2e
 
 ```
 === lk 套件（生产加固后二进制） ===
-SUMMARY: 38 passed, 2 failed
-  (2 failed 为 S12 更大并发的首attempt 建立竞态——S11 边缘重启后紧跟并发建立偶发失败，
-   内置重试已在 fresh room（s12r）通过：9 up receivers + 15 down tracks；汇总计数保留
-   重试前的 fail，为既有脚本口径。S8 并发 54 up receivers 亦证明 simulcast 3 层修复在
-   并发下生效)
+SUMMARY: 37 passed, 0 failed
+  (本轮全绿；S12 更大并发首attempt 的建立竞态偶发时由内置重试吸收——重试房间 s12r 通过。
+   S8 并发 45+ up receivers 证明 simulcast 3 层修复在并发下生效)
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 38 passed, 0 failed
+GO-CLIENT SUMMARY: 39 passed, 0 failed
   (receive-before-publish / NACK / data / attributes / metadata / mute /
    multitrack / single-pc / whip / manual-subscribe / participant-name /
    room-admin / track-pause / room-lifecycle / service-apis /
@@ -153,7 +152,7 @@ GO-CLIENT SUMMARY: 38 passed, 0 failed
    room-move-forward / whip-ice-restart / health / simulate-speaker /
    simulate-node-failure / simulate-server-leave / sub-perm-revoke /
    participant-leave-visible / sync-state / connection-quality / turn-credentials /
-   reconnect / perform-rpc / simulcast-switch / reconnect-resume)
+   reconnect / perform-rpc / simulcast-switch / reconnect-resume / webhook-events)
 ```
 
 覆盖的功能：
@@ -166,8 +165,9 @@ GO-CLIENT SUMMARY: 38 passed, 0 failed
 
 ## 已知限制
 
-- **NACK 跨节点**：已用 Go 客户端（`06-client-e2e.sh`）真实验证——客户端发 NACK → 边缘 →
-  房主 DownTrack。`--loss` 场景断言质量反馈下降。缓冲级 NACK 生成另有 `TestNack` 单测。
+- **NACK 跨节点（已修复回环）**：客户端发真 RTCP NACK → 边缘 → 房主 DownTrack 并**实际重传**
+  （`nacks=15/nackAcks=1`）。此前房主侧因边缘 SSRC 重写丢弃 NACK（见生产加固"下行 RTCP SSRC
+  重写"），已修复并固化断言。`--loss` 场景断言质量反馈下降。缓冲级 NACK 生成另有 `TestNack` 单测。
 - **重连语义（边缘重启）**：客户端可恢复（全量重连），但 resume 协商会失败一次
   （远程 PC 控制通道关闭 → `create offer failed: media channel closed` → `NEGOTIATE_FAILED` →
   `FULL_RECONNECT`）。生产级改进方向：远程 PC 检测到控制通道死亡后主动触发干净的全量重连，
@@ -216,6 +216,18 @@ GO-CLIENT SUMMARY: 38 passed, 0 failed
   3 层全部跨节点（实测比特率 `[LOW≈105k, MED≈341k, HIGH≈1340k]`），新增单测
   `TestMediaGatewaySimulcastLayersBridgedSeparately`（3 SSRC 各自独立桥接 + 同层重复仍关闭 +
   整 track 移除）。
+- **下行 RTCP SSRC 重写（NACK/PLI/RR 跨节点回环修复）**（`participant.go`）：边缘
+  `TrackLocalStaticRTP` 在 SRTP 前把 RTP SSRC 重写为 pion sender 自己的（`track_local_static.go:
+  packet.Header.SSRC = b.ssrc`），所以订阅者 NACK/PLI/RR 指向**边缘 SSRC**、房主 DownTrack 按内部
+  SSRC 过滤（`p.MediaSSRC == d.ssrc`）全部丢弃——实测边缘转发了 NACK 但房主 `nacks:0`。修复：房主
+  侧 down-RTCP 边界把 PLI/FIR/NACK 的 MediaSSRC 与 RR 的 report SSRC 统一重写为 DownTrack 内部
+  SSRC（每 track 独占 MediaChannel，无串扰），实测 `nacks=15/nackAcks=1`（DownTrack 真正重传）。
+  新增单测 `TestRewriteDownRTCPForLocalSSRC`（NACK/PLI/FIR/RR 改写 + payload 保留 + 畸形输入不
+  panic）。顺带修复该测试暴露的 `for _, r := range p.Reports` 拷贝迭代不改写 bug。
+- **webhook receiver pod**（`test/nat-e2e/webhook-receiver/` + `manifests/webhook-receiver.yaml`）：
+  独立 scratch 镜像 + ClusterIP 服务（`webhook-receiver.default.svc:8080`），双节点经集群 DNS 可达
+  （宿主机不同网段不可达）。`webhook-events` 场景断言 receiver 用 `webhook.ReceiveWebhookEvent`
+  验证每个事件的 JWT sha256 签名（0 rejected）并记录 4 类生命周期事件。
 - **畸形 padding 防护**（`mediachannelrtp.go`）：padding 长度字节大于 payload 时清 Padding 标志，
   令 Marshal 成功而非每包报错（原实现 `Padding=true` + `PaddingSize=0` 触发 pion
   `errInvalidRTPPadding`）。

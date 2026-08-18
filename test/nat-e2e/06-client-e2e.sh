@@ -64,20 +64,45 @@ wait_log() { # wait_log <edge|room> <pattern> <timeout_sec> (same as 04-e2e.sh)
   done
 }
 
+wait_log_rcv() { # wait_log_rcv <pattern> <timeout_sec>  (webhook-receiver pod logs)
+  local pat="$1" timeout="$2" i=0
+  # process substitution (like wait_log): a `| grep -q` pipeline exits 141 under
+  # pipefail because grep -q closes the pipe on its first match (kubectl SIGPIPE),
+  # so the until loop would never observe a match.
+  until grep -qE "$pat" < <(kubectl logs -n "$NAMESPACE" pod/webhook-receiver --tail=2000 2>/dev/null); do
+    i=$((i+1))
+    if [ "$i" -ge "$timeout" ]; then
+      echo "  ✗ timeout ($timeout s) waiting in webhook-receiver logs for: $pat" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+receiver_logs() { kubectl logs -n "$NAMESPACE" pod/webhook-receiver --tail=2000 2>/dev/null; }
+
 PASS=0; FAIL=0
 
 # receive-before-publish: subscriber joins empty room, publisher publishes later
 if run_scenario receive-before-publish yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
-# NACK cross-node: client sends NACKs; assert the edge forwarded nack-typed RTCP
-# to the room's DownTrack (the definitive cross-node NACK path).
+# NACK cross-node: client sends NACKs; assert (a) the edge forwarded nack-typed
+# RTCP to the room's DownTrack AND (b) the room's DownTrack actually retransmitted
+# (nackAcks >= 1 in its rtp stats on close) — the full cross-node NACK→RTX round-trip.
 if run_scenario nack yes; then
-  if wait_log edge 'nat edge -> room down RTCP forwarded.*nack' 40; then
+  if wait_log edge 'nat edge -> room down RTCP forwarded.*nack' 40 && wait_log room 'rtp stats' 60; then
     n="$(edge_logs --since=3m | grep -c 'nat edge -> room down RTCP forwarded.*nack' || true)"
     n="${n:-0}"
-    echo "  ✓ NACK: edge forwarded $n nack batches to room DownTrack"; PASS=$((PASS+1))
+    na="$(room_logs --since=3m | grep 'rtp stats' | grep 'go-nack-sub' | grep -o '"nackAcks": [0-9]*' | grep -o '[0-9]*' | awk '$1>0' | head -1 || true)"
+    na="${na:-}"
+    if [ "$n" -ge 1 ] && [ -n "$na" ]; then
+      echo "  ✓ NACK: edge forwarded $n nack batches; room DownTrack retransmitted (nackAcks=$na)"
+      PASS=$((PASS+1))
+    else
+      echo "  ✗ NACK: forwarded=$n retransmit(nackAcks)=${na:-none}"; FAIL=$((FAIL+1))
+    fi
   else
-    echo "  ✗ NACK: no nack-typed down RTCP reached the room"; FAIL=$((FAIL+1))
+    echo "  ✗ NACK: no nack-typed down RTCP reached the room, or no DownTrack stats"; FAIL=$((FAIL+1))
   fi
 else
   FAIL=$((FAIL+1))
@@ -273,8 +298,12 @@ seed_room_map "$ROOM_REV"
 if run_scenario sub-perm-revoke yes "$ROOM_REV"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
 # participant-leave-visible: B leaves cleanly; A must observe the participant
-# removal broadcast cross-node.
-if run_scenario participant-leave-visible yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+# removal broadcast cross-node. FRESH room: the shared room accumulates a
+# participant per scenario (70+ by this point), which slows joins enough to
+# trigger the 30s connect timeout.
+ROOM_LV="${ROOM_GO}-leave"
+seed_room_map "$ROOM_LV"
+if run_scenario participant-leave-visible yes "$ROOM_LV"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
 # sync-state: a connected client declares its published track via SyncState; a
 # valid state must NOT trigger a full reconnect.
@@ -361,6 +390,39 @@ if run_scenario reconnect-resume yes "$ROOM_RS"; then
     PASS=$((PASS+1))
   else
     echo "  ✗ RECONNECT-RESUME: room log missing resume anchor"; FAIL=$((FAIL+1))
+  fi
+else
+  FAIL=$((FAIL+1))
+fi
+
+# webhook-events: the server-side webhook (HTTP callback) path cross-node. The
+# server POSTs HMAC-signed events (Authorization Bearer JWT carrying sha256 of the
+# body) to the receiver pod (webhook-receiver.default.svc:8080/webhook), which
+# verifies the signature and logs each event. A client joins + publishes + leaves;
+# the receiver must observe participant_joined / track_published / participant_left
+# / track_unpublished for go-webhook-pub, with ZERO rejected signatures. FRESH
+# room; assertions are scoped to the identity so other scenarios' events cannot
+# satisfy them.
+ROOM_WEB="${ROOM_GO}-webhook"
+seed_room_map "$ROOM_WEB"
+if run_scenario webhook-events yes "$ROOM_WEB"; then
+  if wait_log_rcv 'WEBHOOK_EVENT participant_joined.*go-webhook-pub' 40 \
+  && wait_log_rcv 'WEBHOOK_EVENT track_published.*go-webhook-pub' 40 \
+  && wait_log_rcv 'WEBHOOK_EVENT participant_left.*go-webhook-pub' 40 \
+  && wait_log_rcv 'WEBHOOK_EVENT track_unpublished.*go-webhook-pub' 40; then
+    nj="$(receiver_logs | grep -c 'WEBHOOK_EVENT participant_joined.*go-webhook-pub' || true)"; nj="${nj:-0}"
+    np="$(receiver_logs | grep -c 'WEBHOOK_EVENT track_published.*go-webhook-pub' || true)"; np="${np:-0}"
+    nl="$(receiver_logs | grep -c 'WEBHOOK_EVENT participant_left.*go-webhook-pub' || true)"; nl="${nl:-0}"
+    nu="$(receiver_logs | grep -c 'WEBHOOK_EVENT track_unpublished.*go-webhook-pub' || true)"; nu="${nu:-0}"
+    nr="$(receiver_logs | grep -c 'WEBHOOK_REJECTED' || true)"; nr="${nr:-0}"
+    if [ "$nj" -ge 1 ] && [ "$np" -ge 1 ] && [ "$nl" -ge 1 ] && [ "$nu" -ge 1 ] && [ "$nr" -eq 0 ]; then
+      echo "  ✓ WEBHOOK-EVENTS: receiver verified join(x$nj)/publish(x$np)/left(x$nl)/unpublish(x$nu); 0 rejected signatures"
+      PASS=$((PASS+1))
+    else
+      echo "  ✗ WEBHOOK-EVENTS: counts join=$nj publish=$np left=$nl unpublish=$nu rejected=$nr"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ✗ WEBHOOK-EVENTS: receiver did not observe all four signed events for go-webhook-pub"; FAIL=$((FAIL+1))
   fi
 else
   FAIL=$((FAIL+1))
