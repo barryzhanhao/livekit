@@ -143,6 +143,62 @@ if run_scenario subscription-permission yes; then PASS=$((PASS+1)); else FAIL=$(
 # quality-request: subscriber requests max video quality (dynacast layer selection)
 if run_scenario quality-request yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
+# rtc-validate: token-validation HTTP endpoints (validateInternal + room allocation)
+if run_scenario rtc-validate yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# update-video-track: publisher updates track dimensions; subscriber sees the
+# updated Width/Height via the participant broadcast cross-node.
+if run_scenario update-video-track yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# update-audio-track: publisher updates Opus track features; subscriber sees
+# AudioFeatures via the participant broadcast cross-node (also exercises the
+# Opus up-plane through the Go client).
+if run_scenario update-audio-track yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# data-track-publish: PublishDataTrackRequest + UnpublishDataTrackRequest signal
+# path (data-channel messages are documented unbridged cross-node).
+if run_scenario data-track-publish yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# hidden-participant: hidden grant participant must be invisible to peers but
+# visible to the admin RoomService. Fresh room (shared ROOM_GO may have peers).
+ROOM_HID="${ROOM_GO}-hidden"
+seed_room_map "$ROOM_HID"
+if run_scenario hidden-participant yes "$ROOM_HID"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# subscriber-only: CanPublish=false participant (recorder-style) receives media
+# from a normal publisher. Fresh room (custom-grant participant).
+ROOM_REC="${ROOM_GO}-rec"
+seed_room_map "$ROOM_REC"
+if run_scenario subscriber-only yes "$ROOM_REC"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# room-move-forward: MoveParticipant/ForwardParticipant routing RPCs (same-room
+# rejected; cross-room routed to the RoomManager stub "not implemented").
+if run_scenario room-move-forward yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# whip-ice-restart: WHIP session lifecycle — POST + media, PATCH (ICE restart)
+# cleanly rejected (upstream SDP-patch panic hardened to a 4xx error; the node
+# must NOT crash), DELETE (teardown) still succeeds. Edge logs must show both the
+# WHIP.Patch and WHIP.Delete API calls (the PATCH error log has no method suffix).
+ROOM_WHIP_RS="${ROOM_GO}-whiprs"
+seed_room_map "$ROOM_WHIP_RS"
+if run_scenario whip-ice-restart yes "$ROOM_WHIP_RS"; then
+  if wait_log edge 'API WHIP.Patch' 40 && wait_log edge 'API WHIP.Delete' 40; then
+    np="$(edge_logs --since=3m | grep -c 'API WHIP.Patch' || true)"; np="${np:-0}"
+    nd="$(edge_logs --since=3m | grep -c 'API WHIP.Delete' || true)"; nd="${nd:-0}"
+    if [ "$np" -ge 1 ] && [ "$nd" -ge 1 ]; then
+      echo "  ✓ WHIP-ICE-RESTART: edge handled PATCH(x$np) + DELETE(x$nd); room node survived"
+      PASS=$((PASS+1))
+    else
+      echo "  ✗ WHIP-ICE-RESTART: edge PATCH/DELETE log anchors missing (patch=$np delete=$nd)"
+      FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ✗ WHIP-ICE-RESTART: edge logs missing WHIP.Patch/Delete"; FAIL=$((FAIL+1))
+  fi
+else
+  FAIL=$((FAIL+1))
+fi
+
 # whip: one-shot signalling (RFC 9725) ingest over /whip/v1. Client asserts media
 # flows to a WS subscriber; the room logs must show UseOneShotSignallingMode
 # ("oneShot": true) and the WHIP publisher's up-plane registered.

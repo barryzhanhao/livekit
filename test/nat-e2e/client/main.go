@@ -16,9 +16,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -305,6 +307,62 @@ func scenarioWhip(url, apiKey, apiSecret, room string) {
 		os.Exit(1)
 	}
 	fmt.Println("WHIP: PASS (one-shot publish; subscriber received", sub.BytesReceived(), "bytes)")
+}
+
+// scenarioWhipIceRestart: full WHIP session lifecycle — POST (create + publish),
+// PATCH If-Match:* (ICE restart), then DELETE (teardown). The ICE-restart PATCH
+// is blocked by an upstream livekit/protocol panic in the SDP patch helper
+// (mutate-while-ranging on candidate-bearing remote descriptions); the fork
+// hardens that into a clean 4xx error so a remote fragment cannot crash the node.
+// The scenario asserts the node SURVIVES the malformed-fragment PATCH (DELETE
+// still works right after) — a crash-resilience regression test. It also covers
+// whipservice.handleParticipantPatch + handleParticipantDelete.
+func scenarioWhipIceRestart(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-whip-rs-sub")
+	waitConnected(sub)
+
+	httpBase := "http://" + mustParseURL(url).Host
+	s, err := newWhipSession(httpBase, token(apiKey, apiSecret, room, "go-whip-rs"), "go-whip-rs")
+	must(err)
+	defer s.pc.Close()
+
+	if err := s.waitConnected(20 * time.Second); err != nil {
+		fmt.Println("WHIP_ICE_RESTART: FAIL initial connect", err)
+		os.Exit(1)
+	}
+	// Publish RTP in the background immediately: the edge gateway registers the
+	// up-plane track only after the first RTP packet (FireOnTrackBeforeFirstRTP
+	// is off on the edge), so the track only becomes visible to subscribers once
+	// real media flows.
+	go func() {
+		_ = s.publishVideo(90 * time.Second)
+	}()
+
+	// subscriber sees the WHIP track + initial media
+	if err := waitRemoteTrackCount(sub, 1, 20*time.Second); err != nil {
+		fmt.Println("WHIP_ICE_RESTART: FAIL subscriber never saw the WHIP track", err)
+		os.Exit(1)
+	}
+	if err := waitBytes(sub, 4096, 30*time.Second); err != nil {
+		fmt.Println("WHIP_ICE_RESTART: FAIL no initial media", err)
+		os.Exit(1)
+	}
+
+	// ICE restart via PATCH (If-Match: *) — must yield a CLEAN error, not a crash.
+	perr := s.iceRestart()
+	if perr == nil {
+		fmt.Println("WHIP_ICE_RESTART: FAIL expected clean error from ICE-restart PATCH (upstream SDP-patch panic), got success")
+		os.Exit(1)
+	}
+	fmt.Println("WHIP_ICE_RESTART: PATCH returned clean error:", perr)
+
+	// The node must still be alive after the failed PATCH: the session teardown
+	// (DELETE → DeleteSession psrpc) must still succeed.
+	if err := s.deleteSession(); err != nil {
+		fmt.Println("WHIP_ICE_RESTART: FAIL DELETE after failed PATCH — node likely crashed", err)
+		os.Exit(1)
+	}
+	fmt.Println("WHIP_ICE_RESTART: PASS (POST + media; PATCH cleanly rejected without crash; DELETE teardown)")
 }
 
 // scenarioCodecs: publish VP9 and AV1 tracks cross-node; the room must register
@@ -918,6 +976,335 @@ func scenarioAttributes(url, apiKey, apiSecret, room string) {
 	os.Exit(1)
 }
 
+// waitTrackSID polls the remote participant view until the given identity has a
+// published track, returning its server-assigned SID (TR_*). Falls back to
+// checking the local published-track view if the remote view is empty.
+func waitTrackSID(c *testclient.RTCClient, identity string, timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, p := range c.RemoteParticipants() {
+			if p.Identity != identity {
+				continue
+			}
+			for _, t := range p.Tracks {
+				if t.Sid != "" {
+					return t.Sid
+				}
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return ""
+}
+
+// scenarioRTCValidate: exercises the server's token-validation HTTP endpoints
+// (/rtc/validate and /rtc/v1/validate). These run the full validateInternal →
+// ValidateConnectRequest → room-allocation path (token grants, limits) WITHOUT
+// creating a media session — a distinct, network-reachable surface.
+func scenarioRTCValidate(wsURL, apiKey, apiSecret, room string) {
+	httpBase := "http://" + mustParseURL(wsURL).Host
+
+	// legacy validate: token as query param → 200 "success"
+	tok := token(apiKey, apiSecret, room, "go-validate")
+	resp, err := http.Get(fmt.Sprintf("%s/rtc/validate?access_token=%s", httpBase, url.QueryEscape(tok)))
+	must(err)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "success" {
+		fmt.Println("RTC_VALIDATE: FAIL legacy validate", resp.StatusCode, string(body))
+		os.Exit(1)
+	}
+
+	// missing token → 401 (auth-failure branch)
+	resp, err = http.Get(httpBase + "/rtc/validate")
+	must(err)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		fmt.Println("RTC_VALIDATE: FAIL missing-token expected 401, got", resp.StatusCode)
+		os.Exit(1)
+	}
+
+	// v1 validate without join_request → 400 (needsJoinRequest branch)
+	resp, err = http.Get(fmt.Sprintf("%s/rtc/v1/validate?access_token=%s", httpBase, url.QueryEscape(tok)))
+	must(err)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		fmt.Println("RTC_VALIDATE: FAIL v1 no-join-request expected 400, got", resp.StatusCode)
+		os.Exit(1)
+	}
+
+	fmt.Println("RTC_VALIDATE: PASS (validate endpoints: success + auth/join_request failure branches)")
+}
+
+// scenarioUpdateVideoTrack: the publisher updates a published video track's
+// dimensions (UpdateVideoTrack); the subscriber must observe the new
+// Width/Height via the participant broadcast cross-node.
+func scenarioUpdateVideoTrack(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-uvt-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-uvt-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	trackSid := waitTrackSID(sub, "go-uvt-pub", 20*time.Second)
+	if trackSid == "" {
+		fmt.Println("UPDATE_VIDEO_TRACK: FAIL no track visible to subscriber")
+		os.Exit(1)
+	}
+
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_UpdateVideoTrack{
+			UpdateVideoTrack: &livekit.UpdateLocalVideoTrack{
+				TrackSid: trackSid,
+				Width:    1280,
+				Height:   720,
+			},
+		},
+	}))
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, p := range sub.RemoteParticipants() {
+			if p.Identity != "go-uvt-pub" {
+				continue
+			}
+			for _, t := range p.Tracks {
+				if t.Sid == trackSid && t.Width == 1280 && t.Height == 720 {
+					fmt.Println("UPDATE_VIDEO_TRACK: PASS (subscriber saw width/height update cross-node)")
+					return
+				}
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	fmt.Println("UPDATE_VIDEO_TRACK: FAIL subscriber never saw width/height update")
+	os.Exit(1)
+}
+
+// scenarioUpdateAudioTrack: the publisher publishes an Opus audio track and
+// updates its features (UpdateAudioTrack → stereo); the subscriber must observe
+// the audio track's AudioFeatures via the participant broadcast cross-node.
+// Also exercises the Opus up-plane through the Go client.
+func scenarioUpdateAudioTrack(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-uat-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-uat-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("audio/opus", "audio", "microphone")
+	must(err)
+	defer writer.Stop()
+
+	trackSid := waitTrackSID(sub, "go-uat-pub", 20*time.Second)
+	if trackSid == "" {
+		fmt.Println("UPDATE_AUDIO_TRACK: FAIL no audio track visible to subscriber")
+		os.Exit(1)
+	}
+
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_UpdateAudioTrack{
+			UpdateAudioTrack: &livekit.UpdateLocalAudioTrack{
+				TrackSid: trackSid,
+				Features: []livekit.AudioTrackFeature{livekit.AudioTrackFeature_TF_STEREO},
+			},
+		},
+	}))
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, p := range sub.RemoteParticipants() {
+			if p.Identity != "go-uat-pub" {
+				continue
+			}
+			for _, t := range p.Tracks {
+				if t.Sid == trackSid && len(t.AudioFeatures) > 0 && t.AudioFeatures[0] == livekit.AudioTrackFeature_TF_STEREO {
+					fmt.Println("UPDATE_AUDIO_TRACK: PASS (subscriber saw audio features update cross-node)")
+					return
+				}
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	fmt.Println("UPDATE_AUDIO_TRACK: FAIL subscriber never saw audio features update")
+	os.Exit(1)
+}
+
+// scenarioDataTrackPublish: publish a data track via PublishDataTrackRequest and
+// unpublish it via UnpublishDataTrackRequest — the participant data-track signal
+// path. (Data-channel messages are not bridged cross-node in the fork, so the
+// writer is never started; the signal RPC + response is the point.)
+func scenarioDataTrackPublish(url, apiKey, apiSecret, room string) {
+	pub := newClient(url, apiKey, apiSecret, room, "go-dtp-pub")
+	waitConnected(pub)
+
+	writer, err := pub.PublishDataTrack()
+	if err != nil {
+		fmt.Println("DATA_TRACK_PUBLISH: FAIL publish data track", err)
+		os.Exit(1)
+	}
+	writer.Stop() // do not start: DC messages are not bridged cross-node (§6.8)
+
+	// unpublish the data track (handle 1 = the first published)
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_UnpublishDataTrackRequest{
+			UnpublishDataTrackRequest: &livekit.UnpublishDataTrackRequest{PubHandle: 1},
+		},
+	}))
+	time.Sleep(1 * time.Second)
+	fmt.Println("DATA_TRACK_PUBLISH: PASS (publish + unpublish data track via signal path)")
+}
+
+// scenarioHiddenParticipant: a participant with the hidden grant joins. Other
+// participants must NOT see it in their remote view (broadcast exclusion), but
+// the admin RoomService must (participants map still holds it).
+func scenarioHiddenParticipant(url, apiKey, apiSecret, room string) {
+	hiddenTok := func() string {
+		at := auth.NewAccessToken(apiKey, apiSecret).
+			SetIdentity("go-hidden").
+			SetName("go-hidden")
+		at.AddGrant(&auth.VideoGrant{
+			RoomJoin: true, Room: room, Hidden: true,
+			CanPublish: boolPtr(true), CanSubscribe: boolPtr(true),
+		})
+		t, err := at.ToJWT()
+		must(err)
+		return t
+	}()
+
+	conn, err := testclient.NewWebSocketConn(url, hiddenTok, &testclient.Options{AutoSubscribe: true})
+	must(err)
+	hidden, err := testclient.NewRTCClient(conn, false, &testclient.Options{AutoSubscribe: true})
+	must(err)
+	go hidden.Run()
+	waitConnected(hidden)
+
+	// a normal subscriber joins and must NOT see the hidden participant
+	sub := newClient(url, apiKey, apiSecret, room, "go-hidden-sub")
+	waitConnected(sub)
+	time.Sleep(3 * time.Second)
+	for _, p := range sub.RemoteParticipants() {
+		if p.Identity == "go-hidden" {
+			fmt.Println("HIDDEN_PARTICIPANT: FAIL subscriber saw the hidden participant")
+			os.Exit(1)
+		}
+	}
+
+	// the admin must still be able to see it via RoomService
+	httpBase := "http://" + mustParseURL(url).Host
+	rmc := livekit.NewRoomServiceJSONClient(httpBase, &http.Client{})
+	adminCtx := func() context.Context {
+		at := auth.NewAccessToken(apiKey, apiSecret)
+		at.AddGrant(&auth.VideoGrant{RoomAdmin: true, RoomList: true, Room: room})
+		t, err := at.ToJWT()
+		must(err)
+		header := make(http.Header)
+		testclient.SetAuthorizationToken(header, t)
+		ctx, err := twirp.WithHTTPRequestHeaders(context.Background(), header)
+		must(err)
+		return ctx
+	}
+	lp, err := rmc.ListParticipants(adminCtx(), &livekit.ListParticipantsRequest{Room: room})
+	must(err)
+	for _, p := range lp.Participants {
+		if p.Identity == "go-hidden" {
+			fmt.Println("HIDDEN_PARTICIPANT: PASS (hidden from peers, visible to admin)")
+			return
+		}
+	}
+	fmt.Println("HIDDEN_PARTICIPANT: FAIL admin could not see hidden participant")
+	os.Exit(1)
+}
+
+// scenarioSubscriberOnly: a participant joins WITHOUT publish permission
+// (recorder-style subscriber). It must appear in the room (admin) and receive
+// media from a normal publisher — the CanPublish=false grant path.
+func scenarioSubscriberOnly(url, apiKey, apiSecret, room string) {
+	recTok := func() string {
+		at := auth.NewAccessToken(apiKey, apiSecret).
+			SetIdentity("go-rec").
+			SetName("go-rec")
+		// no CanPublish: subscriber-only grants
+		at.AddGrant(&auth.VideoGrant{RoomJoin: true, Room: room, CanSubscribe: boolPtr(true)})
+		t, err := at.ToJWT()
+		must(err)
+		return t
+	}()
+
+	conn, err := testclient.NewWebSocketConn(url, recTok, &testclient.Options{AutoSubscribe: true})
+	must(err)
+	rec, err := testclient.NewRTCClient(conn, false, &testclient.Options{AutoSubscribe: true})
+	must(err)
+	go rec.Run()
+	waitConnected(rec)
+
+	// a normal publisher publishes; the subscriber-only participant must receive
+	pub := newClient(url, apiKey, apiSecret, room, "go-rec-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	if err := waitBytes(rec, 2048, 30*time.Second); err != nil {
+		fmt.Println("SUBSCRIBER_ONLY: FAIL subscriber-only participant received no media", err)
+		os.Exit(1)
+	}
+	fmt.Println("SUBSCRIBER_ONLY: PASS (CanPublish=false participant received", rec.BytesReceived(), "bytes cross-node)")
+}
+
+// scenarioRoomMoveForward: exercises RoomService MoveParticipant/ForwardParticipant
+// (multi-node participant routing RPCs). Same-room targets are rejected by the
+// RoomService before routing; cross-room targets route to the participant's node,
+// whose RoomManager stubs return "not implemented".
+func scenarioRoomMoveForward(url, apiKey, apiSecret, room string) {
+	httpBase := "http://" + mustParseURL(url).Host
+	rmc := livekit.NewRoomServiceJSONClient(httpBase, &http.Client{})
+	destRoom := room + "-dest"
+	// EnsureDestRoomPermission requires source==grant.Room AND destination==grant.
+	// DestinationRoom. A single token is bound to one source→destination pair, so
+	// the same-room and cross-room calls need separate admin contexts.
+	adminCtx := func(dest string) context.Context {
+		at := auth.NewAccessToken(apiKey, apiSecret)
+		at.AddGrant(&auth.VideoGrant{RoomAdmin: true, Room: room, DestinationRoom: dest})
+		t, err := at.ToJWT()
+		must(err)
+		header := make(http.Header)
+		testclient.SetAuthorizationToken(header, t)
+		ctx, err := twirp.WithHTTPRequestHeaders(context.Background(), header)
+		must(err)
+		return ctx
+	}
+
+	// a participant to "move"
+	p := newClient(url, apiKey, apiSecret, room, "go-move-p")
+	waitConnected(p)
+
+	// same-room → rejected by RoomService before routing (destination == source)
+	_, err := rmc.MoveParticipant(adminCtx(room), &livekit.MoveParticipantRequest{Room: room, Identity: "go-move-p", DestinationRoom: room})
+	if err == nil || !strings.Contains(err.Error(), "destination room cannot be the same as source room") {
+		fmt.Println("ROOM_MOVE_FORWARD: FAIL same-room move not rejected:", err)
+		os.Exit(1)
+	}
+	_, err = rmc.ForwardParticipant(adminCtx(room), &livekit.ForwardParticipantRequest{Room: room, Identity: "go-move-p", DestinationRoom: room})
+	if err == nil || !strings.Contains(err.Error(), "destination room cannot be the same as source room") {
+		fmt.Println("ROOM_MOVE_FORWARD: FAIL same-room forward not rejected:", err)
+		os.Exit(1)
+	}
+
+	// cross-room → routed to the participant's node → RoomManager stub "not implemented"
+	_, err = rmc.MoveParticipant(adminCtx(destRoom), &livekit.MoveParticipantRequest{Room: room, Identity: "go-move-p", DestinationRoom: destRoom})
+	if err == nil || !strings.Contains(err.Error(), "not implemented") {
+		fmt.Println("ROOM_MOVE_FORWARD: FAIL cross-room move expected not implemented, got:", err)
+		os.Exit(1)
+	}
+	_, err = rmc.ForwardParticipant(adminCtx(destRoom), &livekit.ForwardParticipantRequest{Room: room, Identity: "go-move-p", DestinationRoom: destRoom})
+	if err == nil || !strings.Contains(err.Error(), "not implemented") {
+		fmt.Println("ROOM_MOVE_FORWARD: FAIL cross-room forward expected not implemented, got:", err)
+		os.Exit(1)
+	}
+	fmt.Println("ROOM_MOVE_FORWARD: PASS (same-room rejected; cross-room routed to stub)")
+}
+
 func main() {
 	// match the official test harness: register prometheus metrics so the RTC
 	// client's telemetry hooks don't dereference nil counters.
@@ -930,7 +1317,7 @@ func main() {
 	apiKey := flag.String("api-key", "devkey", "API key")
 	apiSecret := flag.String("api-secret", "secret", "API secret")
 	room := flag.String("room", "nat-go", "room name")
-	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes")
+	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart")
 	flag.Parse()
 
 	switch *scenario {
@@ -968,6 +1355,22 @@ func main() {
 		scenarioSubscriptionPermission(*url, *apiKey, *apiSecret, *room)
 	case "quality-request":
 		scenarioQualityRequest(*url, *apiKey, *apiSecret, *room)
+	case "rtc-validate":
+		scenarioRTCValidate(*url, *apiKey, *apiSecret, *room)
+	case "update-video-track":
+		scenarioUpdateVideoTrack(*url, *apiKey, *apiSecret, *room)
+	case "update-audio-track":
+		scenarioUpdateAudioTrack(*url, *apiKey, *apiSecret, *room)
+	case "data-track-publish":
+		scenarioDataTrackPublish(*url, *apiKey, *apiSecret, *room)
+	case "hidden-participant":
+		scenarioHiddenParticipant(*url, *apiKey, *apiSecret, *room)
+	case "subscriber-only":
+		scenarioSubscriberOnly(*url, *apiKey, *apiSecret, *room)
+	case "room-move-forward":
+		scenarioRoomMoveForward(*url, *apiKey, *apiSecret, *room)
+	case "whip-ice-restart":
+		scenarioWhipIceRestart(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

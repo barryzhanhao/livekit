@@ -777,3 +777,39 @@ func TestSinglePCAnswerStripsSubscribeOnlyCodecsFromRecvSide(t *testing.T) {
 			"answer must not advertise H.264 in recv-side m-section: %s", a.Value)
 	}
 }
+
+// Regression test for the ICE-restart SDP-fragment panic hardening: a remote
+// WHIP fragment + a candidate-bearing remote description triggers an upstream
+// livekit/protocol mutate-while-ranging panic (sdp.go PatchICECredentialAndCandidatesIntoSDP).
+// The handler must convert that into ErrInvalidSDPFragment instead of crashing.
+func TestICERestartSDPFragmentPanicHardened(t *testing.T) {
+	params := TransportParams{
+		Config:                   &WebRTCConfig{},
+		IsOfferer:                false,
+		UseOneShotSignallingMode: true,
+		Handler:                  &transportfakes.FakeHandler{},
+	}
+	tr, err := NewPCTransport(params)
+	require.NoError(t, err)
+	defer tr.Close()
+
+	// A remote description carrying many ICE candidates interleaved with other
+	// attributes is what makes the upstream patch helper's removal loop run past
+	// the shrinking slice length. Complete the negotiation so the offer becomes
+	// the CURRENT remote description (pion keeps it pending until a local answer).
+	var sb strings.Builder
+	sb.WriteString("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n")
+	sb.WriteString("m=video 9 UDP/TLS/RTP/SAVPF 96\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:old\r\na=ice-pwd:oldpwd\r\na=rtpmap:96 VP8/90000\r\na=setup:actpass\r\na=fingerprint:sha-256 2D:E2:72:41:24:AE:D0:6A:2E:90:93:B7:05:0A:0D:B0:61:A0:58:49:88:4E:26:90:E5:32:C7:76:94:CC:8F:59\r\n")
+	for i := 0; i < 40; i++ {
+		sb.WriteString(fmt.Sprintf("a=ssrc:%d cname:test\r\n", 1000+i))
+		sb.WriteString(fmt.Sprintf("a=candidate:%d 1 udp 2130706431 127.0.0.1 %d typ host\r\n", i+1, 5000+i))
+	}
+	sb.WriteString("a=end-of-candidates\r\n")
+	require.NoError(t, tr.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sb.String()}))
+	answer, err := tr.pc.CreateAnswer(nil)
+	require.NoError(t, err)
+	require.NoError(t, tr.pc.SetLocalDescription(answer))
+
+	_, err = tr.HandleICERestartSDPFragment("m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\na=ice-ufrag:new\r\na=ice-pwd:newpwd\r\n")
+	require.ErrorIs(t, err, ErrInvalidSDPFragment)
+}

@@ -1968,10 +1968,22 @@ func (t *PCTransport) HandleICETrickleSDPFragment(sdpFragment string) error {
 }
 
 // Handles SDP Fragment for ICE Restart in WHIP
-func (t *PCTransport) HandleICERestartSDPFragment(sdpFragment string) (string, error) {
+func (t *PCTransport) HandleICERestartSDPFragment(sdpFragment string) (sd string, err error) {
 	if !t.params.UseOneShotSignallingMode {
 		return "", ErrNotSynchronousLocalCandidatesMode
 	}
+
+	// A remote WHIP client's fragment must never be able to crash the node: the
+	// protocol SDP-patch helper (livekit/protocol/sdp PatchICECredentialAndCandidatesIntoSDP)
+	// mutates the media attribute slice while ranging over it and panics on
+	// candidate-bearing input. Convert any such panic into a clean error so the
+	// handler returns 4xx/5xx instead of taking the process down.
+	defer func() {
+		if r := recover(); r != nil {
+			t.params.Logger.Warnw("panic while patching ICE restart fragment", nil, "recover", r, "sdpFragment", sdpFragment)
+			sd, err = "", ErrInvalidSDPFragment
+		}
+	}()
 
 	parsedFragment := &lksdp.SDPFragment{}
 	if err := parsedFragment.Unmarshal(sdpFragment); err != nil {
@@ -2001,11 +2013,11 @@ func (t *PCTransport) HandleICERestartSDPFragment(sdpFragment string) (string, e
 		t.params.Logger.Warnw("could not marshal SDP with patched remote", err)
 		return "", err
 	}
-	sd := webrtc.SessionDescription{
+	remoteDesc := webrtc.SessionDescription{
 		SDP:  string(bytes),
 		Type: webrtc.SDPTypeOffer,
 	}
-	if err := t.pc.SetRemoteDescription(sd); err != nil {
+	if err := t.pc.SetRemoteDescription(remoteDesc); err != nil {
 		t.params.Logger.Warnw("could not set remote description", err)
 		return "", err
 	}

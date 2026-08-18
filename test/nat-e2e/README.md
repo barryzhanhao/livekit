@@ -91,6 +91,14 @@ cd test/nat-e2e
 | service-apis | 全量 `RoomService` 管理面：list/get participant、admin mute track、update participant/room metadata、update subscriptions、send data、kick、delete |
 | subscription-permission | 订阅者显式声明 per-track `SubscriptionPermission` → 服务器评估 → 媒体仍流动 |
 | quality-request | 订阅者请求最大视频质量（`UpdateTrackSettings.Quality`，dynacast 分层路径） |
+| rtc-validate | 令牌校验 HTTP 端点 `/rtc/validate`（成功 + 无 token 401 + v1 缺 join_request 400）→ validateInternal + room 分配 |
+| update-video-track | 发布者 `UpdateVideoTrack`（宽高）→ 订阅者跨节点看到 TrackInfo 更新 |
+| update-audio-track | Opus 上行 + `UpdateAudioTrack`（stereo 特性）→ 订阅者跨节点看到 AudioFeatures |
+| data-track-publish | `PublishDataTrackRequest` + `UnpublishDataTrackRequest` 信号路径（DC 消息仍不跨节点桥接） |
+| hidden-participant | hidden grant 参与者对普通成员不可见（广播排除）但 RoomService 可见 |
+| subscriber-only | `CanPublish=false`（录制风格）参与者只收不发，收到普通发布者媒体 |
+| room-move-forward | `MoveParticipant`/`ForwardParticipant`：同房被拒（invalid_argument）、跨房路由到 RoomManager stub（not implemented） |
+| whip-ice-restart | WHIP 生命周期：POST+媒体 → PATCH(ICE restart) 被干净拒绝（见下方已知限制）→ DELETE 拆会话；节点不崩溃 |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
 
@@ -146,6 +154,14 @@ GO-CLIENT SUMMARY: 12 passed, 0 failed
   重跑）使其确定性通过。生产级改进方向：核查边缘控制 accept 的并发建立与 room 的
   `establishRemoteSession` 背压。
 - **数据通道消息**：跨节点只转发 SDP 协商（m=application）；DC 数据消息未桥接（§6.8 既定暂拆）。
+- **WHIP ICE-restart（上游协议库 bug，已加固）**：`PATCH If-Match:*`（RFC 9725 ICE restart）在 fork 中
+  会触发上游 `livekit/protocol/sdp` `PatchICECredentialAndCandidatesIntoSDP` 的
+  **mutate-while-ranging panic**（`sdp.go:695`，对带 candidate 的远端描述遍历删除时切片越界），
+  曾使房主节点进程崩溃（`slice bounds out of range [169:167]`）。本轮在 `transport.go`
+  `HandleICERestartSDPFragment` 增加 **panic 兜底**（recover → `ErrInvalidSDPFragment` 干净错误），
+  远端 WHIP 片段无法再击穿节点；新增单测 `TestICERestartSDPFragmentPanicHardened` 与
+  E2E `whip-ice-restart` 场景验证"PATCH 干净拒绝 + 节点存活 + DELETE 仍成功"。真正的
+  ICE restart 打通需修复上游库（改遍历时删除为过滤重建），本 fork 暂以兜底错误收敛。
 - **内网明文**：media_relay 明文 TCP，生产需内网隔离或 TLS（§9）。
 - **瞬时 ICE 抖动**：Go 客户端 `nack` 场景偶发订阅者 ICE/DTLS 10s 超时（`TRANSPORT_FAILURE`），
   重跑即过（本机客户端经 Docker/VM 网卡候选 + srflx 的路径偶发抖动）。`06-client-e2e.sh` 以
@@ -191,11 +207,12 @@ GO-CLIENT SUMMARY: 12 passed, 0 failed
 - **可复现部署**（`03-deploy.sh`）：新增 `kubectl rollout restart`（镜像 tag 不变时重跑也能滚动到
   新二进制）+ `kubectl rollout status`（`kubectl wait` 会匹配 Recreate 滚动中被删除的旧 pod，
   导致 room 不滚动）；`02-build-image.sh`/`06-client-e2e.sh` 修正 `REPO_ROOT` 层级（`../../..` → `../..`）。
-- **单测**（本轮新增 6 个）：`TestRemotePeerConnectionRequestTimeout`（控制通道 15s 超时兜底）、
+- **单测**（本轮新增 7 个）：`TestRemotePeerConnectionRequestTimeout`（控制通道 15s 超时兜底）、
   `TestRemotePeerConnectionCloseUnblocksRequests`（通道关闭解阻塞 pending 请求）、
   `TestMediaChannelRTPWriterPadding`/`TestMediaChannelRTPWriterMalformedPadding`（padding 翻译 +
   畸形防护）、`TestMediaGatewayDuplicateSubscriberTrackClosesChannel`/
-  `TestMediaGatewayDuplicatePublisherTrackClosesChannel`（重复 attach 关闭冗余通道）。
+  `TestMediaGatewayDuplicatePublisherTrackClosesChannel`（重复 attach 关闭冗余通道）、
+  `TestICERestartSDPFragmentPanicHardened`（WHIP ICE-restart 片段 panic 兜底，见已知限制）。
 
 ## 与上游 LiveKit K8s 部署的对比
 
