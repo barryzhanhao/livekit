@@ -271,6 +271,18 @@ ROOM_REV="${ROOM_GO}-revoke"
 seed_room_map "$ROOM_REV"
 if run_scenario sub-perm-revoke yes "$ROOM_REV"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
+# participant-leave-visible: B leaves cleanly; A must observe the participant
+# removal broadcast cross-node.
+if run_scenario participant-leave-visible yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# sync-state: a connected client declares its published track via SyncState; a
+# valid state must NOT trigger a full reconnect.
+if run_scenario sync-state yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# connection-quality: A must observe B's per-participant connection quality
+# cross-node (SignalResponse_ConnectionQuality over the relay).
+if run_scenario connection-quality yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
 # health: HTTP / on both nodes (defaultHandler → healthCheck, node-stats
 # heartbeat freshness). Client-facing edge + room node must both answer 200 OK.
 if curl -s -m 5 "http://$(edge_node_ip):7880/" | grep -q '^OK$' && curl -s -m 5 "http://$(room_node_ip):7880/" | grep -q '^OK$'; then

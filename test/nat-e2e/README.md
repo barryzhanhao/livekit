@@ -104,6 +104,9 @@ cd test/nat-e2e
 | simulate-node-failure | 参与者模拟节点故障（`SimulateScenario_NodeFailure`）→ 服务端丢弃参与者并断开信令 → 客户端观察到服务端驱动断连 |
 | simulate-server-leave | 参与者模拟服务端 leave（`SimulateScenario_ServerLeave`）→ 服务端干净关闭参与者 → 客户端观察到服务端驱动断连 |
 | sub-perm-revoke | 媒体流动后**发布者**撤销订阅者对自身 track 的订阅权限（`SubscriptionPermission{AllParticipants:false}` → maybeRevokeSubscriptions → RemoveSubscriber）→ 被撤销者媒体冻结（下行 track 跨节点关闭） |
+| participant-leave-visible | B 干净离开 → A 跨节点观察到参与者移除广播（`SignalResponse_Update` 移除已离开参与者） |
+| sync-state | 已连接客户端用 `SyncState` 声明自身已发布 track → 服务端 `onSyncState` 校验通过 → **不**触发全量重连 |
+| connection-quality | A 跨节点观察到 B 的 per-participant 连接质量（`SignalResponse_ConnectionQuality`，EXCELLENT/score 4.5） |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
 
@@ -132,14 +135,15 @@ SUMMARY: 37 passed, 0 failed
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 30 passed, 0 failed
+GO-CLIENT SUMMARY: 33 passed, 0 failed
   (receive-before-publish / NACK / data / attributes / metadata / mute /
    multitrack / single-pc / whip / manual-subscribe / participant-name /
    room-admin / track-pause / room-lifecycle / service-apis /
    subscription-permission / quality-request / rtc-validate / update-video-track /
    update-audio-track / data-track-publish / hidden-participant / subscriber-only /
    room-move-forward / whip-ice-restart / health / simulate-speaker /
-   simulate-node-failure / simulate-server-leave / sub-perm-revoke)
+   simulate-node-failure / simulate-server-leave / sub-perm-revoke /
+   participant-leave-visible / sync-state / connection-quality)
 ```
 
 覆盖的功能：
@@ -234,11 +238,14 @@ GO-CLIENT SUMMARY: 30 passed, 0 failed
   （低噪声、不轮转）上验证"单会话/无 dual-PC offerer"与"one-shot"——边缘日志全量保留，锚点
   确定性可达。`07-coverage.sh` `--report` 分支的顶层 `return 0` 改为 `exit 0`（顶层 `return`
   无效，会导致脚本在汇总时误报）。
-- **test/client SDK 扩展**（`client.go`）：新增 `SignalResponse_Leave` 与
-  `SignalResponse_SpeakersChanged` 处理 + `WaitUntilDisconnected`/`DisconnectReason`/
-  `ActiveSpeakers` 访问器，支撑 simulate 场景的客户端侧断言（服务端驱动断连、speaker 广播）。
-  speaker delta 是**按订阅者收窄**的（`SendSpeakerUpdate(force=false)` 只发给已订阅该发言者的
-  参与者或发言者本人），simulate-speaker 场景先建立订阅再触发模拟。
+- **test/client SDK 扩展**（`client.go`）：新增 `SignalResponse_Leave` /
+  `SignalResponse_SpeakersChanged` / `SignalResponse_ConnectionQuality` 处理 +
+  `WaitUntilDisconnected`/`DisconnectReason`/`ActiveSpeakers`/`LastConnectionQuality`
+  访问器，支撑 simulate / speaker / 质量场景的客户端侧断言。speaker delta 是**按订阅者收窄**的
+  （`SendSpeakerUpdate(force=false)` 只发给已订阅该发言者的参与者或发言者本人），simulate-speaker
+  场景先建立订阅再触发模拟。媒体 track 的"取消发布"需重协商移除 transceiver（`writer.Stop()`
+  只停发送、服务端不因此取消发布），dual-PC NAT 下驱动不可靠，故无独立 track-unpublish 场景
+  （参与者离开覆盖参与者移除广播）。
 
 ## 与上游 LiveKit K8s 部署的对比
 

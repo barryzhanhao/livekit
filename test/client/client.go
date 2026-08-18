@@ -112,10 +112,12 @@ type RTCClient struct {
 	subscribedDataTracks       map[livekit.ParticipantID]map[uint16]*DataTrackRemote
 
 	// server-driven disconnect (SignalResponse_Leave or WS close) + last speaker
-	// snapshot, used by the simulate/speaker E2E scenarios
-	disconnectReason atomic.Int32
-	disconnected     atomic.Bool
-	activeSpeakers   atomic.Pointer[[]*livekit.SpeakerInfo]
+	// snapshot + last connection-quality snapshot, used by the simulate/speaker
+	// and connection-quality E2E scenarios
+	disconnectReason    atomic.Int32
+	disconnected        atomic.Bool
+	activeSpeakers      atomic.Pointer[[]*livekit.SpeakerInfo]
+	connectionQuality   atomic.Pointer[[]*livekit.ConnectionQualityInfo]
 }
 
 var (
@@ -712,6 +714,11 @@ func (c *RTCClient) handleSignalResponse(res *livekit.SignalResponse) error {
 		speakers := make([]*livekit.SpeakerInfo, 0, len(msg.SpeakersChanged.Speakers))
 		speakers = append(speakers, msg.SpeakersChanged.Speakers...)
 		c.activeSpeakers.Store(&speakers)
+
+	case *livekit.SignalResponse_ConnectionQuality:
+		updates := make([]*livekit.ConnectionQualityInfo, 0, len(msg.ConnectionQuality.Updates))
+		updates = append(updates, msg.ConnectionQuality.Updates...)
+		c.connectionQuality.Store(&updates)
 	}
 	return nil
 }
@@ -742,6 +749,17 @@ func (c *RTCClient) DisconnectReason() livekit.DisconnectReason {
 // (from SignalResponse_SpeakersChanged), or nil if none was received.
 func (c *RTCClient) ActiveSpeakers() []*livekit.SpeakerInfo {
 	p := c.activeSpeakers.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// LastConnectionQuality returns the most recent per-participant connection-quality
+// snapshot broadcast by the server (from SignalResponse_ConnectionQuality), or
+// nil if none was received.
+func (c *RTCClient) LastConnectionQuality() []*livekit.ConnectionQualityInfo {
+	p := c.connectionQuality.Load()
 	if p == nil {
 		return nil
 	}

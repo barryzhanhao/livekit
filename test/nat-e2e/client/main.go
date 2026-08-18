@@ -961,6 +961,137 @@ func scenarioSubPermRevoke(url, apiKey, apiSecret, room string) {
 	fmt.Printf("SUB_PERM_REVOKE: PASS (media froze after revoke: +%d bytes over 3s)\n", after-before)
 }
 
+// scenarioParticipantLeaveVisible: B leaves the room cleanly; A must observe the
+// participant-removal broadcast cross-node (SignalResponse_Update with the
+// departed participant removed).
+func scenarioParticipantLeaveVisible(url, apiKey, apiSecret, room string) {
+	a := newClient(url, apiKey, apiSecret, room, "go-leave-a")
+	waitConnected(a)
+	b := newClient(url, apiKey, apiSecret, room, "go-leave-b")
+	waitConnected(b)
+
+	if err := waitRemoteIdentity(a, "go-leave-b", 20*time.Second); err != nil {
+		fmt.Println("PARTICIPANT_LEAVE: FAIL A never saw B", err)
+		os.Exit(1)
+	}
+
+	b.Stop()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if !remoteIdentitySeen(a, "go-leave-b") {
+			fmt.Println("PARTICIPANT_LEAVE: PASS (A no longer sees B after leave)")
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	fmt.Println("PARTICIPANT_LEAVE: FAIL A still sees B after leave")
+	os.Exit(1)
+}
+
+// scenarioSyncState: a connected client sends SyncState declaring its published
+// track. The server validates the track exists (onSyncState); a valid state must
+// NOT trigger a full reconnect — the client stays connected.
+func scenarioSyncState(url, apiKey, apiSecret, room string) {
+	pub := newClient(url, apiKey, apiSecret, room, "go-sync-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	// wait for the track to be acked (appears in GetPublishedTrackIDs)
+	var trackSid string
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) && trackSid == "" {
+		ids := pub.GetPublishedTrackIDs()
+		if len(ids) > 0 {
+			trackSid = ids[0]
+		}
+		if trackSid == "" {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if trackSid == "" {
+		fmt.Println("SYNC_STATE: FAIL no published track acked")
+		os.Exit(1)
+	}
+
+	must(pub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_SyncState{
+			SyncState: &livekit.SyncState{
+				PublishTracks: []*livekit.TrackPublishedResponse{
+					{Track: &livekit.TrackInfo{Sid: trackSid}},
+				},
+			},
+		},
+	}))
+
+	// a valid SyncState must not trigger a full reconnect: the client must stay
+	// connected for a few seconds after the request
+	if err := pub.WaitUntilDisconnected(3 * time.Second); err == nil {
+		fmt.Println("SYNC_STATE: FAIL client disconnected after valid SyncState (full reconnect triggered)")
+		os.Exit(1)
+	}
+	fmt.Println("SYNC_STATE: PASS (valid SyncState accepted; no full reconnect)")
+}
+
+// scenarioConnectionQuality: the server periodically publishes per-participant
+// connection quality to every participant; A must observe B's quality info
+// cross-node (SignalResponse_ConnectionQuality over the relay).
+func scenarioConnectionQuality(url, apiKey, apiSecret, room string) {
+	a := newClient(url, apiKey, apiSecret, room, "go-cq-a")
+	waitConnected(a)
+	b := newClient(url, apiKey, apiSecret, room, "go-cq-b")
+	waitConnected(b)
+
+	// B publishes so quality is actively computed for it
+	writer, err := b.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+	if err := waitBytes(a, 1024, 30*time.Second); err != nil {
+		fmt.Println("CONNECTION_QUALITY: FAIL no media from B", err)
+		os.Exit(1)
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, qi := range a.LastConnectionQuality() {
+			if qi.ParticipantSid == string(b.ID()) && qi.Score > 0 {
+				fmt.Println("CONNECTION_QUALITY: PASS (A observed B's quality cross-node:", qi.Quality, qi.Score, ")")
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	fmt.Println("CONNECTION_QUALITY: FAIL A never received B's quality update")
+	os.Exit(1)
+}
+
+// waitRemoteIdentity polls until c sees a remote participant with the identity.
+func waitRemoteIdentity(c *testclient.RTCClient, identity string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, p := range c.RemoteParticipants() {
+			if p.Identity == identity {
+				return nil
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("remote participant %q not seen", identity)
+}
+
+// remoteIdentitySeen reports whether c currently sees a remote participant with
+// the identity (used to assert a participant's removal after leave).
+func remoteIdentitySeen(c *testclient.RTCClient, identity string) bool {
+	for _, p := range c.RemoteParticipants() {
+		if p.Identity == identity {
+			return true
+		}
+	}
+	return false
+}
+
 // scenarioQualityRequest: the subscriber sets the max video quality of a
 // subscribed track (UpdateTrackSettings.Quality), exercising the room's
 // dynacast/layer-selection path; media must keep flowing at the requested tier.
@@ -1512,6 +1643,12 @@ func main() {
 		scenarioSimulateServerLeave(*url, *apiKey, *apiSecret, *room)
 	case "sub-perm-revoke":
 		scenarioSubPermRevoke(*url, *apiKey, *apiSecret, *room)
+	case "participant-leave-visible":
+		scenarioParticipantLeaveVisible(*url, *apiKey, *apiSecret, *room)
+	case "sync-state":
+		scenarioSyncState(*url, *apiKey, *apiSecret, *room)
+	case "connection-quality":
+		scenarioConnectionQuality(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)
