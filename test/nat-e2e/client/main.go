@@ -1091,6 +1091,48 @@ func scenarioTurnCredentials(url, apiKey, apiSecret, room string) {
 	fmt.Println("TURN_CREDENTIALS: FAIL no TURN server in join response", servers)
 	os.Exit(1)
 }
+
+// scenarioReconnect: after the publisher's signal connection drops (PCs stay
+// alive), a fresh join with the SAME identity within the server's disconnect
+// grace window removes the duplicate participant and republishes; the subscriber
+// must observe media restored cross-node. Exercises the server's
+// duplicate-identity cleanup — the outcome a real client's full reconnect lands on.
+func scenarioReconnect(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-rc-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-rc-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	if err := waitBytes(sub, 1024, 30*time.Second); err != nil {
+		fmt.Println("RECONNECT: FAIL no baseline media", err)
+		os.Exit(1)
+	}
+
+	// drop ONLY the signal; keep the PCs alive (the server keeps the participant
+	// for the disconnect-cleanup grace window)
+	pub.DropSignal()
+	time.Sleep(2 * time.Second)
+
+	// fresh join with the same identity → the server removes the duplicate
+	// participant (RemoveParticipant DuplicateIdentity) and the new participant
+	// joins; it then republishes
+	before := sub.BytesReceived()
+	pub2 := newClient(url, apiKey, apiSecret, room, "go-rc-pub")
+	waitConnected(pub2)
+	writer2, err := pub2.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer2.Stop()
+
+	// the subscriber must receive media again cross-node (fresh track from pub2)
+	if err := waitBytes(sub, before+1024, 60*time.Second); err != nil {
+		fmt.Println("RECONNECT: FAIL media not restored after reconnect", err)
+		os.Exit(1)
+	}
+	fmt.Println("RECONNECT: PASS (media restored after signal drop + same-identity rejoin)")
+}
 func waitRemoteIdentity(c *testclient.RTCClient, identity string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1674,6 +1716,8 @@ func main() {
 		scenarioConnectionQuality(*url, *apiKey, *apiSecret, *room)
 	case "turn-credentials":
 		scenarioTurnCredentials(*url, *apiKey, *apiSecret, *room)
+	case "reconnect":
+		scenarioReconnect(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

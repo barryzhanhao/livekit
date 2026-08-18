@@ -894,6 +894,15 @@ func (c *RTCClient) Stop() {
 	c.cancel()
 }
 
+// DropSignal closes ONLY the signal WebSocket, simulating a network drop while
+// the peer connections stay alive (as a real client experiences on signal loss).
+// Unlike Stop(), it does not send a Leave or tear down the transports; the server
+// keeps the participant within the disconnect-cleanup grace window.
+func (c *RTCClient) DropSignal() {
+	c.conn.SetCloseHandler(nil) // don't let a close frame cascade into Stop()
+	_ = c.conn.Close()
+}
+
 func (c *RTCClient) RefreshToken() string {
 	c.lock.Lock()
 	defer c.lock.Unlock()

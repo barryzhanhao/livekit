@@ -287,6 +287,13 @@ if run_scenario connection-quality yes; then PASS=$((PASS+1)); else FAIL=$((FAIL
 # must carry a TURN server (iceServersForParticipant) with valid credentials.
 if run_scenario turn-credentials yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
+# reconnect: publisher drops only its signal; a same-identity rejoin removes the
+# duplicate participant and republishes — the subscriber sees media restored.
+# FRESH room: the rejoin must not be disturbed by other publishers' media.
+ROOM_RC="${ROOM_GO}-reconnect"
+seed_room_map "$ROOM_RC"
+if run_scenario reconnect yes "$ROOM_RC"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
 # health: HTTP / on both nodes (defaultHandler → healthCheck, node-stats
 # heartbeat freshness). Client-facing edge + room node must both answer 200 OK.
 if curl -s -m 5 "http://$(edge_node_ip):7880/" | grep -q '^OK$' && curl -s -m 5 "http://$(room_node_ip):7880/" | grep -q '^OK$'; then

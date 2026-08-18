@@ -108,6 +108,7 @@ cd test/nat-e2e
 | sync-state | 已连接客户端用 `SyncState` 声明自身已发布 track → 服务端 `onSyncState` 校验通过 → **不**触发全量重连 |
 | connection-quality | A 跨节点观察到 B 的 per-participant 连接质量（`SignalResponse_ConnectionQuality`，EXCELLENT/score 4.5） |
 | turn-credentials | 启用内嵌 TURN（UDP 3478）→ join 响应经 `iceServersForParticipant` 携带 TURN URL + 非空用户名/凭据（`turn:192.168.107.4:3478?transport=udp`） |
+| reconnect | 发布者只断开信令 WS（PC 存活）→ 断连宽限窗口内**同身份**重新 join → 服务端移除重复参与者（`RemoveParticipant DuplicateIdentity`）→ 新参与者重发布 → 订阅者跨节点看到媒体恢复（真实客户端全量重连落到的结局） |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
 
@@ -136,7 +137,7 @@ SUMMARY: 37 passed, 0 failed
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 34 passed, 0 failed
+GO-CLIENT SUMMARY: 35 passed, 0 failed
   (receive-before-publish / NACK / data / attributes / metadata / mute /
    multitrack / single-pc / whip / manual-subscribe / participant-name /
    room-admin / track-pause / room-lifecycle / service-apis /
@@ -144,7 +145,8 @@ GO-CLIENT SUMMARY: 34 passed, 0 failed
    update-audio-track / data-track-publish / hidden-participant / subscriber-only /
    room-move-forward / whip-ice-restart / health / simulate-speaker /
    simulate-node-failure / simulate-server-leave / sub-perm-revoke /
-   participant-leave-visible / sync-state / connection-quality / turn-credentials)
+   participant-leave-visible / sync-state / connection-quality / turn-credentials /
+   reconnect)
 ```
 
 覆盖的功能：
