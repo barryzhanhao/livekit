@@ -17,6 +17,12 @@ docker build -t "$IMG" -f "$DIR/Dockerfile.nat" "$BUILD_DIR"
 log "loading image into kind '$CLUSTER_NAME' ..."
 kind load docker-image "$IMG" --name "$CLUSTER_NAME"
 
+# redis: the only image the nodes pull from the registry (everything else is
+# preloaded). The kind nodes' containerd proxy points at 127.0.0.1:7897 (node
+# loopback), which cannot reach the host's proxy, so a fresh cluster cannot pull
+# it — preload it like the other images.
+kind load docker-image redis:7-alpine --name "$CLUSTER_NAME" || true
+
 # webhook receiver (E2E): tiny static HTTP server the server nodes POST webhook
 # events to. Built into its own scratch image + loaded into kind.
 log "cross-compiling webhook-receiver (linux/amd64) ..."

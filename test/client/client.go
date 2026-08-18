@@ -1545,6 +1545,31 @@ func (c *RTCClient) IsLocalCandidateRelaySelected() bool {
 	return false
 }
 
+// HasRelayCandidate reports whether any of this client's LOCAL gathered ICE
+// candidates is a TURN relay — i.e. the client successfully allocated a relay on
+// the advertised TURN server. (The relay-ONLY ICE path does not fully connect in
+// the Docker/kind environment, but allocation itself is verified cross-node.)
+func (c *RTCClient) HasRelayCandidate() bool {
+	var infos []*types.ICEConnectionInfo
+	if c.publisher != nil {
+		infos = append(infos, c.publisher.GetICEConnectionInfo())
+	}
+	if c.subscriber != nil {
+		infos = append(infos, c.subscriber.GetICEConnectionInfo())
+	}
+	for _, info := range infos {
+		if info == nil {
+			continue
+		}
+		for _, lc := range info.Local {
+			if lc.Candidate != nil && lc.Candidate.Typ == webrtc.ICECandidateTypeRelay {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (c *RTCClient) SendNacks(count int) {
 	var packets []rtcp.Packet
 	c.lock.Lock()

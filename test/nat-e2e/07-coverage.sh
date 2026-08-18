@@ -90,14 +90,14 @@ fi
 log "flushing coverage via /debug/coverage..."
 # The instrumented server exposes /debug/coverage (when GOCOVERDIR is set) which
 # flushes counters on demand — no process exit required.
-for role in edge room; do
+for role in edge room edge2; do
   ip="$("$role"_node_ip)"
   code=$(curl -s -o /dev/null -w '%{http_code}' "http://$ip:7880/debug/coverage" 2>/dev/null || echo 000)
   echo "  $role: /debug/coverage -> $code"
 done
 
 log "collecting coverage from emptyDir..."
-for role in edge room; do
+for role in edge room edge2; do
   pod=$(kubectl get pod -l app.kubernetes.io/name=$role -n "$NAMESPACE" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
   if [ -n "$pod" ] && kubectl exec -n "$NAMESPACE" "$pod" -- sh -c 'test -d /tmp/coverage' 2>/dev/null; then
     mkdir -p "$COVER_DIR/$role"

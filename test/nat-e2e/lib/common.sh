@@ -15,6 +15,7 @@ ROOM="${ROOM:-nat-test}"
 IMG="${IMG:-livekit-nat:dev}"
 EDGE_NODE="${EDGE_NODE:-$CLUSTER_NAME-worker}"
 ROOM_NODE="${ROOM_NODE:-$CLUSTER_NAME-worker2}"
+EDGE2_NODE="${EDGE2_NODE:-$CLUSTER_NAME-worker3}"
 EDGE_LABEL="nat-role=edge"
 ROOM_LABEL="nat-role=room"
 API_KEY="${API_KEY:-devkey}"
@@ -47,6 +48,7 @@ require() {
 # ---- node / pod helpers ----
 edge_node_ip() { kubectl get node "$EDGE_NODE" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'; }
 room_node_ip() { kubectl get node "$ROOM_NODE" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'; }
+edge2_node_ip() { kubectl get node "$EDGE2_NODE" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'; }
 
 node_logs()  { kubectl logs -n "$NAMESPACE" "deploy/livekit-$1" -c server "${@:2}"; }
 edge_logs()  { node_logs edge; }

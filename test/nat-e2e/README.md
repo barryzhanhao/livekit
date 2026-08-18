@@ -7,18 +7,23 @@
 ## 架构
 
 ```
-                        ┌─ 边缘节点 (nat-test-worker, 192.168.107.3) ─┐
- 客户端 (host)          │  SignalService (WS 7880)                     │
-   │ WS / SRTP / ICE    │  MediaGateway (真实 pion PC, UDP 7882)       │
-   └──────────────────► │  media_relay: 7883(RTP/RTCP) 7884(控制)      │
+                        ┌─ 边缘节点1 (nat-test-worker, 192.168.107.5) ─┐
+ 客户端A (host)          │  SignalService (WS 7880)                     │
+   │ WS / SRTP / ICE     │  MediaGateway (真实 pion PC, UDP 7882)       │
+   └──────────────────►  │  media_relay: 7883(RTP/RTCP) 7884(控制)      │
                         └──────┬──────────────────┬───────────────────┘
                                │ TCP 明文 RTP/RTCP │ TCP 控制 (pion PC op)
                         ┌──────▼──────────────────▼───────────────────┐
                         │ 房主节点 (nat-test-worker2, 192.168.107.4)   │
                         │  Room/Participant/TransportManager/SFU       │
                         │  DownTrack · buffer · dynacast · 拥塞控制    │
-                        └──────────────────────────────────────────────┘
-                        Redis (共享路由: room_node_map / nodes / PSRPC)
+                        └──────┬──────────────────┬───────────────────┘
+                               │ TCP 明文 RTP/RTCP │ TCP 控制 (pion PC op)
+                        ┌──────▼──────────────────▼───────────────────┐
+                        │ 边缘节点2 (nat-test-worker3, 192.168.107.2)  │ 多边缘:
+ 客户端B (host)          │  同构于边缘节点1（第二边缘，独立 advertise_ip）│ 同一房间可由
+   │ WS / SRTP / ICE     └────────────────────────────────────────────┘ 两个边缘同时服务
+   └──────────────────►  Redis (共享路由: room_node_map / nodes / PSRPC)
 ```
 
 - **NAT 模拟**：客户端只能通过边缘节点的 `advertise_ip`（对外 IP）连接；节点间内部流量走
@@ -40,7 +45,7 @@
 cd test/nat-e2e
 
 ./00-prereqs.sh        # 检查/安装工具，预拉镜像
-./01-cluster.sh        # 创建 kind 集群（control-plane + 2 worker：edge/room）
+./01-cluster.sh        # 创建 kind 集群（control-plane + 3 worker：edge/room/edge2；缺 worker3 时自动重建）
 ./02-build-image.sh    # 交叉编译 fork 的 livekit-server → 镜像 → 导入 kind
 ./03-deploy.sh         # 部署 Redis + 双 server pod（hostNetwork + advertise_ip）+ 钉房间到房主
 ./04-e2e.sh            # 跑全部 lk 场景（约 5-6 分钟）
@@ -107,7 +112,7 @@ cd test/nat-e2e
 | participant-leave-visible | B 干净离开 → A 跨节点观察到参与者移除广播（`SignalResponse_Update` 移除已离开参与者） |
 | sync-state | 已连接客户端用 `SyncState` 声明自身已发布 track → 服务端 `onSyncState` 校验通过 → **不**触发全量重连 |
 | connection-quality | A 跨节点观察到 B 的 per-participant 连接质量（`SignalResponse_ConnectionQuality`，EXCELLENT/score 4.5） |
-| turn-credentials | 启用内嵌 TURN（UDP 3478）→ join 响应经 `iceServersForParticipant` 携带 TURN URL + 非空用户名/凭据（`turn:192.168.107.4:3478?transport=udp`） |
+| turn-credentials | 启用内嵌 TURN（UDP 3478）→ join 响应经 `iceServersForParticipant` 携带 TURN URL + 非空用户名/凭据，且客户端**实际分配** relay candidate（`HasRelayCandidate`，跨节点 `ALLOCATE OK`）；relay-only 完整连接受 Docker/kind 环境限制（见已知限制） |
 | reconnect | 发布者只断开信令 WS（PC 存活）→ 断连宽限窗口内**同身份**重新 join → 服务端移除重复参与者（`RemoveParticipant DuplicateIdentity`）→ 新参与者重发布 → 订阅者跨节点看到媒体恢复（真实客户端全量重连落到的结局） |
 | perform-rpc | `RoomService.PerformRpc` 指向 NAT 参与者 → 跨节点 DC 数据未桥接（已记录限制）→ RPC **干净、有界**失败（`data channel is not available`，psrpc Internal，毫秒级返回，绝不挂起）——把文档化限制固化为确定性回归断言 |
 | simulcast-switch | 真实 3 层 simulcast（`lk --publish-demo` 发 3-SSRC H264）+ Go 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`，MediaGateway 修复的证明）+ DownTrack max-subscribed 层随请求 0/1/2（层选择路径）；下切可真实生效（客户端码率骤降）、上切受层锁 PLI 限制（见已知限制） |
@@ -115,6 +120,7 @@ cd test/nat-e2e
 | webhook-events | 服务端 webhook（HTTP 回调）路径：加入/发布/离开触发 `participant_joined`/`track_published`/`track_unpublished`/`participant_left`，POST 到集群内 receiver pod（`webhook-receiver.default.svc:8080/webhook`），receiver **验证 JWT sha256 签名**（0 rejected）后逐条记录（HMAC 签名验证端到端） |
 | subscriber-pli | 下行 RTCP 的 **PLI 路径**（keyframe 请求变体，与 NACK 互补）：订阅者发真 PLI → 房主 DownTrack 处理并请求发布者 keyframe（`sending PLI RTCP`，SSRC 重写修复的 PLI 证明——修复前边缘重写 SSRC 被 `p.MediaSSRC == d.ssrc` 丢弃） |
 | media-follows-signaling | 核心边界 IP 级证明：**媒体终止于信令节点（边缘）**——服务端 PC 跑在边缘（advertise_ip），客户端收到的远端 ICE candidate 必须携带边缘 IP（= WS hostname），绝不含房主 IP；断言 candidate 含边缘 IP + 媒体实际流动 |
+| multi-edge | **多边缘核心属性**：pub 连边缘1、sub 连边缘2（同一房间钉在房主节点）→ 媒体双向跨越边缘1↔边缘2（各经房主节点），两个边缘各出现网关会话（多边缘需要 `01-cluster.sh` 建 3 worker，无 worker3 时自动跳过） |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
 
@@ -145,7 +151,7 @@ SUMMARY: 37 passed, 0 failed
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 41 passed, 0 failed
+GO-CLIENT SUMMARY: 42 passed, 0 failed
   (receive-before-publish / NACK / data / attributes / metadata / mute /
    multitrack / single-pc / whip / manual-subscribe / participant-name /
    room-admin / track-pause / room-lifecycle / service-apis /
@@ -155,7 +161,7 @@ GO-CLIENT SUMMARY: 41 passed, 0 failed
    simulate-node-failure / simulate-server-leave / sub-perm-revoke /
    participant-leave-visible / sync-state / connection-quality / turn-credentials /
    reconnect / perform-rpc / simulcast-switch / reconnect-resume / webhook-events /
-   subscriber-pli / media-follows-signaling)
+   subscriber-pli / media-follows-signaling / multi-edge)
 ```
 
 覆盖的功能：
@@ -181,13 +187,22 @@ GO-CLIENT SUMMARY: 41 passed, 0 failed
   重跑）使其确定性通过。生产级改进方向：核查边缘控制 accept 的并发建立与 room 的
   `establishRemoteSession` 背压。
 - **数据通道消息**：跨节点只转发 SDP 协商（m=application）；DC 数据消息未桥接（§6.8 既定暂拆）。
-- **simulcast 层切换（上切受限）**：MediaGateway 修复后 3 层 RTP 已能全部跨节点（`available
+- **simulcast 上切受限（精确诊断）**：MediaGateway 修复后 3 层 RTP 已能全部跨节点（`available
   layers changed` 达 `[0,1,2]`），且 **下切**（HIGH→LOW）可真实生效（客户端码率从 ~800kbps 骤降到
-  ~150kbps）、DownTrack max-subscribed 层随请求 0/1/2 正确应用。但 **下切后再上切**（LOW→MEDIUM）
-  会把 forwarder 卡进层锁 PLI 循环（`sending PLI for layer lock` 每 200ms 一发、目标层 keyframe
-  始终无法 latch、媒体冻结），疑似与跨节点 up-RTCP（PLI → publisher keyframe 往返）的层 keyframe
-  检测/latch 有关。`simulcast-switch` 场景断言确定性的服务端锚点（3 层 up plane + 层选择 0/1/2），
-  上切媒体恢复留待专项核查。
+  ~150kbps）、DownTrack max-subscribed 层随请求 0/1/2 正确应用。**下切后再上切**（LOW→MEDIUM）卡进
+  层锁 PLI 循环（`sending PLI for layer lock` 每 200ms、目标层 keyframe 无法 latch、媒体冻结）。
+  受控复现的链条证据：订阅者请求到达 `SubscribedTrack`（`applying subscriber track settings` 显示
+  HIGH→LOW→MEDIUM→HIGH）→ 但 DownTrack `setting max spatial layer` 与 dynacast
+  `setting subscriber max quality` 常不触发（只 HIGH/OFF）→ `sending max subscribed quality`（发回
+  发布者）只发一次 → 发布者（lk）从不重新启用 MEDIUM/HIGH → 目标层 RTP 停滞、层锁永不 latch。
+  这是 dynacast 层传播 + 层锁的**间歇性**交互（同一场景时而全通、时而断裂），需在房主侧核查
+  max-layer 变更到 dynacast 的通知链；`simulcast-switch` 场景断言确定性的部分（3 层 up plane +
+  层选择 0/1/2 + 下切生效）。
+- **TURN relay（分配正常、relay-only ICE 环境限制）**：`turn-credentials` 场景现已断言客户端
+  **实际分配** relay candidate（`HasRelayCandidate`，join 响应凭据 → 房主节点 TURN `ALLOCATE OK
+  relayed: 192.168.107.4:50013`，跨节点分配路径验证）。但 **relay-only**（`ICETransportPolicyRelay`）
+  的完整 ICE 连接在 Docker/kind 环境不建立（分配成功、relay 候选已收集，但 relayed socket 的
+  STUN check 到边缘 host candidate 无法完成），非 fork 服务器问题（TURN server 正常监听 + 发凭据）。
 - **WHIP ICE-restart（上游协议库 bug，已加固）**：`PATCH If-Match:*`（RFC 9725 ICE restart）在 fork 中
   会触发上游 `livekit/protocol/sdp` `PatchICECredentialAndCandidatesIntoSDP` 的
   **mutate-while-ranging panic**（`sdp.go:695`，对带 candidate 的远端描述遍历删除时切片越界），

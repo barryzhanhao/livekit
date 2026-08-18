@@ -1083,7 +1083,14 @@ func scenarioTurnCredentials(url, apiKey, apiSecret, room string) {
 					fmt.Println("TURN_CREDENTIALS: FAIL TURN server", u, "has empty credentials")
 					os.Exit(1)
 				}
-				fmt.Println("TURN_CREDENTIALS: PASS (join issued TURN", u, "user", is.Username, ")")
+				// the client must actually ALLOCATE a relay on the advertised TURN
+				// server (gather a relay candidate), proving the allocation path
+				// works cross-node — not just that credentials are issued.
+				if !c.HasRelayCandidate() {
+					fmt.Println("TURN_CREDENTIALS: FAIL no relay candidate gathered despite TURN", u)
+					os.Exit(1)
+				}
+				fmt.Println("TURN_CREDENTIALS: PASS (join issued TURN", u, "; client allocated a relay candidate)")
 				return
 			}
 		}
@@ -1428,6 +1435,36 @@ func scenarioMediaFollowsSignaling(url, apiKey, apiSecret, room string) {
 	}
 	fmt.Printf("MEDIA_FOLLOWS_SIGNALING: PASS (server ICE candidates include edge IP %s — media terminates on the signaling node)\n", edgeIP)
 }
+
+// scenarioMultiEdge: two clients signal to DIFFERENT edge nodes (edge1 via the
+// primary URL, edge2 via url2) for the SAME room, which is hosted on the room
+// node. Media must follow signaling on BOTH edges: pub(edge1) publishes → sub
+// receives via edge2 (edge1→room→edge2), and sub(edge2) publishes → pub receives
+// via edge1 (edge2→room→edge1). Proves the multi-edge core property: any edge can
+// terminate a client's media for a room hosted elsewhere.
+func scenarioMultiEdge(url, apiKey, apiSecret, room, url2 string) {
+	pub := newClient(url, apiKey, apiSecret, room, "go-multi-pub")
+	waitConnected(pub)
+	sub := newClient(url2, apiKey, apiSecret, room, "go-multi-sub")
+	waitConnected(sub)
+
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+	if err := waitBytes(sub, 2048, 60*time.Second); err != nil {
+		fmt.Println("MULTI_EDGE: FAIL no media from edge1-pub to edge2-sub", err)
+		os.Exit(1)
+	}
+
+	writer2, err := sub.AddStaticTrack("video/vp8", "video", "camera2")
+	must(err)
+	defer writer2.Stop()
+	if err := waitBytes(pub, 2048, 60*time.Second); err != nil {
+		fmt.Println("MULTI_EDGE: FAIL no media from edge2-sub to edge1-pub", err)
+		os.Exit(1)
+	}
+	fmt.Println("MULTI_EDGE: PASS (media crossed edge1↔edge2 via the room node)")
+}
 func waitRemoteIdentity(c *testclient.RTCClient, identity string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1543,15 +1580,15 @@ func scenarioNack(url, apiKey, apiSecret, room string) {
 		fmt.Println("NACK: FAIL no media received before NACK", err)
 		os.Exit(1)
 	}
-	for i := 0; i < 3; i++ {
-		sub.SendNacks(5) // NACK the last 5 received packets, 3 rounds
-		time.Sleep(200 * time.Millisecond)
+	for i := 0; i < 6; i++ {
+		sub.SendNacks(5) // NACK the last 5 received packets, 6 rounds
+		time.Sleep(150 * time.Millisecond)
 	}
 	// keep the session alive so the room's DownTrack processes the final NACK
 	// round and increments its retransmit counter (nackAcks) before this client
 	// leaves and its DownTrack closes (the close logs the rtp stats).
 	time.Sleep(3 * time.Second)
-	fmt.Println("NACK: sent 3 rounds of 5 NACKs (assert server-side via room logs)")
+	fmt.Println("NACK: sent 6 rounds of 5 NACKs (assert server-side via room logs)")
 }
 
 // scenarioData: publish a data-channel message. NOTE: the fork currently does not
@@ -1942,10 +1979,11 @@ func main() {
 	}
 
 	url := flag.String("url", "ws://127.0.0.1:7880", "edge node WebSocket URL")
+	url2 := flag.String("url2", "", "second edge node WebSocket URL (multi-edge scenario)")
 	apiKey := flag.String("api-key", "devkey", "API key")
 	apiSecret := flag.String("api-secret", "secret", "API secret")
 	room := flag.String("room", "nat-go", "room name")
-	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events|subscriber-pli|media-follows-signaling")
+	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events|subscriber-pli|media-follows-signaling|multi-edge")
 	flag.Parse()
 
 	switch *scenario {
@@ -2029,6 +2067,8 @@ func main() {
 		scenarioSubscriberPLI(*url, *apiKey, *apiSecret, *room)
 	case "media-follows-signaling":
 		scenarioMediaFollowsSignaling(*url, *apiKey, *apiSecret, *room)
+	case "multi-edge":
+		scenarioMultiEdge(*url, *apiKey, *apiSecret, *room, *url2)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

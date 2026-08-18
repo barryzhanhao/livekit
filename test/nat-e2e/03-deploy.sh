@@ -11,7 +11,8 @@ kubectl cluster-info >/dev/null 2>&1 || { echo "no cluster — run ./01-cluster.
 
 EDGE_IP="$(edge_node_ip)"
 ROOM_IP="$(room_node_ip)"
-log "edge node ip: $EDGE_IP   room node ip: $ROOM_IP"
+EDGE2_IP="$(edge2_node_ip 2>/dev/null || true)"
+log "edge node ip: $EDGE_IP   room node ip: $ROOM_IP   edge2 node ip: ${EDGE2_IP:-<none>}"
 
 # ---- Redis ----
 kubectl apply -f "$DIR/manifests/redis.yaml"
@@ -97,19 +98,34 @@ EOF
 
 gen_server_deploy edge edge "$EDGE_IP"  | kubectl apply -f -
 gen_server_deploy room room "$ROOM_IP" | kubectl apply -f -
+# second edge (multi-edge): the edge2 worker terminates media for clients that
+# signal to it; the room node feeds BOTH edges for the same pinned room.
+if [ -n "${EDGE2_IP:-}" ]; then
+  kubectl create configmap "nat-config-edge2" \
+    --from-file=config.yaml=<(gen_node_config "$EDGE2_IP") \
+    --dry-run=client -o yaml | kubectl apply -f -
+  gen_server_deploy edge2 edge2 "$EDGE2_IP" | kubectl apply -f -
+fi
 # Image tag is stable ($IMG), so `apply` alone won't roll when the image was
 # rebuilt under the same tag — force a rollout so re-running this script always
 # runs the latest binary (Recreate strategy frees the hostNetwork ports).
 kubectl rollout restart deploy/livekit-edge deploy/livekit-room -n "$NAMESPACE"
+if [ -n "${EDGE2_IP:-}" ]; then
+  kubectl rollout restart deploy/livekit-edge2 -n "$NAMESPACE"
+fi
 
-log "waiting for both server pods Ready..."
+log "waiting for server pods Ready..."
 # rollout status waits for the NEW ReplicaSet (unlike `kubectl wait`, which can
 # match the old pod still terminating after a Recreate rollout).
 kubectl rollout status deploy/livekit-edge -n "$NAMESPACE" --timeout=180s
 kubectl rollout status deploy/livekit-room -n "$NAMESPACE" --timeout=180s
+if [ -n "${EDGE2_IP:-}" ]; then
+  kubectl rollout status deploy/livekit-edge2 -n "$NAMESPACE" --timeout=180s
+fi
 
-log "waiting for both nodes registered in redis..."
-wait_for "both nodes registered" 120 sh -c 'kubectl exec deploy/redis -- redis-cli --raw HLEN nodes | grep -qx 2'
+log "waiting for nodes registered in redis..."
+# 2 nodes without edge2, 3 with it
+wait_for "all nodes registered" 120 sh -c 'kubectl exec deploy/redis -- redis-cli --raw HLEN nodes | grep -qE "^(2|3)$"'
 
 log "--- registered nodes ---"
 for key in $(redis_cli HKEYS nodes); do

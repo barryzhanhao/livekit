@@ -89,7 +89,11 @@ if run_scenario receive-before-publish yes; then PASS=$((PASS+1)); else FAIL=$((
 # NACK cross-node: client sends NACKs; assert (a) the edge forwarded nack-typed
 # RTCP to the room's DownTrack AND (b) the room's DownTrack actually retransmitted
 # (nackAcks >= 1 in its rtp stats on close) — the full cross-node NACK→RTX round-trip.
-if run_scenario nack yes; then
+# FRESH room (the shared room accumulates participants, which disturbs the
+# NACK/retransmit timing late in the suite).
+ROOM_NACK="${ROOM_GO}-nack"
+seed_room_map "$ROOM_NACK"
+if run_scenario nack yes "$ROOM_NACK"; then
   if wait_log edge 'nat edge -> room down RTCP forwarded.*nack' 40 \
   && wait_log room 'rtp stats.*go-nack-sub' 60; then
     n="$(edge_logs --since=3m | grep -c 'nat edge -> room down RTCP forwarded.*nack' || true)"
@@ -460,6 +464,39 @@ fi
 ROOM_MFS="${ROOM_GO}-mfs"
 seed_room_map "$ROOM_MFS"
 if run_scenario media-follows-signaling yes "$ROOM_MFS"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# multi-edge: two clients signal to DIFFERENT edge nodes (edge1 + edge2) for the
+# SAME room hosted on the room node. Media must follow signaling on BOTH edges —
+# pub(edge1)→sub(edge2) AND sub(edge2)→pub(edge1) both flow (each via the room
+# node). Only runs when the edge2 worker is deployed; both edges must show a
+# gateway session for this room.
+if [ -n "$(edge2_node_ip 2>/dev/null || true)" ]; then
+  WS2="ws://$(edge2_node_ip):7880"
+  ROOM_ME="${ROOM_GO}-multi"
+  seed_room_map "$ROOM_ME"
+  echo "=== multi-edge (edge1=$(edge_node_ip) edge2=$(edge2_node_ip)) ==="
+  set +e
+  /tmp/nat-client -url "$WS_URL" -url2 "$WS2" -api-key "$API_KEY" -api-secret "$API_SECRET" \
+    -room "$ROOM_ME" -scenario multi-edge
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ] \
+  && wait_log edge "nat edge gateway session starting.*$ROOM_ME\"" 40 \
+  && wait_log edge2 "nat edge gateway session starting.*$ROOM_ME\"" 40; then
+    ne1="$(edge_logs --since=3m | grep 'nat edge gateway session starting' | grep -c "$ROOM_ME\"" || true)"; ne1="${ne1:-0}"
+    ne2="$(kubectl logs -n "$NAMESPACE" "deploy/livekit-edge2" -c server --since=3m 2>/dev/null | grep -c 'nat edge gateway session starting.*'"$ROOM_ME"'"' || true)"; ne2="${ne2:-0}"
+    if [ "$ne1" -ge 1 ] && [ "$ne2" -ge 1 ]; then
+      echo "  ✓ MULTI-EDGE: media crossed edge1(x$ne1)↔edge2(x$ne2) via the room node"
+      PASS=$((PASS+1))
+    else
+      echo "  ✗ MULTI-EDGE: gateway sessions edge1=$ne1 edge2=$ne2"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ✗ MULTI-EDGE: client rc=$rc or gateway sessions missing on both edges"; FAIL=$((FAIL+1))
+  fi
+else
+  echo "  - MULTI-EDGE: skipped (no edge2 worker deployed; run 01-cluster.sh to recreate with worker3)"
+fi
 
 # health: HTTP / on both nodes (defaultHandler → healthCheck, node-stats
 # heartbeat freshness). Client-facing edge + room node must both answer 200 OK.
