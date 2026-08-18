@@ -56,7 +56,7 @@ func TestMediaGatewayAddPublisherTrack(t *testing.T) {
 
 	pkt := testPacket(t, 300, 0x1234abcd, []byte{0xaa, 0xbb})
 	r := &fakeRTPReader{packets: []*rtp.Packet{pkt}}
-	require.NoError(t, g.AddPublisherTrack("track-2", r, ch))
+	require.NoError(t, g.AddPublisherTrack("track-2", 0x1234abcd, r, ch))
 
 	raw, err := peer.ReadRTP()
 	require.NoError(t, err)
@@ -125,7 +125,8 @@ func TestMediaGatewayDuplicateSubscriberTrackClosesChannel(t *testing.T) {
 }
 
 // TestMediaGatewayDuplicatePublisherTrackClosesChannel is the up-direction
-// counterpart of the subscriber duplicate-attach guard.
+// counterpart of the subscriber duplicate-attach guard: the SAME layer (SSRC)
+// re-attaching must close the redundant channel, not leak it.
 func TestMediaGatewayDuplicatePublisherTrackClosesChannel(t *testing.T) {
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	require.NoError(t, err)
@@ -138,10 +139,10 @@ func TestMediaGatewayDuplicatePublisherTrackClosesChannel(t *testing.T) {
 	r := &fakeRTPReader{packets: []*rtp.Packet{pkt}}
 
 	ch1, _ := NewLocalMediaChannelPair(10)
-	require.NoError(t, g.AddPublisherTrack("track-dup-up", r, ch1))
+	require.NoError(t, g.AddPublisherTrack("track-dup-up", 0x1234abcd, r, ch1))
 
 	ch2, peer2 := NewLocalMediaChannelPair(10)
-	require.NoError(t, g.AddPublisherTrack("track-dup-up", r, ch2))
+	require.NoError(t, g.AddPublisherTrack("track-dup-up", 0x1234abcd, r, ch2))
 
 	require.ErrorIs(t, peer2.WriteRTP([]byte{0x01}), ErrMediaChannelClosed)
 
@@ -149,4 +150,66 @@ func TestMediaGatewayDuplicatePublisherTrackClosesChannel(t *testing.T) {
 	_, ok := g.upTracks["track-dup-up"]
 	g.mu.RUnlock()
 	require.True(t, ok)
+}
+
+// TestMediaGatewaySimulcastLayersBridgedSeparately verifies that a simulcast track
+// (one trackID, one TrackRemote/SSRC per layer) bridges EACH layer on its own
+// MediaChannel instead of treating the 2nd/3rd SSRC as duplicate attaches. This is
+// what lets the room node's SFU receive real 3-layer simulcast across the NAT
+// boundary and switch the DownTrack between layers.
+func TestMediaGatewaySimulcastLayersBridgedSeparately(t *testing.T) {
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	require.NoError(t, err)
+	defer pc.Close()
+
+	g := NewMediaGateway(pc)
+	defer g.Close()
+
+	const (
+		trackID    = "demo-video"
+		ssrcLow    = 1088957874 // q
+		ssrcMedium = 1808587958 // h
+		ssrcHigh   = 3512054672 // f
+	)
+
+	readers := map[uint32]*fakeRTPReader{
+		ssrcLow:    {packets: []*rtp.Packet{testPacket(t, 10, ssrcLow, []byte{0x01})}},
+		ssrcMedium: {packets: []*rtp.Packet{testPacket(t, 20, ssrcMedium, []byte{0x02})}},
+		ssrcHigh:   {packets: []*rtp.Packet{testPacket(t, 30, ssrcHigh, []byte{0x03})}},
+	}
+	peers := make(map[uint32]MediaChannel, 3)
+	for _, ssrc := range []uint32{ssrcLow, ssrcMedium, ssrcHigh} {
+		ch, peer := NewLocalMediaChannelPair(10)
+		defer peer.Close()
+		peers[ssrc] = peer
+		require.NoError(t, g.AddPublisherTrack(trackID, ssrc, readers[ssrc], ch))
+	}
+
+	g.mu.RLock()
+	layers, ok := g.upTracks[trackID]
+	g.mu.RUnlock()
+	require.True(t, ok)
+	require.Len(t, layers, 3)
+
+	// Each layer's RTP must arrive at the room end of its own MediaChannel.
+	for _, ssrc := range []uint32{ssrcLow, ssrcMedium, ssrcHigh} {
+		raw, err := peers[ssrc].ReadRTP()
+		require.NoError(t, err, "layer ssrc %d", ssrc)
+		var got rtp.Packet
+		require.NoError(t, got.Unmarshal(raw))
+		require.Equal(t, uint32(ssrc), got.SSRC)
+		require.Equal(t, readers[ssrc].packets[0].Payload, got.Payload)
+	}
+
+	// A true duplicate of ONE layer still closes its redundant channel.
+	chDup, peerDup := NewLocalMediaChannelPair(10)
+	require.NoError(t, g.AddPublisherTrack(trackID, ssrcMedium, readers[ssrcMedium], chDup))
+	require.ErrorIs(t, peerDup.WriteRTP([]byte{0x01}), ErrMediaChannelClosed)
+
+	// Removal tears down all layers of the track.
+	g.RemoveTrack(trackID)
+	g.mu.RLock()
+	_, ok = g.upTracks[trackID]
+	g.mu.RUnlock()
+	require.False(t, ok)
 }

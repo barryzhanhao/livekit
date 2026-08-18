@@ -8,6 +8,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REPO_ROOT="$(cd "$DIR/../.." && pwd)"   # livekit repo root (test/nat-e2e is 2 levels deep)
 ROOM_GO="${ROOM_GO:-nat-go}"
+WORK="$(mktemp -d)"
 
 require go kubectl
 WS_URL="${WS_URL:-ws://$(edge_node_ip):7880}"
@@ -293,6 +294,77 @@ if run_scenario turn-credentials yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1
 ROOM_RC="${ROOM_GO}-reconnect"
 seed_room_map "$ROOM_RC"
 if run_scenario reconnect yes "$ROOM_RC"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# perform-rpc: RoomService PerformRpc to a NAT participant must fail CLEANLY and
+# BOUNDED — data-channel DATA messages are a documented NAT limitation (not
+# bridged cross-node), so the room's remote (edge) PCTransport has no local data
+# channel and the RPC returns ErrDataChannelUnavailable immediately instead of
+# hanging. The client asserts the specific error + bounded latency; this pins the
+# documented limitation as a deterministic regression test (no indefinite hang).
+# FRESH room (clean psrpc routing target).
+ROOM_RPC="${ROOM_GO}-rpc"
+seed_room_map "$ROOM_RPC"
+if run_scenario perform-rpc yes "$ROOM_RPC"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# simulcast-switch: REAL 3-layer layer switching. lk publishes 3-layer H264
+# simulcast (publish-demo, identity go-sim-lk-pub); the Go subscriber requests
+# LOW then MEDIUM/HIGH via UpdateTrackSettings. Two room-side proofs, both scoped
+# to this scenario's participants so earlier scenarios (quality-request, single
+# layer) cannot satisfy them:
+#   (a) the room received all 3 simulcast up planes cross-node — `available layers
+#       changed - layer seen` reaching [0,1,2] for go-sim-lk-pub. This is the
+#       MediaGateway fix's proof: each simulcast layer now bridges on its own
+#       MediaChannel (previously only the first layer's RTP crossed the boundary).
+#   (b) the DownTrack's max subscribed spatial followed the client's requests —
+#       `setting max spatial layer` shows layers 0, 1, 2 for go-sim-sub (the real
+#       down-switch to LOW + selection applied through MEDIUM/HIGH).
+# The client drives the requests and keeps the session alive (client-side media
+# BITRATE assertions are not reliable: an up-switch after a down-switch stalls the
+# forwarder in a layer-lock PLI loop cross-node, documented limitation).
+ROOM_SIM="${ROOM_GO}-simulcast"
+seed_room_map "$ROOM_SIM"
+lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
+  -r "$ROOM_SIM" -i go-sim-lk-pub --publish-demo --fps 30 >"$WORK/lk-sim.log" 2>&1 &
+LK_SIM_PID=$!
+if run_scenario simulcast-switch yes "$ROOM_SIM"; then
+  if wait_log room 'available layers changed - layer seen' 60 && wait_log room 'setting max spatial layer' 60; then
+    layers3="$(room_logs --since=3m | grep 'available layers changed - layer seen' | grep 'go-sim-lk-pub' | grep -o '\[0, 1, 2\]' | head -1)"
+    layers="$(room_logs --since=3m | grep 'setting max spatial layer' | grep 'go-sim-sub' | grep -o '"layer": *[0-9]*' | grep -o '[0-9]*' | sort -u | tr '\n' ' ')"
+    if [ -n "$layers3" ] && echo " $layers " | grep -q ' 0 ' && echo " $layers " | grep -q ' 1 ' && echo " $layers " | grep -q ' 2 '; then
+      echo "  ✓ SIMULCAST-SWITCH: 3-layer up-plane cross-node + applied layer selection {0,1,2} (observed: $layers)"
+      PASS=$((PASS+1))
+    else
+      echo "  ✗ SIMULCAST-SWITCH: layers3=[$layers3] applied=($layers)"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ✗ SIMULCAST-SWITCH: room logs missing layer anchors"; FAIL=$((FAIL+1))
+  fi
+else
+  FAIL=$((FAIL+1))
+fi
+kill -9 "$LK_SIM_PID" 2>/dev/null || true
+wait "$LK_SIM_PID" 2>/dev/null || true
+
+# reconnect-resume: the reconnect=true resume negotiation path. The publisher
+# drops its signal WS (PCs alive), then reconnects the signal with reconnect=true
+# + its SID within the disconnect-cleanup grace window. The server MUST take the
+# resume path (room log "resuming RTC session"); the client then either completes
+# a clean resume (SignalResponse_Reconnect) or falls back to a full reconnect when
+# the server rejects it (Leave with RECONNECT action). Either way media must be
+# restored — the assertion is that the negotiation path is exercised and the
+# client recovers, never hangs. FRESH room (the rejoin must not be disturbed).
+ROOM_RS="${ROOM_GO}-resume"
+seed_room_map "$ROOM_RS"
+if run_scenario reconnect-resume yes "$ROOM_RS"; then
+  if wait_log room 'resuming RTC session' 60; then
+    echo "  ✓ RECONNECT-RESUME: server took the resume path (resuming RTC session)"
+    PASS=$((PASS+1))
+  else
+    echo "  ✗ RECONNECT-RESUME: room log missing resume anchor"; FAIL=$((FAIL+1))
+  fi
+else
+  FAIL=$((FAIL+1))
+fi
 
 # health: HTTP / on both nodes (defaultHandler → healthCheck, node-stats
 # heartbeat freshness). Client-facing edge + room node must both answer 200 OK.

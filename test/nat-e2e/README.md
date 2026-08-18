@@ -109,6 +109,9 @@ cd test/nat-e2e
 | connection-quality | A 跨节点观察到 B 的 per-participant 连接质量（`SignalResponse_ConnectionQuality`，EXCELLENT/score 4.5） |
 | turn-credentials | 启用内嵌 TURN（UDP 3478）→ join 响应经 `iceServersForParticipant` 携带 TURN URL + 非空用户名/凭据（`turn:192.168.107.4:3478?transport=udp`） |
 | reconnect | 发布者只断开信令 WS（PC 存活）→ 断连宽限窗口内**同身份**重新 join → 服务端移除重复参与者（`RemoveParticipant DuplicateIdentity`）→ 新参与者重发布 → 订阅者跨节点看到媒体恢复（真实客户端全量重连落到的结局） |
+| perform-rpc | `RoomService.PerformRpc` 指向 NAT 参与者 → 跨节点 DC 数据未桥接（已记录限制）→ RPC **干净、有界**失败（`data channel is not available`，psrpc Internal，毫秒级返回，绝不挂起）——把文档化限制固化为确定性回归断言 |
+| simulcast-switch | 真实 3 层 simulcast（`lk --publish-demo` 发 3-SSRC H264）+ Go 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`，MediaGateway 修复的证明）+ DownTrack max-subscribed 层随请求 0/1/2（层选择路径）；下切可真实生效（客户端码率骤降）、上切受层锁 PLI 限制（见已知限制） |
+| reconnect-resume | `reconnect=true` resume 协商路径：断信令后同 SID resume → 服务端走 `resuming RTC session`（`ResumeParticipant`）→ 客户端观察到**干净 resume**（`SignalResponse_Reconnect`，媒体继续）或干净拒绝（`SignalResponse_Leave` RECONNECT → 全量重连回退），媒体必恢复、绝不挂起 |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
 
@@ -133,11 +136,15 @@ cd test/nat-e2e
 
 ```
 === lk 套件（生产加固后二进制） ===
-SUMMARY: 37 passed, 0 failed
+SUMMARY: 38 passed, 2 failed
+  (2 failed 为 S12 更大并发的首attempt 建立竞态——S11 边缘重启后紧跟并发建立偶发失败，
+   内置重试已在 fresh room（s12r）通过：9 up receivers + 15 down tracks；汇总计数保留
+   重试前的 fail，为既有脚本口径。S8 并发 54 up receivers 亦证明 simulcast 3 层修复在
+   并发下生效)
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 35 passed, 0 failed
+GO-CLIENT SUMMARY: 38 passed, 0 failed
   (receive-before-publish / NACK / data / attributes / metadata / mute /
    multitrack / single-pc / whip / manual-subscribe / participant-name /
    room-admin / track-pause / room-lifecycle / service-apis /
@@ -146,7 +153,7 @@ GO-CLIENT SUMMARY: 35 passed, 0 failed
    room-move-forward / whip-ice-restart / health / simulate-speaker /
    simulate-node-failure / simulate-server-leave / sub-perm-revoke /
    participant-leave-visible / sync-state / connection-quality / turn-credentials /
-   reconnect)
+   reconnect / perform-rpc / simulcast-switch / reconnect-resume)
 ```
 
 覆盖的功能：
@@ -171,6 +178,13 @@ GO-CLIENT SUMMARY: 35 passed, 0 failed
   重跑）使其确定性通过。生产级改进方向：核查边缘控制 accept 的并发建立与 room 的
   `establishRemoteSession` 背压。
 - **数据通道消息**：跨节点只转发 SDP 协商（m=application）；DC 数据消息未桥接（§6.8 既定暂拆）。
+- **simulcast 层切换（上切受限）**：MediaGateway 修复后 3 层 RTP 已能全部跨节点（`available
+  layers changed` 达 `[0,1,2]`），且 **下切**（HIGH→LOW）可真实生效（客户端码率从 ~800kbps 骤降到
+  ~150kbps）、DownTrack max-subscribed 层随请求 0/1/2 正确应用。但 **下切后再上切**（LOW→MEDIUM）
+  会把 forwarder 卡进层锁 PLI 循环（`sending PLI for layer lock` 每 200ms 一发、目标层 keyframe
+  始终无法 latch、媒体冻结），疑似与跨节点 up-RTCP（PLI → publisher keyframe 往返）的层 keyframe
+  检测/latch 有关。`simulcast-switch` 场景断言确定性的服务端锚点（3 层 up plane + 层选择 0/1/2），
+  上切媒体恢复留待专项核查。
 - **WHIP ICE-restart（上游协议库 bug，已加固）**：`PATCH If-Match:*`（RFC 9725 ICE restart）在 fork 中
   会触发上游 `livekit/protocol/sdp` `PatchICECredentialAndCandidatesIntoSDP` 的
   **mutate-while-ranging panic**（`sdp.go:695`，对带 candidate 的远端描述遍历删除时切片越界），
@@ -195,6 +209,13 @@ GO-CLIENT SUMMARY: 35 passed, 0 failed
   时房主协商干净失败而非永久阻塞（原实现 `<-respCh` 无超时）。
 - **重复 attach 关闭冗余通道**（`mediagateway.go`）：同一 track 二次 attach（如重协商）时关闭
   冗余 MediaChannel，避免 TCP 连接泄漏与 pacer 背压（原实现直接 return nil 泄漏通道）。
+- **simulcast 多层跨节点桥接修复**（`mediagateway.go`）：up 方向桥按 `trackID+SSRC` 键控——
+  同一 trackID 的多个 SSRC（simulcast 层）各自建立独立 MediaChannel 桥接，只有**同 SSRC**
+  再 attach 才算重复（关闭冗余通道）。原实现按 trackID 键控，3 层 simulcast 只有首个 SSRC
+  的 RTP 能跨节点（其余被当"重复"关闭，房主 SFU 只见 1 层比特率、无法切层）；修复后
+  3 层全部跨节点（实测比特率 `[LOW≈105k, MED≈341k, HIGH≈1340k]`），新增单测
+  `TestMediaGatewaySimulcastLayersBridgedSeparately`（3 SSRC 各自独立桥接 + 同层重复仍关闭 +
+  整 track 移除）。
 - **畸形 padding 防护**（`mediachannelrtp.go`）：padding 长度字节大于 payload 时清 Padding 标志，
   令 Marshal 成功而非每包报错（原实现 `Padding=true` + `PaddingSize=0` 触发 pion
   `errInvalidRTPPadding`）。
@@ -242,12 +263,16 @@ GO-CLIENT SUMMARY: 35 passed, 0 failed
   确定性可达。`07-coverage.sh` `--report` 分支的顶层 `return 0` 改为 `exit 0`（顶层 `return`
   无效，会导致脚本在汇总时误报）。
 - **test/client SDK 扩展**（`client.go`）：新增 `SignalResponse_Leave` /
-  `SignalResponse_SpeakersChanged` / `SignalResponse_ConnectionQuality` 处理 +
-  `WaitUntilDisconnected`/`DisconnectReason`/`ActiveSpeakers`/`LastConnectionQuality`
-  访问器，支撑 simulate / speaker / 质量场景的客户端侧断言。speaker delta 是**按订阅者收窄**的
-  （`SendSpeakerUpdate(force=false)` 只发给已订阅该发言者的参与者或发言者本人），simulate-speaker
-  场景先建立订阅再触发模拟。媒体 track 的"取消发布"需重协商移除 transceiver（`writer.Stop()`
-  只停发送、服务端不因此取消发布），dual-PC NAT 下驱动不可靠，故无独立 track-unpublish 场景
+  `SignalResponse_SpeakersChanged` / `SignalResponse_ConnectionQuality` /
+  `SignalResponse_Reconnect` 处理 + `WaitUntilDisconnected`/`Disconnected`/`DisconnectReason`/
+  `ActiveSpeakers`/`LastConnectionQuality`/`ResumeAccepted` 访问器，以及 resume 支持：
+  `Options.Reconnect`/`Options.ReconnectSID`（WS URL 带 `reconnect=true&sid=`）与
+  `RTCClient.Resume(host, token, opts)`（重连信令 WS、复用既有 PC，真实客户端 resume 行为），
+  支撑 simulate / speaker / 质量 / reconnect-resume 场景的客户端侧断言。speaker delta 是
+  **按订阅者收窄**的（`SendSpeakerUpdate(force=false)` 只发给已订阅该发言者的参与者或发言者
+  本人），simulate-speaker 场景先建立订阅再触发模拟。媒体 track 的"取消发布"需重协商移除
+  transceiver（`writer.Stop()` 只停发送、服务端不因此取消发布），dual-PC NAT 下驱动不可靠，
+  故无独立 track-unpublish 场景
   （参与者离开覆盖参与者移除广播）。
 
 ## 与上游 LiveKit K8s 部署的对比

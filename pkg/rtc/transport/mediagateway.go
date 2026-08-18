@@ -42,8 +42,8 @@ type MediaGateway struct {
 
 	mu         sync.RWMutex
 	downTracks map[livekit.TrackID]*gatewayDownTrack
-	upTracks   map[livekit.TrackID]*gatewayUpTrack
-	publishers map[uint32]rtpPacketReader // SSRC -> published TrackRemote
+	upTracks   map[livekit.TrackID]map[uint32]*gatewayUpTrack // trackID -> SSRC -> bridge (simulcast layers)
+	publishers map[uint32]rtpPacketReader                     // SSRC -> published TrackRemote
 	closed     bool
 
 	onTrackMu sync.RWMutex
@@ -67,7 +67,7 @@ func NewMediaGateway(pc *webrtc.PeerConnection) *MediaGateway {
 	g := &MediaGateway{
 		pc:         pc,
 		downTracks: make(map[livekit.TrackID]*gatewayDownTrack),
-		upTracks:   make(map[livekit.TrackID]*gatewayUpTrack),
+		upTracks:   make(map[livekit.TrackID]map[uint32]*gatewayUpTrack),
 		publishers: make(map[uint32]rtpPacketReader),
 	}
 	// Register the publisher track when the pion PC receives it. The gateway
@@ -149,29 +149,35 @@ func (g *MediaGateway) AddSubscriberTrack(trackID livekit.TrackID, codec webrtc.
 
 // AddPublisherTrack registers a publisher (up) track: it starts pumping RTP from
 // the rtpPacketReader (typically a pion TrackRemote received via OnTrack) into
-// the MediaChannel bound for the room node.
-func (g *MediaGateway) AddPublisherTrack(trackID livekit.TrackID, remote rtpPacketReader, ch MediaChannel) error {
+// the MediaChannel bound for the room node. The bridge is keyed by trackID+SSRC:
+// a simulcast track publishes one TrackRemote per layer, all sharing the trackID,
+// so each SSRC gets its own bridge and its own MediaChannel; only a re-attach of
+// the SAME SSRC is treated as a duplicate (redundant channel closed).
+func (g *MediaGateway) AddPublisherTrack(trackID livekit.TrackID, ssrc uint32, remote rtpPacketReader, ch MediaChannel) error {
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
 		return ErrMediaChannelClosed
 	}
-	if _, exists := g.upTracks[trackID]; exists {
+	layers := g.upTracks[trackID]
+	if layers == nil {
+		layers = make(map[uint32]*gatewayUpTrack)
+		g.upTracks[trackID] = layers
+	}
+	if _, exists := layers[ssrc]; exists {
 		g.mu.Unlock()
-		// Duplicate attach: the first channel owns the bridge; close the redundant
-		// channel (see AddSubscriberTrack).
+		// Duplicate attach of the SAME layer (e.g. renegotiation): the first
+		// channel owns the bridge; close the redundant channel so the room side's
+		// pump unblocks and the TCP connection is not leaked. Distinct SSRCs are
+		// simulcast layers sharing this trackID and must be bridged separately.
 		_ = ch.Close()
 		return nil
 	}
-	g.upTracks[trackID] = &gatewayUpTrack{remote: remote, ch: ch}
+	layers[ssrc] = &gatewayUpTrack{remote: remote, ch: ch}
 	g.mu.Unlock()
 
 	go pumpTrackToMediaChannel(remote, ch)
 	go pumpMediaChannelRTCPToPC(ch, g.pc)
-	ssrc := uint32(0)
-	if tr, ok := remote.(*webrtc.TrackRemote); ok {
-		ssrc = uint32(tr.SSRC())
-	}
 	logger.Debugw("nat gateway publisher track attached", "trackID", trackID, "ssrc", ssrc, "sessionID", g.sessionID)
 	return nil
 }
@@ -211,7 +217,7 @@ func (g *MediaGateway) Attach(hello MediaHello, ch MediaChannel, reader rtpPacke
 		if reader == nil {
 			return errors.New("publisher track requires an rtpPacketReader")
 		}
-		return g.AddPublisherTrack(trackID, reader, ch)
+		return g.AddPublisherTrack(trackID, hello.SSRC, reader, ch)
 	default:
 		return fmt.Errorf("unknown media direction %q", hello.Direction)
 	}
@@ -229,10 +235,10 @@ func (g *MediaGateway) removeDownTrack(trackID livekit.TrackID) {
 
 func (g *MediaGateway) removeUpTrack(trackID livekit.TrackID) {
 	g.mu.Lock()
-	ut := g.upTracks[trackID]
+	layers := g.upTracks[trackID]
 	delete(g.upTracks, trackID)
 	g.mu.Unlock()
-	if ut != nil {
+	for _, ut := range layers {
 		_ = ut.ch.Close()
 	}
 }
@@ -249,14 +255,16 @@ func (g *MediaGateway) Close() {
 	down := g.downTracks
 	up := g.upTracks
 	g.downTracks = make(map[livekit.TrackID]*gatewayDownTrack)
-	g.upTracks = make(map[livekit.TrackID]*gatewayUpTrack)
+	g.upTracks = make(map[livekit.TrackID]map[uint32]*gatewayUpTrack)
 	g.publishers = make(map[uint32]rtpPacketReader)
 	g.mu.Unlock()
 
 	for _, dt := range down {
 		_ = dt.ch.Close()
 	}
-	for _, ut := range up {
-		_ = ut.ch.Close()
+	for _, layers := range up {
+		for _, ut := range layers {
+			_ = ut.ch.Close()
+		}
 	}
 }

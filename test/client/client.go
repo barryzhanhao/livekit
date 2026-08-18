@@ -114,10 +114,11 @@ type RTCClient struct {
 	// server-driven disconnect (SignalResponse_Leave or WS close) + last speaker
 	// snapshot + last connection-quality snapshot, used by the simulate/speaker
 	// and connection-quality E2E scenarios
-	disconnectReason    atomic.Int32
-	disconnected        atomic.Bool
-	activeSpeakers      atomic.Pointer[[]*livekit.SpeakerInfo]
-	connectionQuality   atomic.Pointer[[]*livekit.ConnectionQualityInfo]
+	disconnectReason  atomic.Int32
+	disconnected      atomic.Bool
+	activeSpeakers    atomic.Pointer[[]*livekit.SpeakerInfo]
+	connectionQuality atomic.Pointer[[]*livekit.ConnectionQualityInfo]
+	resumeAccepted    atomic.Bool
 
 	// iceServers from the Join response (TURN credentials), exposed for the
 	// turn-credentials E2E scenario
@@ -153,6 +154,11 @@ type Options struct {
 	UseJoinRequestQueryParam  bool
 	RTCServicePath            string
 	ForceRelay                bool
+	// Reconnect signals a resume attempt: the WS URL carries reconnect=true plus
+	// the prior SID so the server swaps the signal sink onto the existing
+	// participant (ResumeParticipant) instead of creating a duplicate.
+	Reconnect    bool
+	ReconnectSID string
 }
 
 func NewWebSocketConn(host, token string, opts *Options) (*websocket.Conn, error) {
@@ -227,6 +233,10 @@ func NewWebSocketConn(host, token string, opts *Options) (*websocket.Conn, error
 			}
 		}
 		connectUrl += encodeQueryParam("sdk", sdk)
+
+		if opts != nil && opts.Reconnect {
+			connectUrl += fmt.Sprintf("&reconnect=true&sid=%s", opts.ReconnectSID)
+		}
 	}
 
 	logger.Infow("connecting to", "url", parsedURL.String())
@@ -718,6 +728,16 @@ func (c *RTCClient) handleSignalResponse(res *livekit.SignalResponse) error {
 		c.disconnectReason.Store(int32(msg.Leave.Reason))
 		c.disconnected.Store(true)
 
+	// signal-resume accepted: the server swapped this WS onto the existing
+	// participant (ResumeParticipant). The existing peer connections stay up; the
+	// server follows with an ICE-restart offer on the subscriber transport. The
+	// reconnect-resume scenario uses ResumeAccepted() to distinguish a clean
+	// resume from a Leave-driven full-reconnect fallback.
+	case *livekit.SignalResponse_Reconnect:
+		logger.Infow("server accepted resume (ReconnectResponse)",
+			"participant", c.localParticipant.Identity)
+		c.resumeAccepted.Store(true)
+
 	case *livekit.SignalResponse_SpeakersChanged:
 		speakers := make([]*livekit.SpeakerInfo, 0, len(msg.SpeakersChanged.Speakers))
 		speakers = append(speakers, msg.SpeakersChanged.Speakers...)
@@ -747,10 +767,25 @@ func (c *RTCClient) WaitUntilDisconnected(timeout time.Duration) error {
 	return fmt.Errorf("client still connected after %v", timeout)
 }
 
+// Disconnected reports whether the server has closed this client's signal
+// connection (SignalResponse_Leave or WS close). Non-blocking; the reconnect-resume
+// scenario polls it while waiting for the resume outcome.
+func (c *RTCClient) Disconnected() bool {
+	return c.disconnected.Load()
+}
+
 // DisconnectReason returns the server-provided DisconnectReason for a server
 // initiated leave, or -1 if the client was never disconnected by the server.
 func (c *RTCClient) DisconnectReason() livekit.DisconnectReason {
 	return livekit.DisconnectReason(c.disconnectReason.Load())
+}
+
+// ResumeAccepted reports whether the server accepted a signal-resume attempt
+// (SignalResponse_Reconnect, i.e. the participant was resumed in place rather
+// than being replaced). Used by the reconnect-resume scenario to distinguish a
+// clean resume from a Leave-driven full-reconnect fallback.
+func (c *RTCClient) ResumeAccepted() bool {
+	return c.resumeAccepted.Load()
 }
 
 // ActiveSpeakers returns the last active-speaker snapshot broadcast by the server
@@ -901,6 +936,34 @@ func (c *RTCClient) Stop() {
 func (c *RTCClient) DropSignal() {
 	c.conn.SetCloseHandler(nil) // don't let a close frame cascade into Stop()
 	_ = c.conn.Close()
+}
+
+// Resume re-establishes the signal WebSocket as a resume attempt
+// (reconnect=true + prior SID) while reusing the existing peer connections — the
+// real-client behavior after signal loss. The server either accepts the resume
+// (SignalResponse_Reconnect → ResumeAccepted() becomes true) or fails it
+// (SignalResponse_Leave with RECONNECT action → Disconnected() becomes true);
+// callers fall back to a full reconnect in the latter case. host/token must
+// identify the same participant; opts must carry Reconnect=true + ReconnectSID.
+func (c *RTCClient) Resume(host, token string, opts *Options) error {
+	conn, err := NewWebSocketConn(host, token, opts)
+	if err != nil {
+		return err
+	}
+	old := c.conn
+	old.SetCloseHandler(nil) // the drop path already did this; keep it idempotent
+	c.conn = conn
+	_ = old.Close()
+
+	go func() {
+		if err := c.Run(); err != nil {
+			logger.Infow("resume signal loop ended",
+				"participant", c.localParticipant.Identity,
+				"error", err,
+			)
+		}
+	}()
+	return nil
 }
 
 func (c *RTCClient) RefreshToken() string {
