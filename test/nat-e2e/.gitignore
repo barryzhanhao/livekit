@@ -1,3 +1,6 @@
 # stray artifacts (redirect residues from ad-hoc debugging)
 /room
 *.log
+
+# E2E coverage tool artifacts (instrumented binary + collected profiles)
+/coverage-results/

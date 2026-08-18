@@ -22,7 +22,9 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
 	"runtime"
+	"runtime/coverage"
 	"runtime/pprof"
 	"strconv"
 	"time"
@@ -143,6 +145,11 @@ func NewLivekitServer(conf *config.Config,
 		mux = http.DefaultServeMux
 		mux.HandleFunc("/debug/goroutine", s.debugGoroutines)
 		mux.HandleFunc("/debug/rooms", s.debugInfo)
+	}
+	if os.Getenv("GOCOVERDIR") != "" {
+		// E2E coverage: flush the in-process counters to GOCOVERDIR on demand so a
+		// long-running server's coverage can be collected without a clean exit.
+		mux.HandleFunc("/debug/coverage", s.debugCoverage)
 	}
 
 	xtwirp.RegisterServer(mux, roomServer)
@@ -368,6 +375,22 @@ func (s *LivekitServer) MediaRelay() *MediaRelay {
 
 func (s *LivekitServer) debugGoroutines(w http.ResponseWriter, _ *http.Request) {
 	_ = pprof.Lookup("goroutine").WriteTo(w, 2)
+}
+
+// debugCoverage flushes the instrumented process's coverage counters to
+// GOCOVERDIR. It only exists when the binary was built with `-cover` (the E2E
+// coverage tool) and GOCOVERDIR is set; a non-instrumented build returns 404.
+func (s *LivekitServer) debugCoverage(w http.ResponseWriter, _ *http.Request) {
+	dir := os.Getenv("GOCOVERDIR")
+	if dir == "" {
+		http.Error(w, "GOCOVERDIR not set", http.StatusBadRequest)
+		return
+	}
+	if err := coverage.WriteCountersDir(dir); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write([]byte("coverage written to " + dir))
 }
 
 func (s *LivekitServer) debugInfo(w http.ResponseWriter, _ *http.Request) {

@@ -69,6 +69,7 @@ spec:
             - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
             - {name: LIVEKIT_REGION, value: "$role"}
             - {name: LIVEKIT_NODE_ID, value: "node-$name"}
+            ${NAT_COVERAGE_GOCOVERDIR:-}
           ports:
             - {containerPort: 7880, protocol: TCP}
             - {containerPort: 7881, protocol: TCP}
@@ -77,6 +78,7 @@ spec:
             - {containerPort: 7884, protocol: TCP}
           volumeMounts:
             - {name: config, mountPath: /etc/livekit}
+            ${NAT_COVERAGE_VOLUME_MOUNT:-}
           resources:
             limits: {cpu: "2", memory: 1Gi}
       volumes:
@@ -85,6 +87,7 @@ spec:
             name: nat-config-$name
             items:
               - {key: config.yaml, path: config.yaml}
+${NAT_COVERAGE_VOLUME:-}
 EOF
 }
 

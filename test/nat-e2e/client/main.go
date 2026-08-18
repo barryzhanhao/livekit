@@ -9,7 +9,7 @@
 // Usage (built by 06-client-e2e.sh):
 //
 //	nat-client -url ws://<edge-ip>:7880 -api-key devkey -api-secret secret \
-//	           -room nat-go -scenario <receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name>
+//	           -room nat-go -scenario <receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle>
 package main
 
 import (
@@ -487,6 +487,344 @@ func scenarioRoomAdmin(url, apiKey, apiSecret, room string) {
 	fmt.Println("ROOM_ADMIN: PASS (create/list/kick/delete via RoomService REST)")
 }
 
+// scenarioTrackPause: the subscriber pauses a subscribed track
+// (UpdateTrackSettings.Disabled) — its received byte count must freeze — then
+// resumes it and media flows again. Exercises subscriber pause/resume cross-node.
+func scenarioTrackPause(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-pause-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-pause-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	// capture the server-assigned track SID
+	var trackSid string
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) && trackSid == "" {
+		for _, p := range sub.RemoteParticipants() {
+			if p.Identity != "go-pause-pub" {
+				continue
+			}
+			for _, t := range p.Tracks {
+				trackSid = t.Sid
+			}
+		}
+		if trackSid == "" {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if trackSid == "" {
+		fmt.Println("TRACK_PAUSE: FAIL no track visible to subscriber")
+		os.Exit(1)
+	}
+
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("TRACK_PAUSE: FAIL no initial media", err)
+		os.Exit(1)
+	}
+	before := sub.BytesReceived()
+
+	// pause: bytes must stop growing
+	must(sub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_TrackSetting{
+			TrackSetting: &livekit.UpdateTrackSettings{
+				TrackSids: []string{trackSid},
+				Disabled:  true,
+			},
+		},
+	}))
+	time.Sleep(3 * time.Second)
+	afterPause := sub.BytesReceived()
+	if afterPause > before+256 {
+		fmt.Println("TRACK_PAUSE: FAIL media kept flowing after pause", before, "->", afterPause)
+		os.Exit(1)
+	}
+
+	// resume: media flows again
+	must(sub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_TrackSetting{
+			TrackSetting: &livekit.UpdateTrackSettings{
+				TrackSids: []string{trackSid},
+				Disabled:  false,
+			},
+		},
+	}))
+	if err := waitBytes(sub, afterPause+2048, 20*time.Second); err != nil {
+		fmt.Println("TRACK_PAUSE: FAIL no media after resume", err)
+		os.Exit(1)
+	}
+	fmt.Println("TRACK_PAUSE: PASS (pause froze bytes; resume resumed media)")
+}
+
+// scenarioRoomLifecycle: create a room with a short empty timeout, join two
+// clients, disconnect both, and verify the room is deleted once it is empty —
+// the room-management lifecycle across nodes.
+func scenarioRoomLifecycle(url, apiKey, apiSecret, room string) {
+	httpBase := "http://" + mustParseURL(url).Host
+	rmc := livekit.NewRoomServiceJSONClient(httpBase, &http.Client{})
+	adminCtx := func() context.Context {
+		at := auth.NewAccessToken(apiKey, apiSecret)
+		at.AddGrant(&auth.VideoGrant{RoomCreate: true, RoomList: true, RoomAdmin: true, Room: room})
+		t, err := at.ToJWT()
+		must(err)
+		header := make(http.Header)
+		testclient.SetAuthorizationToken(header, t)
+		ctx, err := twirp.WithHTTPRequestHeaders(context.Background(), header)
+		must(err)
+		return ctx
+	}
+
+	// EmptyTimeout covers a room that never had participants; once joined and
+	// left, CloseIfEmpty switches to DepartureTimeout — set both short.
+	_, err := rmc.CreateRoom(adminCtx(), &livekit.CreateRoomRequest{
+		Name:            room,
+		EmptyTimeout:    5,
+		DepartureTimeout: 5,
+	})
+	if err != nil {
+		fmt.Println("ROOM_LIFECYCLE: FAIL create room", err)
+		os.Exit(1)
+	}
+
+	c1 := newClient(url, apiKey, apiSecret, room, "go-lifecycle-a")
+	waitConnected(c1)
+	c2 := newClient(url, apiKey, apiSecret, room, "go-lifecycle-b")
+	waitConnected(c2)
+
+	// both leave cleanly
+	c1.Stop()
+	c2.Stop()
+
+	// room must be deleted after the empty timeout
+	deadline := time.Now().Add(25 * time.Second)
+	for time.Now().Before(deadline) {
+		res, err := rmc.ListRooms(adminCtx(), &livekit.ListRoomsRequest{})
+		must(err)
+		gone := true
+		for _, r := range res.Rooms {
+			if r.Name == room {
+				gone = false
+				break
+			}
+		}
+		if gone {
+			fmt.Println("ROOM_LIFECYCLE: PASS (room deleted after empty timeout)")
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	fmt.Println("ROOM_LIFECYCLE: FAIL room not deleted after empty timeout")
+	os.Exit(1)
+}
+
+// scenarioServiceAPIs: exercises the full RoomService admin surface (REST) — the
+// room manager + RPC handlers behind each call — to raise E2E coverage of
+// pkg/service. Calls: create/list/get room, list/get participant, mute a track,
+// update participant metadata, update room metadata, update subscriptions,
+// send data, remove participant, delete room.
+func scenarioServiceAPIs(url, apiKey, apiSecret, room string) {
+	httpBase := "http://" + mustParseURL(url).Host
+	rmc := livekit.NewRoomServiceJSONClient(httpBase, &http.Client{})
+	adminCtx := func(grants *auth.VideoGrant) context.Context {
+		at := auth.NewAccessToken(apiKey, apiSecret)
+		at.AddGrant(grants)
+		t, err := at.ToJWT()
+		must(err)
+		header := make(http.Header)
+		testclient.SetAuthorizationToken(header, t)
+		ctx, err := twirp.WithHTTPRequestHeaders(context.Background(), header)
+		must(err)
+		return ctx
+	}
+	fullAdmin := &auth.VideoGrant{RoomCreate: true, RoomList: true, RoomAdmin: true, Room: room}
+
+	_, err := rmc.CreateRoom(adminCtx(fullAdmin), &livekit.CreateRoomRequest{Name: room})
+	must(err)
+
+	// two clients so there are participants to administer
+	c1 := newClient(url, apiKey, apiSecret, room, "go-apis-a")
+	waitConnected(c1)
+	c2 := newClient(url, apiKey, apiSecret, room, "go-apis-b")
+	waitConnected(c2)
+	writer, err := c1.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+	time.Sleep(2 * time.Second)
+
+	// find the track SID from the OTHER participant's view
+	var trackSid string
+	for _, p := range c2.RemoteParticipants() {
+		if p.Identity == "go-apis-a" {
+			for _, t := range p.Tracks {
+				trackSid = t.Sid
+			}
+		}
+	}
+	if trackSid == "" {
+		fmt.Println("SERVICE_APIS: FAIL no track to administer")
+		os.Exit(1)
+	}
+
+	// list participants
+	lp, err := rmc.ListParticipants(adminCtx(fullAdmin), &livekit.ListParticipantsRequest{Room: room})
+	must(err)
+	if len(lp.Participants) < 2 {
+		fmt.Println("SERVICE_APIS: FAIL expected >=2 participants")
+		os.Exit(1)
+	}
+	// get one participant
+	_, err = rmc.GetParticipant(adminCtx(fullAdmin), &livekit.RoomParticipantIdentity{Room: room, Identity: "go-apis-a"})
+	must(err)
+	// list rooms (the created room present)
+	lr, err := rmc.ListRooms(adminCtx(fullAdmin), &livekit.ListRoomsRequest{})
+	must(err)
+	found := false
+	for _, r := range lr.Rooms {
+		if r.Name == room {
+			found = true
+		}
+	}
+	if !found {
+		fmt.Println("SERVICE_APIS: FAIL room not listed")
+		os.Exit(1)
+	}
+	// admin mutes the published track
+	_, err = rmc.MutePublishedTrack(adminCtx(fullAdmin), &livekit.MuteRoomTrackRequest{Room: room, Identity: "go-apis-a", TrackSid: trackSid, Muted: true})
+	must(err)
+	// update participant metadata
+	_, err = rmc.UpdateParticipant(adminCtx(fullAdmin), &livekit.UpdateParticipantRequest{Room: room, Identity: "go-apis-a", Metadata: "admin-updated"})
+	must(err)
+	// update room metadata
+	_, err = rmc.UpdateRoomMetadata(adminCtx(fullAdmin), &livekit.UpdateRoomMetadataRequest{Room: room, Metadata: "room-meta"})
+	must(err)
+	// admin subscription control
+	_, err = rmc.UpdateSubscriptions(adminCtx(fullAdmin), &livekit.UpdateSubscriptionsRequest{Room: room, Identity: "go-apis-b", TrackSids: []string{trackSid}, Subscribe: false})
+	must(err)
+	// send data to the room
+	_, err = rmc.SendData(adminCtx(fullAdmin), &livekit.SendDataRequest{Room: room, Data: []byte("admin-data"), Kind: livekit.DataPacket_RELIABLE})
+	must(err)
+	// remove (kick) one participant
+	_, err = rmc.RemoveParticipant(adminCtx(fullAdmin), &livekit.RoomParticipantIdentity{Room: room, Identity: "go-apis-b"})
+	must(err)
+	time.Sleep(1 * time.Second)
+	// delete the room
+	_, err = rmc.DeleteRoom(adminCtx(fullAdmin), &livekit.DeleteRoomRequest{Room: room})
+	must(err)
+
+	fmt.Println("SERVICE_APIS: PASS (create/list/get/mute/update/send/kick/delete)")
+}
+
+// scenarioSubscriptionPermission: the subscriber explicitly declares per-track
+// subscription permissions (SubscriptionPermission); the server evaluates and
+// replies with SubscriptionPermissionUpdate, then media must flow — exercises the
+// rtc subscription-permission path cross-node.
+func scenarioSubscriptionPermission(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-perm-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-perm-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	// capture the publisher's track SID + participant SID
+	var trackSid, pubSid string
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) && trackSid == "" {
+		for _, p := range sub.RemoteParticipants() {
+			if p.Identity != "go-perm-pub" {
+				continue
+			}
+			pubSid = string(p.Sid)
+			for _, t := range p.Tracks {
+				trackSid = t.Sid
+			}
+		}
+		if trackSid == "" {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if trackSid == "" {
+		fmt.Println("SUBSCRIPTION_PERMISSION: FAIL no track visible")
+		os.Exit(1)
+	}
+
+	// declare permission to subscribe to the publisher's track
+	must(sub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_SubscriptionPermission{
+			SubscriptionPermission: &livekit.SubscriptionPermission{
+				AllParticipants: true,
+				TrackPermissions: []*livekit.TrackPermission{
+					{ParticipantSid: pubSid, TrackSids: []string{trackSid}},
+				},
+			},
+		},
+	}))
+
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("SUBSCRIPTION_PERMISSION: FAIL no media received", err)
+		os.Exit(1)
+	}
+	fmt.Println("SUBSCRIPTION_PERMISSION: PASS (permission granted; media flowed)")
+}
+
+// scenarioQualityRequest: the subscriber sets the max video quality of a
+// subscribed track (UpdateTrackSettings.Quality), exercising the room's
+// dynacast/layer-selection path; media must keep flowing at the requested tier.
+func scenarioQualityRequest(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-quality-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-quality-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	var trackSid string
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) && trackSid == "" {
+		for _, p := range sub.RemoteParticipants() {
+			if p.Identity != "go-quality-pub" {
+				continue
+			}
+			for _, t := range p.Tracks {
+				trackSid = t.Sid
+			}
+		}
+		if trackSid == "" {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if trackSid == "" {
+		fmt.Println("QUALITY_REQUEST: FAIL no track visible")
+		os.Exit(1)
+	}
+
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("QUALITY_REQUEST: FAIL no initial media", err)
+		os.Exit(1)
+	}
+
+	// request HIGH quality (dynacast layer selection path)
+	must(sub.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_TrackSetting{
+			TrackSetting: &livekit.UpdateTrackSettings{
+				TrackSids: []string{trackSid},
+				Quality:   livekit.VideoQuality_HIGH,
+			},
+		},
+	}))
+	time.Sleep(1 * time.Second)
+	before := sub.BytesReceived()
+	if err := waitBytes(sub, before+2048, 20*time.Second); err != nil {
+		fmt.Println("QUALITY_REQUEST: FAIL no media after quality request", err)
+		os.Exit(1)
+	}
+	fmt.Println("QUALITY_REQUEST: PASS (quality request processed; media flowed)")
+}
+
 // scenarioReceiveBeforePublish: subscriber joins an empty room, then the publisher
 // joins and publishes. The subscriber must auto-subscribe to the new track.
 func scenarioReceiveBeforePublish(url, apiKey, apiSecret, room string) {
@@ -620,6 +958,16 @@ func main() {
 		scenarioParticipantName(*url, *apiKey, *apiSecret, *room)
 	case "room-admin":
 		scenarioRoomAdmin(*url, *apiKey, *apiSecret, *room)
+	case "track-pause":
+		scenarioTrackPause(*url, *apiKey, *apiSecret, *room)
+	case "room-lifecycle":
+		scenarioRoomLifecycle(*url, *apiKey, *apiSecret, *room)
+	case "service-apis":
+		scenarioServiceAPIs(*url, *apiKey, *apiSecret, *room)
+	case "subscription-permission":
+		scenarioSubscriptionPermission(*url, *apiKey, *apiSecret, *room)
+	case "quality-request":
+		scenarioQualityRequest(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

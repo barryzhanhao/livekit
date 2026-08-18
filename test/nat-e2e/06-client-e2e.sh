@@ -126,6 +126,23 @@ if run_scenario participant-name yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1
 # room-admin: REST RoomService create/list/kick/delete cross-node
 if run_scenario room-admin yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
+# track-pause: subscriber pauses (UpdateTrackSettings.Disabled) then resumes a track
+if run_scenario track-pause yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# room-lifecycle: room deleted after participants leave (short empty/departure
+# timeout). Needs a FRESH room (the shared ROOM_GO has lingering participants).
+ROOM_LC="${ROOM_GO}-lifecycle"
+if run_scenario room-lifecycle yes "$ROOM_LC"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# service-apis: full RoomService admin surface (mute/update/send/kick/etc.)
+if run_scenario service-apis yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# subscription-permission: explicit per-track subscription permission declaration
+if run_scenario subscription-permission yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# quality-request: subscriber requests max video quality (dynacast layer selection)
+if run_scenario quality-request yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
 # whip: one-shot signalling (RFC 9725) ingest over /whip/v1. Client asserts media
 # flows to a WS subscriber; the room logs must show UseOneShotSignallingMode
 # ("oneShot": true) and the WHIP publisher's up-plane registered.

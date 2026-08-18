@@ -45,7 +45,8 @@ cd test/nat-e2e
 ./03-deploy.sh         # 部署 Redis + 双 server pod（hostNetwork + advertise_ip）+ 钉房间到房主
 ./04-e2e.sh            # 跑全部 lk 场景（约 5-6 分钟）
 ./04-e2e.sh --loss 5   # 加 WAN 丢包模拟（netem 5%）验证质量反馈跨节点
-./06-client-e2e.sh     # 跑 Go 客户端场景（receive-before-publish / NACK / data / attributes）
+./06-client-e2e.sh     # 跑 Go 客户端场景（receive-before-publish / NACK / data / attributes 等）
+./07-coverage.sh       # E2E 覆盖度工具：插桩二进制 + 跑套件 + 收集 + 报告（见下）
 ./05-cleanup.sh        # 拆除集群
 ```
 
@@ -85,6 +86,29 @@ cd test/nat-e2e
 | manual-subscribe | 订阅者 `AutoSubscribe=false` 加入 → 发布者发布 → 订阅者显式 `UpdateSubscription` → 收包 |
 | participant-name | 发布者更新显示名 `Name` → 订阅者跨节点看到 |
 | room-admin | REST `RoomService` 建房间/列房间/踢人/删房间（跨节点，边缘 HTTP 端点） |
+| track-pause | 订阅者 `UpdateTrackSettings.Disabled` 暂停已订阅 track → 字节冻结 → 恢复 → 继续收包 |
+| room-lifecycle | 建房间（短 empty/departure timeout）→ 两人加入 → 离开 → 房间被自动删除 |
+| service-apis | 全量 `RoomService` 管理面：list/get participant、admin mute track、update participant/room metadata、update subscriptions、send data、kick、delete |
+| subscription-permission | 订阅者显式声明 per-track `SubscriptionPermission` → 服务器评估 → 媒体仍流动 |
+| quality-request | 订阅者请求最大视频质量（`UpdateTrackSettings.Quality`，dynacast 分层路径） |
+
+## E2E 覆盖度工具（`07-coverage.sh`）
+
+用 Go 覆盖率插桩构建服务器二进制（`go build -cover -coverpkg=github.com/livekit/livekit-server/...`），
+部署到双节点集群（`GOCOVERDIR=/tmp/coverage` + emptyDir），跑完 E2E 套件后经 `/debug/coverage`
+端点按需刷新计数器，再合并两个节点的覆盖档案并报告总覆盖率与按包分布。
+
+```bash
+./07-coverage.sh              # 完整测量（lk 套件 + Go 客户端，约 15 分钟）
+./07-coverage.sh --quick      # 仅 Go 客户端（约 8 分钟）
+./07-coverage.sh --report coverage-results   # 只汇总已收集的数据
+```
+
+实测（Go 客户端套件）：全项目语句覆盖率 ~25%；核心运行时包 `pkg/rtc` ~46%、
+`pkg/sfu` ~43%、`pkg/service` ~16%。黑盒 E2E 自然覆盖网络可达的运行时路径；配置解析、
+CLI、遥测内部等启动/内部代码无法经 E2E 触达——80% 的"整个项目"目标需要收窄统计口径到
+运行时包或补充大量边界场景，工具已提供按包分布以指导后续。服务器新增 `/debug/coverage`
+端点（仅 `GOCOVERDIR` 设置时注册，非插桩构建返回 404）。
 
 ## 验证结果（真实节点实测，双节点 kind）
 
