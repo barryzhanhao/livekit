@@ -99,6 +99,7 @@ cd test/nat-e2e
 | subscriber-only | `CanPublish=false`（录制风格）参与者只收不发，收到普通发布者媒体 |
 | room-move-forward | `MoveParticipant`/`ForwardParticipant`：同房被拒（invalid_argument）、跨房路由到 RoomManager stub（not implemented） |
 | whip-ice-restart | WHIP 生命周期：POST+媒体 → PATCH(ICE restart) 被干净拒绝（见下方已知限制）→ DELETE 拆会话；节点不崩溃 |
+| health | 双节点 HTTP `/`（defaultHandler → healthCheck + 节点心跳新鲜度）均返回 200 OK |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
 
@@ -127,13 +128,13 @@ SUMMARY: 37 passed, 0 failed
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 25 passed, 0 failed
+GO-CLIENT SUMMARY: 26 passed, 0 failed
   (receive-before-publish / NACK / data / attributes / metadata / mute /
    multitrack / single-pc / whip / manual-subscribe / participant-name /
    room-admin / track-pause / room-lifecycle / service-apis /
    subscription-permission / quality-request / rtc-validate / update-video-track /
    update-audio-track / data-track-publish / hidden-participant / subscriber-only /
-   room-move-forward / whip-ice-restart)
+   room-move-forward / whip-ice-restart / health)
 ```
 
 覆盖的功能：

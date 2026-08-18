@@ -229,5 +229,14 @@ else
   FAIL=$((FAIL+1))
 fi
 
+# health: HTTP / on both nodes (defaultHandler → healthCheck, node-stats
+# heartbeat freshness). Client-facing edge + room node must both answer 200 OK.
+if curl -s -m 5 "http://$(edge_node_ip):7880/" | grep -q '^OK$' && curl -s -m 5 "http://$(room_node_ip):7880/" | grep -q '^OK$'; then
+  echo "  ✓ HEALTH: / returns 200 OK on edge + room nodes"
+  PASS=$((PASS+1))
+else
+  echo "  ✗ HEALTH: / health check failed on a node"; FAIL=$((FAIL+1))
+fi
+
 echo "==== GO-CLIENT SUMMARY: $PASS passed, $FAIL failed ===="
 [ "$FAIL" -eq 0 ]
