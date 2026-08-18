@@ -38,6 +38,7 @@ type MediaChannelDialer func(hello transport.MediaHello) (transport.HelloMediaCh
 // interceptor factories) and its own direction config. Both nodes run the same
 // binary and config, so those need not be serialized.
 type GatewaySetup struct {
+	RoomName                 string           `json:"room_name,omitempty"`
 	SessionID                string           `json:"session_id,omitempty"`
 	PublishCodecs            []*livekit.Codec `json:"publish_codecs"`
 	SubscribeCodecs          []*livekit.Codec `json:"subscribe_codecs"`
@@ -150,7 +151,7 @@ func RunEdgeGatewaySession(ch transport.ControlChannel, cfg *WebRTCConfig, onClo
 
 	gw := transport.NewMediaGateway(pc)
 	gw.SetSessionID(setup.SessionID)
-	logger.Debugw("nat edge gateway session starting", "sessionID", setup.SessionID, "isOfferer", setup.IsOfferer, "isSendSide", setup.IsSendSide, "oneShot", setup.UseOneShotSignallingMode)
+	logger.Debugw("nat edge gateway session starting", "room", setup.RoomName, "sessionID", setup.SessionID, "isOfferer", setup.IsOfferer, "isSendSide", setup.IsSendSide, "oneShot", setup.UseOneShotSignallingMode)
 	// Forward published tracks (publisher, up direction) to the room node as
 	// control events; the room node then establishes the up-direction MediaChannel
 	// and pumps RTP into its SFU buffer.

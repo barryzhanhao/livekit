@@ -220,7 +220,7 @@ func (r *RoomManager) nodeByID(nodeID livekit.NodeID) (*livekit.Node, error) {
 // gateway setup handshake, returning the control channel ready for the remote-PC
 // protocol plus a per-track media dialer bound to that edge node and session. The
 // caller owns the returned channel (closes it on teardown).
-func (r *RoomManager) establishRemoteSession(signalNodeID livekit.NodeID, sid livekit.ParticipantID, enabledCodecs []*livekit.Codec, isOfferer, useOneShotSignallingMode bool) (transport.ControlChannel, rtc.MediaChannelDialer, error) {
+func (r *RoomManager) establishRemoteSession(roomName livekit.RoomName, signalNodeID livekit.NodeID, sid livekit.ParticipantID, enabledCodecs []*livekit.Codec, isOfferer, useOneShotSignallingMode bool) (transport.ControlChannel, rtc.MediaChannelDialer, error) {
 	node, err := r.nodeByID(signalNodeID)
 	if err != nil {
 		return nil, nil, err
@@ -230,6 +230,7 @@ func (r *RoomManager) establishRemoteSession(signalNodeID livekit.NodeID, sid li
 		return nil, nil, err
 	}
 	setup := rtc.GatewaySetup{
+		RoomName:                   string(roomName),
 		SessionID:                string(sid),
 		PublishCodecs:            enabledCodecs,
 		SubscribeCodecs:          enabledCodecs,
@@ -554,18 +555,18 @@ func (r *RoomManager) StartSession(
 	)
 	if r.mediaRelay != nil && signalNodeID != r.currentNode.NodeID() {
 		if pi.UseSinglePeerConnection || useOneShotSignallingMode {
-			remoteControlChannel, mediaChannelDialer, err = r.establishRemoteSession(signalNodeID, sid, enabledCodecs, false, useOneShotSignallingMode)
+			remoteControlChannel, mediaChannelDialer, err = r.establishRemoteSession(room.Name(), signalNodeID, sid, enabledCodecs, false, useOneShotSignallingMode)
 			if err != nil {
 				pLogger.Errorw("failed to establish remote media session", err, "signalNodeID", signalNodeID)
 				return err
 			}
 		} else {
-			remoteControlChannel, mediaChannelDialer, err = r.establishRemoteSession(signalNodeID, sid, enabledCodecs, false, false)
+			remoteControlChannel, mediaChannelDialer, err = r.establishRemoteSession(room.Name(), signalNodeID, sid, enabledCodecs, false, false)
 			if err != nil {
 				pLogger.Errorw("failed to establish remote publisher session", err, "signalNodeID", signalNodeID)
 				return err
 			}
-			subscriberRemoteControlChannel, _, err = r.establishRemoteSession(signalNodeID, sid, enabledCodecs, true, false)
+			subscriberRemoteControlChannel, _, err = r.establishRemoteSession(room.Name(), signalNodeID, sid, enabledCodecs, true, false)
 			if err != nil {
 				_ = remoteControlChannel.Close()
 				pLogger.Errorw("failed to establish remote subscriber session", err, "signalNodeID", signalNodeID)

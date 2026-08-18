@@ -112,11 +112,12 @@ cd test/nat-e2e
 ./07-coverage.sh --report coverage-results   # 只汇总已收集的数据
 ```
 
-实测（Go 客户端套件）：全项目语句覆盖率 ~25%；核心运行时包 `pkg/rtc` ~46%、
-`pkg/sfu` ~43%、`pkg/service` ~16%。黑盒 E2E 自然覆盖网络可达的运行时路径；配置解析、
-CLI、遥测内部等启动/内部代码无法经 E2E 触达——80% 的"整个项目"目标需要收窄统计口径到
-运行时包或补充大量边界场景，工具已提供按包分布以指导后续。服务器新增 `/debug/coverage`
-端点（仅 `GOCOVERDIR` 设置时注册，非插桩构建返回 404）。
+实测（Go 客户端套件）：全项目语句覆盖率 ~27%；核心运行时包 `pkg/rtc` ~48%、
+`pkg/sfu` ~44%、`pkg/service` ~17%（`pkg/rtc/transport` 30%、`pkg/routing` 58%）。
+黑盒 E2E 自然覆盖网络可达的运行时路径；配置解析、CLI、遥测内部等启动/内部代码无法经 E2E
+触达——80% 的"整个项目"目标需要收窄统计口径到运行时包或补充大量边界场景，工具已提供按包
+分布以指导后续。服务器新增 `/debug/coverage` 端点（仅 `GOCOVERDIR` 设置时注册，非插桩构建
+返回 404）。
 
 ## 验证结果（真实节点实测，双节点 kind）
 
@@ -126,10 +127,13 @@ SUMMARY: 37 passed, 0 failed
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 12 passed, 0 failed
+GO-CLIENT SUMMARY: 25 passed, 0 failed
   (receive-before-publish / NACK / data / attributes / metadata / mute /
    multitrack / single-pc / whip / manual-subscribe / participant-name /
-   room-admin，含 single-PC 与 one-shot WHIP 单会话 NAT split)
+   room-admin / track-pause / room-lifecycle / service-apis /
+   subscription-permission / quality-request / rtc-validate / update-video-track /
+   update-audio-track / data-track-publish / hidden-participant / subscriber-only /
+   room-move-forward / whip-ice-restart)
 ```
 
 覆盖的功能：
@@ -213,6 +217,14 @@ GO-CLIENT SUMMARY: 12 passed, 0 failed
   畸形防护）、`TestMediaGatewayDuplicateSubscriberTrackClosesChannel`/
   `TestMediaGatewayDuplicatePublisherTrackClosesChannel`（重复 attach 关闭冗余通道）、
   `TestICERestartSDPFragmentPanicHardened`（WHIP ICE-restart 片段 panic 兜底，见已知限制）。
+- **断言锚点抗日志轮转**（`gateway.go`/`roommanager.go`/`06-client-e2e.sh`）：房主节点 SFU 噪声
+  （PLI/转发器/ERROR 栈）可触发 kubelet 日志轮转（10Mi），把会话建立期的日志连同
+  `"oneShot": true` / `"useSinglePC": true` 等房间侧锚点一起裁掉（实测 `whip` 场景因此偶发误报）。
+  本轮给 `GatewaySetup` 增加 `room_name` 字段并在边缘网关会话日志
+  （`nat edge gateway session starting`）中输出，`single-pc`/`whip` 断言改为按房间在**边缘日志**
+  （低噪声、不轮转）上验证"单会话/无 dual-PC offerer"与"one-shot"——边缘日志全量保留，锚点
+  确定性可达。`07-coverage.sh` `--report` 分支的顶层 `return 0` 改为 `exit 0`（顶层 `return`
+  无效，会导致脚本在汇总时误报）。
 
 ## 与上游 LiveKit K8s 部署的对比
 

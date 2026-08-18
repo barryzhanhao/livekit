@@ -55,7 +55,7 @@ if [ "${1:-}" = "--report" ]; then
     }
     END { for(p in ph) if (pt[p]>0) printf "%s\t%.1f%%\t(%d/%d)\n", p, 100*ph[p]/pt[p], ph[p], pt[p] }
   ' "$merge_dir/profile.txt" | sort -t$'\t' -k2 -n | head -15
-  return 0
+  exit 0
 fi
 
 QUICK="${1:-}"

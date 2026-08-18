@@ -95,23 +95,27 @@ else
   FAIL=$((FAIL+1))
 fi
 
-# single-pc: server MUST run single-PC NAT (one control channel + one gateway
-# session per participant). The client asserts media flows; the room logs assert
-# UseSinglePeerConnection was active and NO dual-PC marker appeared for this room.
+# single-pc: server MUST run single-PC NAT (one edge gateway session per
+# participant, no dual-PC publisher/subscriber split). The client asserts media
+# flows; the EDGE gateway log asserts exactly one session per participant (the
+# 2-client scenario → 2 sessions) with no offerer (dual-PC) marker. Asserted on
+# the edge (room-scoped, low-volume, rotation-robust) rather than the room log,
+# which kubelet rotates under SFU noise.
 ROOM_SPC="${ROOM_GO}-spc"
 seed_room_map "$ROOM_SPC"
 if run_scenario single-pc yes "$ROOM_SPC"; then
-  if wait_log room 'useSinglePC": true' 40; then
-    n="$(room_logs --since=3m | grep "$ROOM_SPC" | grep -c 'remote subscriber peer connection (dual-PC)' || true)"
-    n="${n:-0}"
-    if [ "$n" -eq 0 ]; then
-      echo "  ✓ SINGLE-PC: one session per participant (no dual-PC marker for room)"
+  if wait_log edge "nat edge gateway session starting.*$ROOM_SPC\"" 40; then
+    ns="$(edge_logs --since=3m | grep 'nat edge gateway session starting' | grep "$ROOM_SPC\"" | wc -l | tr -d ' ')"
+    no="$(edge_logs --since=3m | grep 'nat edge gateway session starting' | grep "$ROOM_SPC\"" | grep -c 'isOfferer": true' || true)"
+    no="${no:-0}"
+    if [ "$ns" -ge 1 ] && [ "$no" -eq 0 ]; then
+      echo "  ✓ SINGLE-PC: edge gateway sessions=$ns for room (no dual-PC offerer marker)"
       PASS=$((PASS+1))
     else
-      echo "  ✗ SINGLE-PC: found $n dual-PC markers, expected 0"; FAIL=$((FAIL+1))
+      echo "  ✗ SINGLE-PC: edge gateway sessions=$ns, dual-PC offerer=$no (expected >=1 and 0)"; FAIL=$((FAIL+1))
     fi
   else
-    echo "  ✗ SINGLE-PC: room logs did not show single-PC mode"; FAIL=$((FAIL+1))
+    echo "  ✗ SINGLE-PC: edge logs missing gateway session for room"; FAIL=$((FAIL+1))
   fi
 else
   FAIL=$((FAIL+1))
@@ -199,23 +203,27 @@ else
   FAIL=$((FAIL+1))
 fi
 
-# whip: one-shot signalling (RFC 9725) ingest over /whip/v1. Client asserts media
-# flows to a WS subscriber; the room logs must show UseOneShotSignallingMode
-# ("oneShot": true) and the WHIP publisher's up-plane registered.
+# whip: one-shot signalling (RFC 9725) ingest over /whip/v1. The client asserts
+# the WS subscriber received media cross-node. One-shot mode is proven by the
+# EDGE gateway session for THIS room ("oneShot": true, gateway.go) plus the WHIP
+# HTTP create path (API WHIP.Create go-whip-pub): the edge log is room-scoped,
+# low-volume, and not subject to the room's SFU-log rotation. The room name is
+# anchored to the closing quote so the whiprs room ("...-whiprs") cannot satisfy
+# this room's filter.
 ROOM_WHIP="${ROOM_GO}-whip"
 seed_room_map "$ROOM_WHIP"
 if run_scenario whip yes "$ROOM_WHIP"; then
-  if wait_log room '"oneShot": true' 40; then
-    n="$(room_logs --since=3m | grep "$ROOM_WHIP" | grep -c 'nat up track receiver registered' || true)"
-    n="${n:-0}"
-    if [ "$n" -ge 1 ]; then
-      echo "  ✓ WHIP: one-shot session + up-plane registered (up receivers=$n)"
+  if wait_log edge "nat edge gateway session starting.*$ROOM_WHIP\"" 40 && wait_log edge 'API WHIP.Create' 40; then
+    no="$(edge_logs --since=3m | grep 'nat edge gateway session starting' | grep "$ROOM_WHIP\"" | grep -c 'oneShot": true' || true)"; no="${no:-0}"
+    np="$(edge_logs --since=3m | grep 'API WHIP.Create' | grep -c 'go-whip-pub' || true)"; np="${np:-0}"
+    if [ "$no" -ge 1 ] && [ "$np" -ge 1 ]; then
+      echo "  ✓ WHIP: one-shot session (edge oneShot x$no, API WHIP.Create go-whip-pub x$np)"
       PASS=$((PASS+1))
     else
-      echo "  ✗ WHIP: one-shot session but no up-plane for the WHIP publisher"; FAIL=$((FAIL+1))
+      echo "  ✗ WHIP: one-shot session but markers incomplete (oneShot=$no create=$np)"; FAIL=$((FAIL+1))
     fi
   else
-    echo "  ✗ WHIP: room logs did not show one-shot mode"; FAIL=$((FAIL+1))
+    echo "  ✗ WHIP: edge logs missing one-shot gateway session / WHIP.Create"; FAIL=$((FAIL+1))
   fi
 else
   FAIL=$((FAIL+1))
