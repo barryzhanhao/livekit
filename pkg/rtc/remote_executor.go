@@ -71,17 +71,25 @@ func (e *remotePCExecutor) registerEvents() {
 		e.sendEvent(remotePCOpEventConnectionStateChange, body)
 		logger.Infow("nat edge peer connection state", "state", s)
 	})
-	// Data channels created on the edge pion PC carry client→room data messages;
-	// forward them over the control channel so the room node can broadcast them
-	// (NAT-mode data-channel bridging).
+	// Data channels carry client↔room data messages; forward them over the
+	// control channel so the room node can broadcast them (NAT-mode data-channel
+	// bridging). This catches client-initiated data channels; room-initiated
+	// channels (create_data_channel) are wired when they are created below.
 	e.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		label := dc.Label()
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			kind := dataChannelLabelKind(label)
-			body, _ := json.Marshal(remotePCDataMessageEvent{Kind: int32(kind), Data: msg.Data})
-			e.sendEvent(remotePCOpEventDataMessage, body)
-			logger.Debugw("nat edge forwarded data message", "label", label, "kind", kind, "bytes", len(msg.Data))
-		})
+		e.wireDataChannel(dc)
+	})
+}
+
+// wireDataChannel forwards a data channel's inbound messages to the room over the
+// control channel (event_data_message). Called for both client-initiated channels
+// (OnDataChannel) and room-initiated channels (create_data_channel).
+func (e *remotePCExecutor) wireDataChannel(dc *webrtc.DataChannel) {
+	label := dc.Label()
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		kind := dataChannelLabelKind(label)
+		body, _ := json.Marshal(remotePCDataMessageEvent{Kind: int32(kind), Data: msg.Data})
+		e.sendEvent(remotePCOpEventDataMessage, body)
+		logger.Debugw("nat edge forwarded data message", "label", label, "kind", kind, "bytes", len(msg.Data))
 	})
 }
 
@@ -200,6 +208,9 @@ func (e *remotePCExecutor) apply(msg remotePCMessage) (json.RawMessage, error) {
 		if err != nil {
 			return nil, err
 		}
+		// room-initiated data channel: it is the channel the CLIENT also uses, so
+		// wire its inbound messages to the room too (not just client-initiated DCs).
+		e.wireDataChannel(dc)
 		e.dataChMu.Lock()
 		e.dataChs[req.Label] = dc
 		e.dataChMu.Unlock()
