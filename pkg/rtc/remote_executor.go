@@ -16,7 +16,9 @@ package rtc
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 
@@ -76,6 +78,7 @@ func (e *remotePCExecutor) registerEvents() {
 	// bridging). This catches client-initiated data channels; room-initiated
 	// channels (create_data_channel) are wired when they are created below.
 	e.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		logger.Infow("nat edge got client data channel", "label", dc.Label(), "id", dc.ID())
 		e.wireDataChannel(dc)
 	})
 }
@@ -85,11 +88,40 @@ func (e *remotePCExecutor) registerEvents() {
 // (OnDataChannel) and room-initiated channels (create_data_channel).
 func (e *remotePCExecutor) wireDataChannel(dc *webrtc.DataChannel) {
 	label := dc.Label()
-	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		kind := dataChannelLabelKind(label)
-		body, _ := json.Marshal(remotePCDataMessageEvent{Kind: int32(kind), Data: msg.Data})
-		e.sendEvent(remotePCOpEventDataMessage, body)
-		logger.Debugw("nat edge forwarded data message", "label", label, "kind", kind, "bytes", len(msg.Data))
+	logger.Infow("nat edge wire data channel", "label", label, "id", dc.ID(), "ready", dc.ReadyState())
+	dc.OnClose(func() {
+		logger.Infow("nat edge data channel closed", "label", label, "id", dc.ID())
+	})
+	// The server configures every pion PC with detach enabled (transport.go sets
+	// se.DetachDataChannels()), so pion does NOT run a read loop for ANY data
+	// channel and dc.OnMessage never fires — even for channels the CLIENT created
+	// (received here via OnDataChannel). Detach the channel on open and pump its
+	// inbound messages over the control channel ourselves, the same way
+	// PCTransport reads its detached channels (transport.go).
+	dc.OnOpen(func() {
+		logger.Infow("nat edge data channel open", "label", label, "id", dc.ID())
+		raw, err := dc.DetachWithDeadline()
+		if err != nil {
+			logger.Errorw("nat edge detach data channel failed", err, "label", label)
+			return
+		}
+		defer raw.Close()
+		buffer := make([]byte, 65535)
+		for {
+			n, _, err := raw.ReadDataChannel(buffer)
+			if n > 0 {
+				kind := dataChannelLabelKind(label)
+				body, _ := json.Marshal(remotePCDataMessageEvent{Kind: int32(kind), Data: buffer[:n]})
+				e.sendEvent(remotePCOpEventDataMessage, body)
+				logger.Debugw("nat edge forwarded data message", "label", label, "kind", kind, "bytes", n)
+			}
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					logger.Debugw("nat edge data channel read closed", "label", label, "err", err.Error())
+				}
+				return
+			}
+		}
 	})
 }
 

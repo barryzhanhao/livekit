@@ -255,7 +255,9 @@ type gatewayUpTrack struct {
 - **客户端重连**：WS 可能落到不同边缘节点 → 需重建设 `MediaGateway` 或复用，
   走现有 `ResumeParticipant` 语义（transport 重建）。
 - **房主迁移**：`Migration` 现有语义下，媒体面经 `MediaChannel` 重新拨号新边缘节点。
-- **数据通道(SCTP)**：首版暂不拆，仍需房主可达；后续按需拆（网关也可持有 DC）。
+- **数据通道(SCTP)**：已跨节点打通（P0-2）：边缘 executor 在 DC open 时 `DetachWithDeadline` +
+  `ReadDataChannel` 泵入 `event_data_message`（服务端全局 `se.DetachDataChannels()` 使 pion 不跑
+  OnMessage 读循环，故不能依赖 `dc.OnMessage`）。下行经 `send_data_message` → 边缘 `SendText`。
 
 ### 6.9 分步实现（每步可独立合入、单节点零回归）
 
@@ -332,7 +334,8 @@ type gatewayUpTrack struct {
 
 - **SRTP 逐跳密钥**：边缘节点解密后是明文，房主↔边缘内网通道需自建鉴权/加密（至少 TLS 或内网隔离）。
 - **RTCP/NACK/RTX/pli/fir**：这些反馈要随 RTCP 一起跨节点，`MediaChannel` 需承载 RTCP（已含在接口）。
-- **数据通道(SCTP)**：首版暂不拆，仍需房主节点可达；后续按需拆。
+- **数据通道(SCTP)**：已打通（P0-2，见 §6.8）。已知限制：`DetachDataChannels()` 全局开启下，
+  依赖 detached 读循环；TURN relay-only 全路径（真实 NAT 网络）待真节点验证。
 - **拥塞控制状态**：stream allocator / TWCC 状态在房主节点，RTCP feedback 跨节点回流即可。
 - **时序/时钟**：跨节点明文 RTP 需保证单调发送节奏（pacer 在房主节点，发送到边缘的调度要保序）。
 
@@ -368,4 +371,5 @@ rtc:
 - **客户端无感**：ICE candidate 与 TURN URL 仍指向 `advertise_ip`，客户端无改动。
 - **网络要求**：`port`/`control_port` 必须在 pod 间可达（明文，需内网隔离或 TLS，见 §9）。
 - **限制**：首版 split 支持单 PC/one-shot 与 dual-PC 双会话、上行方向、RTCP 反馈跨节点（见进度表 3d/3e）；
-  数据通道（SCTP）仍未拆（见 §6.8）。待真节点端到端验证（进度表末行 ⏳）。
+  数据通道（SCTP）跨节点已打通（P0-2，见 §6.8）——边缘 executor 在 DC open 时 detached 读泵入
+  `event_data_message`。待真节点端到端验证（进度表末行 ⏳）。

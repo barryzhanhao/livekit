@@ -81,7 +81,7 @@ cd test/nat-e2e
 |---|---|
 | receive-before-publish | 订阅者先入空房间，发布者后加入发布 → 订阅者自动订阅并收包 |
 | **NACK 跨节点（含 RTX 重传）** | 订阅者客户端发真 RTCP NACK → 边缘 `pumpSenderRTCPToMediaChannel` → 房主 `DownTrack.ProcessRTCP`（`nacks`）→ **实际重传**（`nackAcks`，实测 nacks=15/nackAcks=1）。RTCP 下行回环修复见生产加固 |
-| data | 数据通道 P0-2 桥接代码已落地（控制协议 + 边缘 executor + 房主广播，协议单测过）；端到端 client→room 待 pion stream-ID 匹配修复（`data` 场景记录当前行为） |
+| data | 数据通道 P0-2 **跨节点打通**：客户端 `PublishData` → 边缘 executor 在 DC open 时 `DetachWithDeadline` + `ReadDataChannel` 泵入 `event_data_message` → 房主广播 → 订阅者跨节点收到（根因：服务端全局 `se.DetachDataChannels()` 使 pion 不再跑 OnMessage 读循环，`wireDataChannel` 改用 detached 读） |
 | attributes | 发布者 `SetAttributes` → 房间广播 → 订阅者跨节点看到属性更新 |
 | metadata | 发布者更新 `Metadata` → 订阅者跨节点看到（`UpdateParticipantMetadata` 信号） |
 | mute | 发布者对已发布 track 发 `MuteTrack` → 订阅者跨节点看到 `Muted=true` |
@@ -114,14 +114,14 @@ cd test/nat-e2e
 | connection-quality | A 跨节点观察到 B 的 per-participant 连接质量（`SignalResponse_ConnectionQuality`，EXCELLENT/score 4.5） |
 | turn-credentials | 启用内嵌 TURN（UDP 3478）→ join 响应经 `iceServersForParticipant` 携带 TURN URL + 非空用户名/凭据，且客户端**实际分配** relay candidate（`HasRelayCandidate`，跨节点 `ALLOCATE OK`）；relay-only 完整连接受 Docker/kind 环境限制（见已知限制） |
 | reconnect | 发布者只断开信令 WS（PC 存活）→ 断连宽限窗口内**同身份**重新 join → 服务端移除重复参与者（`RemoveParticipant DuplicateIdentity`）→ 新参与者重发布 → 订阅者跨节点看到媒体恢复（真实客户端全量重连落到的结局） |
-| perform-rpc | `RoomService.PerformRpc` 指向 NAT 参与者 → 跨节点 DC 数据未桥接（已记录限制）→ RPC **干净、有界**失败（`data channel is not available`，psrpc Internal，毫秒级返回，绝不挂起）——把文档化限制固化为确定性回归断言 |
+| perform-rpc | `RoomService.PerformRpc` 指向 NAT 参与者 → 数据通道已桥接（P0-2），RPC 请求经边缘 DC 出站；测试客户端无 RPC responder → 干净超时（`RpcError 1501 Connection timeout`）——**有界**、绝不挂起，固化为确定性回归断言 |
 | simulcast-switch | 真实 3 层 simulcast（`lk --publish-demo` 发 3-SSRC H264）+ Go 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`，MediaGateway 修复的证明）+ DownTrack max-subscribed 层随请求 0/1/2（层选择路径）；下切可真实生效（客户端码率骤降）、上切受层锁 PLI 限制（见已知限制） |
 | reconnect-resume | `reconnect=true` resume 协商路径：断信令后同 SID resume → 服务端走 `resuming RTC session`（`ResumeParticipant`）→ 客户端观察到**干净 resume**（`SignalResponse_Reconnect`，媒体继续）或干净拒绝（`SignalResponse_Leave` RECONNECT → 全量重连回退），媒体必恢复、绝不挂起 |
 | webhook-events | 服务端 webhook（HTTP 回调）路径：加入/发布/离开触发 `participant_joined`/`track_published`/`track_unpublished`/`participant_left`，POST 到集群内 receiver pod（`webhook-receiver.default.svc:8080/webhook`），receiver **验证 JWT sha256 签名**（0 rejected）后逐条记录（HMAC 签名验证端到端） |
 | subscriber-pli | 下行 RTCP 的 **PLI 路径**（keyframe 请求变体，与 NACK 互补）：订阅者发真 PLI → 房主 DownTrack 处理并请求发布者 keyframe（`sending PLI RTCP`，SSRC 重写修复的 PLI 证明——修复前边缘重写 SSRC 被 `p.MediaSSRC == d.ssrc` 丢弃） |
 | media-follows-signaling | 核心边界 IP 级证明：**媒体终止于信令节点（边缘）**——服务端 PC 跑在边缘（advertise_ip），客户端收到的远端 ICE candidate 必须携带边缘 IP（= WS hostname），绝不含房主 IP；断言 candidate 含边缘 IP + 媒体实际流动 |
 | multi-edge | **多边缘核心属性**：pub 连边缘1、sub 连边缘2（同一房间钉在房主节点）→ 媒体双向跨越边缘1↔边缘2（各经房主节点），两个边缘各出现网关会话（多边缘需要 `01-cluster.sh` 建 3 worker，无 worker3 时自动跳过） |
-| scale-stress | **多房间×多边缘并发**：2 房间 × 双边缘（A 房 pub在edge1/sub在edge2，B 房反向）共 8 会话并发，全部媒体同时流动——压房主节点双边缘处理 + 控制通道并发建立 |
+| scale-stress | **多房间×多边缘并发**：2 房间 × 双边缘（A 房 pub在edge1/sub在edge2，B 房反向）共 8 会话并发，全部媒体同时流动——压房主节点双边缘处理 + 控制通道并发建立（4 客户端并发连接偶发环境瞬断，内置一次重试，同 `run_scenario`） |
 | simulate-ice-restart | **服务端 ICE restart 核心路径**（`SimulateScenario_SwitchCandidateProtocol` → `participant.ICERestart`，与 resume 同一路径）：双向发布/订阅的双方在服务端重启后**各自收流继续**（被重启的订阅者 PC 跨节点重协商 + 未触碰的 PC 不受影响），证明跨节点 ICERestart/重协商端到端 |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
@@ -189,7 +189,7 @@ GO-CLIENT SUMMARY: 45 passed, 0 failed
   并发建立偶发失败（同为控制链路并发建立竞态），已内置**一次自动重试**（等 10s 后用新房间
   重跑）使其确定性通过。生产级改进方向：核查边缘控制 accept 的并发建立与 room 的
   `establishRemoteSession` 背压。
-- **数据通道（P0-2 桥接代码已落地，端到端待修）**：控制协议新增 `send_data_message`/`event_data_message`，边缘 executor 双向转发 + 房主 participant 接入房间广播（协议单测 `TestRemotePCDataChannelBridgingProtocol` 通过）。**端到端 client→room 方向仍被 pion 数据通道 stream-ID 匹配阻塞**：边缘上房主创建的 subscriber DC（奇数 stream ID）与客户端 offerer 创建的 publisher DC 不配对，客户端数据落入未接线的 SCTP 流——需专项核查（很可能需让 publisher PC 不创建 DC、只匹配客户端 offer 的 DC）。`data` 场景记录当前行为。
+- **数据通道（P0-2 跨节点打通）**：控制协议新增 `send_data_message`/`event_data_message`，边缘 executor 双向转发 + 房主 participant 接入房间广播（协议单测 `TestRemotePCDataChannelBridgingProtocol` + 真实 pion 集成测试 `TestRemotePCExecutorDataChannelWire` 通过）。**端到端根因与修复**：服务端在 `transport.go` 对每个 PC 全局 `se.DetachDataChannels()`，pion 对 detached DC **不启动 OnMessage 读循环**——因此边缘 `wireDataChannel` 里 `dc.OnMessage` 永远不会触发（客户端 offerer 的 DC 虽然配对、open，但数据停留在 SCTP 重排队列）。修复：`wireDataChannel` 在 DC open 时 `DetachWithDeadline` 并用 `ReadDataChannel` 泵入 `event_data_message`（与 PCTransport 自身读 detached 通道一致）。`data` 场景现断言**必须跨节点收到**。
 - **simulcast 上切受限（根因已定：发布者 per-layer keyframe 响应，非 NAT bug）**：受控复现证明
   **NAT 跨节点路径完好**——订阅者 TrackSettings 到达 `SubscribedTrack`、`GetSpatialLayerForVideoQuality`
   正确映射（LOW→0/MEDIUM→1/HIGH→2）、forwarder `SetMaxSpatialLayer` 正确变更 max（2→0→1→2）、

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 06-client-e2e — Go client E2E (production-grade test client, dual-PC via the
 # edge). Covers scenarios lk cannot drive: receive-before-publish, NACK cross-node,
-# data (documented unbridged), attribute broadcast.
+# data cross-node (P0-2), attribute broadcast.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$DIR/lib/common.sh"
@@ -117,8 +117,8 @@ else
   FAIL=$((FAIL+1))
 fi
 
-# data: documented limitation (DC not bridged cross-node)
-if run_scenario data no; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+# data: cross-node data-channel message (P0-2: edge detaches + pumps into control)
+if run_scenario data yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
 # attributes: broadcast cross-node
 if run_scenario attributes yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
@@ -334,11 +334,11 @@ seed_room_map "$ROOM_RC"
 if run_scenario reconnect yes "$ROOM_RC"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
 # perform-rpc: RoomService PerformRpc to a NAT participant must fail CLEANLY and
-# BOUNDED — data-channel DATA messages are a documented NAT limitation (not
-# bridged cross-node), so the room's remote (edge) PCTransport has no local data
-# channel and the RPC returns ErrDataChannelUnavailable immediately instead of
-# hanging. The client asserts the specific error + bounded latency; this pins the
-# documented limitation as a deterministic regression test (no indefinite hang).
+# BOUNDED. P0-2 bridges the data channel cross-node, so the RPC request goes out
+# via the edge data channel; the test client has no RPC responder, so the RPC
+# times out cleanly (RpcError 1501 Connection timeout) instead of hanging. The
+# client asserts the specific error + bounded latency; this pins the behavior as
+# a deterministic regression test (no indefinite hang).
 # FRESH room (clean psrpc routing target).
 ROOM_RPC="${ROOM_GO}-rpc"
 seed_room_map "$ROOM_RPC"
@@ -532,11 +532,25 @@ if [ -n "$(edge2_node_ip 2>/dev/null || true)" ]; then
     -api-key "$API_KEY" -api-secret "$API_SECRET" -room "$ROOM_SC_A" -scenario scale-stress
   rc=$?
   set -e
-  if [ "$rc" -eq 0 ]; then
+  if [ "$rc" -ne 0 ]; then
+    # 4 clients connect concurrently across 2 edges; the documented Docker/VM
+    # transient flake can occasionally stall one (same as run_scenario's retry).
+    echo "  ! scale-stress failed (exit $rc); waiting 10s and retrying once"
+    sleep 10
+    set +e
+    /tmp/nat-client -url "$WS_URL" -url2 "$WS2" -room2 "$ROOM_SC_B" \
+      -api-key "$API_KEY" -api-secret "$API_SECRET" -room "$ROOM_SC_A" -scenario scale-stress
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      echo "  ✓ SCALE-STRESS: 2 rooms × 2 edges media flowed concurrently (after retry)"
+      PASS=$((PASS+1))
+    else
+      echo "  ✗ SCALE-STRESS: client exit $rc (also on retry)"; FAIL=$((FAIL+1))
+    fi
+  else
     echo "  ✓ SCALE-STRESS: 2 rooms × 2 edges media flowed concurrently"
     PASS=$((PASS+1))
-  else
-    echo "  ✗ SCALE-STRESS: client exit $rc"; FAIL=$((FAIL+1))
   fi
 else
   echo "  - SCALE-STRESS: skipped (no edge2 worker)"

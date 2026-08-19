@@ -1708,23 +1708,17 @@ func scenarioNack(url, apiKey, apiSecret, room string) {
 	fmt.Println("NACK: sent 6 rounds of 5 NACKs (assert server-side via room logs)")
 }
 
-// scenarioData: publish a data-channel message. NOTE: the fork currently does not
-// bridge data-channel messages across nodes (§6.8), so the subscriber is NOT
-// expected to receive them — this scenario documents the limitation by reporting
-// whether the message arrived.
+// scenarioData: publish a data-channel message cross-node (edge → control →
+// room → broadcast → subscriber edge DC). P0-2: the edge executor detaches the
+// client's data channel on open and pumps ReadDataChannel into event_data_message
+// (pion never runs OnMessage for detached channels — the server enables
+// se.DetachDataChannels() on every PC), so the message must arrive.
 func scenarioData(url, apiKey, apiSecret, room string) {
 	sub := newClient(url, apiKey, apiSecret, room, "go-data-sub")
 	waitConnected(sub)
 	pub := newClient(url, apiKey, apiSecret, room, "go-data-pub")
 	waitConnected(pub)
 
-	// P0-2 bridging code is in place (edge DC → control → room → broadcast →
-	// subscriber edge DC), but the END-TO-END client→room leg is blocked by a pion
-	// data-channel stream-ID matching issue in the remote-PC topology: the edge's
-	// room-created subscriber DCs (odd stream IDs) do not pair with the client's
-	// offerer-created publisher DCs, so the client's data goes to an unwired SCTP
-	// stream. The transport protocol is unit-tested (TestRemotePCDataChannel
-	// BridgingProtocol); this scenario documents the current end-to-end behavior.
 	received := make(chan string, 1)
 	sub.OnDataReceived = func(data []byte, sid string) {
 		select {
@@ -1744,7 +1738,8 @@ func scenarioData(url, apiKey, apiSecret, room string) {
 		}
 		fmt.Println("DATA: PASS (subscriber received the data-channel message cross-node)")
 	case <-time.After(8 * time.Second):
-		fmt.Println("DATA: P0-2 bridging code present; end-to-end client→room DC flow pending pion stream-ID matching fix (documented)")
+		fmt.Println("DATA: FAIL timeout — subscriber never received the data-channel message")
+		os.Exit(1)
 	}
 }
 
