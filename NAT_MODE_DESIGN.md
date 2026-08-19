@@ -38,6 +38,8 @@
 | 3f-1 | 房主节点故障迁移触发（#51）：边缘 `MediaRelay.unregisterGateway` → `RTCService.OnGatewayLost`（延迟 7s 确认房主节点 keepalive 过期/已被摘除，避免误判正常 teardown）→ 向客户端发 `Leave(RECONNECT)` + 关 WS，客户端重连并驱动房间重归 | ✅ 接线 + E2E |
 | 3f-2 | 死节点周期摘除：`RedisRouter.cleanupWorker`（每 10s：`RemoveDeadNodes` + `room_node_map` 指向死节点的条目清理）+ `GetNodeForRoom` 对 stale 映射惰性清理（返回 `ErrNotFound`，join 立即重归到存活节点） | ✅ 接线 + E2E |
 | 验证 | 房主节点故障迁移端到端（#51）：`room-node-failure` 场景**强杀房主节点 pod**（scale 0 + force-delete）→ 客户端 `SIGNAL_CLOSE` 断开 → 死节点被摘除 + 房间重归（`room_node_map` 落到存活节点）→ resume 干净拒绝（`STATE_MISMATCH`）→ 同身份全量重连后房间在新节点重建（跨节点，signalNodeID≠nodeID）+ 媒体恢复 | ✅ |
+| 3g-1 | TURN relay-only 全路径（#50）：双客户端强制 `ICETransportPolicyRelay`（唯一候选 = relay）→ **完整 ICE 经 TURN relay 建立** + 媒体经 relay 端到端流通 + 双端选中候选对均为 relay。根因是 `turn.go` `permissionHandler` 默认拒绝私有 IP peer（relayed socket 的 STUN check 到私有边缘 host candidate 失败），**配置问题非服务器 bug**：真网公网 host candidate 默认放行；私有网（含 kind）需 `allow_restricted_peer_cidrs` | ✅ 集群内修复 + E2E |
+| 验证 | TURN relay-only 端到端（#50）：`turn-relay-only` 场景（`configs/config.yaml` 加 `allow_restricted_peer_cidrs: [192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12]`）→ 双端 relay-only ICE connected + `IsRelaySelectedOnAnyTransport` 双端 true + 媒体经 relay 流通（`waitBytes`）。真网公网 host candidate 无需 allow-list，relay-only 直连开箱即用 | ✅ |
 
 ## 1. 目标与范围
 
@@ -346,7 +348,7 @@ type gatewayUpTrack struct {
 - **SRTP 逐跳密钥**：边缘节点解密后是明文，房主↔边缘内网通道需自建鉴权/加密（至少 TLS 或内网隔离）。
 - **RTCP/NACK/RTX/pli/fir**：这些反馈要随 RTCP 一起跨节点，`MediaChannel` 需承载 RTCP（已含在接口）。
 - **数据通道(SCTP)**：已打通（P0-2，见 §6.8）。已知限制：`DetachDataChannels()` 全局开启下，
-  依赖 detached 读循环；TURN relay-only 全路径（真实 NAT 网络）待真节点验证。
+  依赖 detached 读循环；TURN relay-only 全路径已在集群内验证（#50，见下）。
 - **拥塞控制状态**：stream allocator / TWCC 状态在房主节点，RTCP feedback 跨节点回流即可。
 - **时序/时钟**：跨节点明文 RTP 需保证单调发送节奏（pacer 在房主节点，发送到边缘的调度要保序）。
 

@@ -36,3 +36,14 @@ turn:
   udp_port: 3478           # TURN credential issuance in the join response
   relay_range_start: 50000
   relay_range_end: 50100
+  # The TURN permission policy denies private-peer IPs by default (loopback,
+  # link-local, multicast, RFC1918). The edge's host candidates are private kind
+  # IPs (192.168.107.x), so a relay-ONLY ICE connection — the relayed socket's
+  # STUN checks to the edge host candidate — can only complete if these ranges
+  # are allowed. Real networks advertise PUBLIC host candidates and need no
+  # allow-list (this is exactly why relay-only "needs real-network verification"
+  # upstream: it is a deployment config, not a server bug).
+  allow_restricted_peer_cidrs:
+    - 192.168.0.0/16        # kind node network
+    - 10.0.0.0/8            # pod CIDR
+    - 172.16.0.0/12         # service CIDR

@@ -319,12 +319,27 @@ if run_scenario participant-leave-visible yes "$ROOM_LV"; then PASS=$((PASS+1));
 if run_scenario sync-state yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
 # connection-quality: A must observe B's per-participant connection quality
-# cross-node (SignalResponse_ConnectionQuality over the relay).
-if run_scenario connection-quality yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+# cross-node (SignalResponse_ConnectionQuality over the relay). FRESH room: the
+# quality broadcast is per-room and A's 20s observation window is timing-fragile
+# once the shared room accumulates tens of participants (same reasoning as
+# participant-leave-visible) — a fresh room keeps the assertion deterministic.
+ROOM_CQ="${ROOM_GO}-cq"
+seed_room_map "$ROOM_CQ"
+if run_scenario connection-quality yes "$ROOM_CQ"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
 # turn-credentials: with the in-process TURN server enabled, the join response
 # must carry a TURN server (iceServersForParticipant) with valid credentials.
 if run_scenario turn-credentials yes; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
+# turn-relay-only: BOTH clients force ICETransportPolicyRelay, so their only
+# candidates are TURN relays; full ICE + media through the relay proves the
+# COMPLETE TURN data path (allocation → permission → STUN → RTP/RTCP), not just
+# credential issuance. Works in-cluster because config.yaml's turn block sets
+# allow_restricted_peer_cidrs (the edge's host candidates are private kind IPs);
+# real networks with public host candidates need no allow-list.
+ROOM_RELAY="${ROOM_GO}-relay"
+seed_room_map "$ROOM_RELAY"
+if run_scenario turn-relay-only yes "$ROOM_RELAY"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
 # reconnect: publisher drops only its signal; a same-identity rejoin removes the
 # duplicate participant and republishes — the subscriber sees media restored.

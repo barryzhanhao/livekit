@@ -1523,6 +1523,32 @@ func (c *RTCClient) BytesReceived() uint64 {
 	return total
 }
 
+// IsRelaySelectedOnAnyTransport reports whether the SELECTED local candidate
+// (the candidate in the active ICE pair) of ANY transport is a TURN relay.
+// With ICETransportPolicyRelay the client gathers no host/srflx candidates at
+// all, so a selected relay pair is both necessary and sufficient proof that
+// the connection is established through the TURN relay — not a host fallback.
+func (c *RTCClient) IsRelaySelectedOnAnyTransport() bool {
+	var infos []*types.ICEConnectionInfo
+	if c.publisher != nil {
+		infos = append(infos, c.publisher.GetICEConnectionInfo())
+	}
+	if c.subscriber != nil {
+		infos = append(infos, c.subscriber.GetICEConnectionInfo())
+	}
+	for _, info := range infos {
+		if info == nil {
+			continue
+		}
+		for _, local := range info.Local {
+			if local.SelectedOrder > 0 && local.Candidate != nil && local.Candidate.Typ == webrtc.ICECandidateTypeRelay {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (c *RTCClient) IsLocalCandidateRelaySelected() bool {
 	var info *types.ICEConnectionInfo
 	if c.subscriberAsPrimary.Load() {

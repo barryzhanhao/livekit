@@ -73,6 +73,19 @@ func newSinglePCClient(wsURL, apiKey, apiSecret, room, identity string) *testcli
 	return newRTCClient(wsURL, apiKey, apiSecret, room, identity, true)
 }
 
+// newRelayClient connects with ICETransportPolicyRelay forced — the ONLY ICE
+// candidates the client gathers are TURN relays (no host/srflx), so any
+// established connection is necessarily traversing the TURN relay.
+func newRelayClient(wsURL, apiKey, apiSecret, room, identity string) *testclient.RTCClient {
+	opts := &testclient.Options{AutoSubscribe: true, ForceRelay: true}
+	conn, err := testclient.NewWebSocketConn(wsURL, token(apiKey, apiSecret, room, identity), opts)
+	must(err)
+	c, err := testclient.NewRTCClient(conn, false, opts)
+	must(err)
+	go c.Run()
+	return c
+}
+
 func newRTCClient(wsURL, apiKey, apiSecret, room, identity string, singlePC bool) *testclient.RTCClient {
 	// singlePC: the WS URL must carry a join_request (v1 protocol) for the server
 	// to enable UseSinglePeerConnection; NewRTCClient's flag alone does not add it.
@@ -1099,6 +1112,42 @@ func scenarioTurnCredentials(url, apiKey, apiSecret, room string) {
 	}
 	fmt.Println("TURN_CREDENTIALS: FAIL no TURN server in join response", servers)
 	os.Exit(1)
+}
+
+// scenarioTurnRelayOnly: the full relay-ONLY ICE path. Both clients force
+// ICETransportPolicyRelay, so their ONLY candidate type is the TURN relay; a
+// connected + media-carrying session then proves the ENTIRE relay data path —
+// allocation, CreatePermission, STUN checks through the relay, RTP/RTCP through
+// the relay — not just credential issuance/allocation (turn-credentials). In
+// the kind/Docker environment this requires allow_restricted_peer_cidrs in the
+// TURN config (the edge's host candidates are private IPs; see config.yaml);
+// real networks advertise public host candidates and need no allow-list.
+func scenarioTurnRelayOnly(url, apiKey, apiSecret, room string) {
+	pub := newRelayClient(url, apiKey, apiSecret, room, "go-relay-pub")
+	waitConnected(pub)
+	sub := newRelayClient(url, apiKey, apiSecret, room, "go-relay-sub")
+	waitConnected(sub)
+
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	if err := waitBytes(sub, 2048, 90*time.Second); err != nil {
+		fmt.Println("TURN_RELAY_ONLY: FAIL no media over the relay", err)
+		os.Exit(1)
+	}
+	// media flowed, so both ICE connections are up; with relay-only policy the
+	// selected pair MUST be a relay on both clients — assert it to prove the
+	// relay data path end-to-end (no host/srflx fallback on either side).
+	if !pub.IsRelaySelectedOnAnyTransport() {
+		fmt.Println("TURN_RELAY_ONLY: FAIL publisher's selected candidate is not a TURN relay")
+		os.Exit(1)
+	}
+	if !sub.IsRelaySelectedOnAnyTransport() {
+		fmt.Println("TURN_RELAY_ONLY: FAIL subscriber's selected candidate is not a TURN relay")
+		os.Exit(1)
+	}
+	fmt.Println("TURN_RELAY_ONLY: PASS (relay-only ICE connected; media flowed through the TURN relay)")
 }
 
 // scenarioReconnect: after the publisher's signal connection drops (PCs stay
@@ -2235,7 +2284,7 @@ func main() {
 	apiKey := flag.String("api-key", "devkey", "API key")
 	apiSecret := flag.String("api-secret", "secret", "API secret")
 	room := flag.String("room", "nat-go", "room name")
-	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|room-node-failure|webhook-events|subscriber-pli|media-follows-signaling|multi-edge|simulate-ice-restart|security-auth|scale-stress")
+	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|room-node-failure|webhook-events|subscriber-pli|media-follows-signaling|multi-edge|simulate-ice-restart|security-auth|scale-stress|turn-credentials|turn-relay-only")
 	flag.Parse()
 
 	switch *scenario {
@@ -2305,6 +2354,8 @@ func main() {
 		scenarioConnectionQuality(*url, *apiKey, *apiSecret, *room)
 	case "turn-credentials":
 		scenarioTurnCredentials(*url, *apiKey, *apiSecret, *room)
+	case "turn-relay-only":
+		scenarioTurnRelayOnly(*url, *apiKey, *apiSecret, *room)
 	case "reconnect":
 		scenarioReconnect(*url, *apiKey, *apiSecret, *room)
 	case "perform-rpc":

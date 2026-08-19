@@ -112,7 +112,8 @@ cd test/nat-e2e
 | participant-leave-visible | B 干净离开 → A 跨节点观察到参与者移除广播（`SignalResponse_Update` 移除已离开参与者） |
 | sync-state | 已连接客户端用 `SyncState` 声明自身已发布 track → 服务端 `onSyncState` 校验通过 → **不**触发全量重连 |
 | connection-quality | A 跨节点观察到 B 的 per-participant 连接质量（`SignalResponse_ConnectionQuality`，EXCELLENT/score 4.5） |
-| turn-credentials | 启用内嵌 TURN（UDP 3478）→ join 响应经 `iceServersForParticipant` 携带 TURN URL + 非空用户名/凭据，且客户端**实际分配** relay candidate（`HasRelayCandidate`，跨节点 `ALLOCATE OK`）；relay-only 完整连接受 Docker/kind 环境限制（见已知限制） |
+| turn-credentials | 启用内嵌 TURN（UDP 3478）→ join 响应经 `iceServersForParticipant` 携带 TURN URL + 非空用户名/凭据，且客户端**实际分配** relay candidate（`HasRelayCandidate`，跨节点 `ALLOCATE OK`） |
+| turn-relay-only | 双客户端强制 `ICETransportPolicyRelay`（唯一候选类型 = TURN relay）→ **完整 ICE 经 TURN relay 建立**（分配 → permission → relayed socket STUN check → RTP/RTCP 全部穿透 relay）+ 媒体端到端流通 + 双端**选中候选对均为 relay**（`IsRelaySelectedOnAnyTransport`）。需 `allow_restricted_peer_cidrs`（集群内边缘 host candidate 是私有 IP；真网公网 IP 默认放行） |
 | reconnect | 发布者只断开信令 WS（PC 存活）→ 断连宽限窗口内**同身份**重新 join → 服务端移除重复参与者（`RemoveParticipant DuplicateIdentity`）→ 新参与者重发布 → 订阅者跨节点看到媒体恢复（真实客户端全量重连落到的结局） |
 | perform-rpc | `RoomService.PerformRpc` 指向 NAT 参与者 → 数据通道已桥接（P0-2），RPC 请求经边缘 DC 出站；测试客户端无 RPC responder → 干净超时（`RpcError 1501 Connection timeout`）——**有界**、绝不挂起，固化为确定性回归断言 |
 | simulcast-switch | Go 客户端自含 **PLI 响应式 3 层 VP8 simulcast 发布者**（`simulcast.go`，3 RID + per-layer PLI→keyframe + SR）+ 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`）+ 层选择 0/1/2 + **forwarder 真正上切**（`upgrading layer` 到 1/2 + 各高层 `forwarded key frame`，P0-3 层锁释放的证明）。客户端码率仅诊断（上切后跨节点下行码率有吞吐限制，见已知限制） |
@@ -163,7 +164,7 @@ GO-CLIENT SUMMARY: 45 passed, 0 failed
    room-move-forward / whip-ice-restart / health / simulate-speaker /
    simulate-node-failure / simulate-server-leave / sub-perm-revoke /
    participant-leave-visible / sync-state / connection-quality / turn-credentials /
-   reconnect / perform-rpc / simulcast-switch / reconnect-resume / webhook-events /
+   turn-relay-only / reconnect / perform-rpc / simulcast-switch / reconnect-resume / webhook-events /
    subscriber-pli / media-follows-signaling / multi-edge / simulate-ice-restart /
    security-auth / scale-stress)
 ```
@@ -212,12 +213,15 @@ GO-CLIENT SUMMARY: 45 passed, 0 failed
     plane + 层选择 0/1/2 + forwarder `upgrading layer` 到 1/2 + 各高层 keyframe 被转发），客户端
     码率仅作诊断输出，不设硬性带宽带断言（避免 flake）。真实客户端（浏览器/FFmpeg 编码器）上行
     稳定后下行码率断言可复开。
-- **TURN relay（分配正常、relay-only ICE 环境限制）**：`turn-credentials` 场景现已断言客户端
-  **实际分配** relay candidate（`HasRelayCandidate`，join 响应凭据 → 房主节点 TURN `ALLOCATE OK
-  relayed: 192.168.107.4:50013`，跨节点分配路径验证）。但 **relay-only**（`ICETransportPolicyRelay`）
-  的完整 ICE 连接在 Docker/kind 环境不建立（分配成功、relay 候选已收集，但 relayed socket 的
-  STUN check 到边缘 host candidate 无法完成），非 fork 服务器问题（TURN server 正常监听 + 发凭据）；
-  真实网络需独立验证。
+- **TURN relay（已闭环：#50 修复 + 集群内验证）**：`turn-relay-only` 场景现断言 relay-only
+  `ICETransportPolicyRelay` 的**完整 ICE 连接经 TURN relay 建立**——双端强制 relay-only（无
+  host/srflx 候选）+ 媒体端到端经 relay 流通 + 双端**选中候选对均为 relay**。根因此前记为
+  "环境限制、需真网验证"，实为**部署配置**而非服务器 bug：`pkg/service/turn.go` 的
+  `permissionHandler` 默认**拒绝私有 IP peer**（loopback/link-local/multicast/RFC1918），kind 里
+  边缘的 host candidate 是私有 IP → relayed socket 的 STUN check 无法完成。修复：TURN 配置加
+  `allow_restricted_peer_cidrs: [192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12]`（见
+  `configs/config.yaml`）。真网部署边缘 host candidate 是**公网 IP**，天然不在 restricted 集内，
+  无需 allow-list 即可 relay-only 直连。
 - **边缘路由/负载均衡（部署模式）**：fork 本身无边缘选择逻辑——客户端连到哪个边缘由部署层的
   LB/Ingress 决定（按地域/负载把 WS 引到合适的边缘 pod）。fork 已提供多边缘注册（`nodes` hash 含
   每边缘的 node_ip/advertise_ip）+ 房间钉扎（`room_node_map`），任意边缘都能服务任意房间（
