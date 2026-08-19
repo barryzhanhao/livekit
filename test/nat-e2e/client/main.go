@@ -1473,6 +1473,41 @@ func scenarioMultiEdge(url, apiKey, apiSecret, room, url2 string) {
 	fmt.Println("MULTI_EDGE: PASS (media crossed edge1↔edge2 via the room node)")
 }
 
+// scenarioScaleStress: two rooms, each with a pub + sub, with the four clients
+// spread across BOTH edges (room A: pub on edge1, sub on edge2; room B: pub on
+// edge2, sub on edge1). Both rooms are pinned to the room node. All media must
+// flow concurrently — stressing the room node's dual-edge handling + the
+// control-channel establishment under concurrency.
+func scenarioScaleStress(url, apiKey, apiSecret, room, url2, room2 string) {
+	// room A
+	aPub := newClient(url, apiKey, apiSecret, room, "go-scale-a-pub")
+	waitConnected(aPub)
+	aSub := newClient(url2, apiKey, apiSecret, room, "go-scale-a-sub")
+	waitConnected(aSub)
+	// room B
+	bPub := newClient(url2, apiKey, apiSecret, room2, "go-scale-b-pub")
+	waitConnected(bPub)
+	bSub := newClient(url, apiKey, apiSecret, room2, "go-scale-b-sub")
+	waitConnected(bSub)
+
+	wa, err := aPub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer wa.Stop()
+	wb, err := bPub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer wb.Stop()
+
+	if err := waitBytes(aSub, 2048, 90*time.Second); err != nil {
+		fmt.Println("SCALE_STRESS: FAIL room A (edge1→edge2) no media", err)
+		os.Exit(1)
+	}
+	if err := waitBytes(bSub, 2048, 90*time.Second); err != nil {
+		fmt.Println("SCALE_STRESS: FAIL room B (edge2→edge1) no media", err)
+		os.Exit(1)
+	}
+	fmt.Println("SCALE_STRESS: PASS (2 rooms × 2 edges all media flowed concurrently)")
+}
+
 // scenarioSimulateICERestart: the server-driven ICE restart path (the same
 // `participant.ICERestart` the resume flow uses, driven directly via
 // SimulateScenario_SwitchCandidateProtocol). Both peers publish+subscribe; the
@@ -2078,10 +2113,11 @@ func main() {
 
 	url := flag.String("url", "ws://127.0.0.1:7880", "edge node WebSocket URL")
 	url2 := flag.String("url2", "", "second edge node WebSocket URL (multi-edge scenario)")
+	room2 := flag.String("room2", "", "second room name (scale-stress scenario)")
 	apiKey := flag.String("api-key", "devkey", "API key")
 	apiSecret := flag.String("api-secret", "secret", "API secret")
 	room := flag.String("room", "nat-go", "room name")
-	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events|subscriber-pli|media-follows-signaling|multi-edge|simulate-ice-restart|security-auth")
+	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events|subscriber-pli|media-follows-signaling|multi-edge|simulate-ice-restart|security-auth|scale-stress")
 	flag.Parse()
 
 	switch *scenario {
@@ -2167,6 +2203,8 @@ func main() {
 		scenarioMediaFollowsSignaling(*url, *apiKey, *apiSecret, *room)
 	case "multi-edge":
 		scenarioMultiEdge(*url, *apiKey, *apiSecret, *room, *url2)
+	case "scale-stress":
+		scenarioScaleStress(*url, *apiKey, *apiSecret, *room, *url2, *room2)
 	case "simulate-ice-restart":
 		scenarioSimulateICERestart(*url, *apiKey, *apiSecret, *room)
 	case "security-auth":

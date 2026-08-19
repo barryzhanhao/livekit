@@ -121,6 +121,7 @@ cd test/nat-e2e
 | subscriber-pli | 下行 RTCP 的 **PLI 路径**（keyframe 请求变体，与 NACK 互补）：订阅者发真 PLI → 房主 DownTrack 处理并请求发布者 keyframe（`sending PLI RTCP`，SSRC 重写修复的 PLI 证明——修复前边缘重写 SSRC 被 `p.MediaSSRC == d.ssrc` 丢弃） |
 | media-follows-signaling | 核心边界 IP 级证明：**媒体终止于信令节点（边缘）**——服务端 PC 跑在边缘（advertise_ip），客户端收到的远端 ICE candidate 必须携带边缘 IP（= WS hostname），绝不含房主 IP；断言 candidate 含边缘 IP + 媒体实际流动 |
 | multi-edge | **多边缘核心属性**：pub 连边缘1、sub 连边缘2（同一房间钉在房主节点）→ 媒体双向跨越边缘1↔边缘2（各经房主节点），两个边缘各出现网关会话（多边缘需要 `01-cluster.sh` 建 3 worker，无 worker3 时自动跳过） |
+| scale-stress | **多房间×多边缘并发**：2 房间 × 双边缘（A 房 pub在edge1/sub在edge2，B 房反向）共 8 会话并发，全部媒体同时流动——压房主节点双边缘处理 + 控制通道并发建立 |
 | simulate-ice-restart | **服务端 ICE restart 核心路径**（`SimulateScenario_SwitchCandidateProtocol` → `participant.ICERestart`，与 resume 同一路径）：双向发布/订阅的双方在服务端重启后**各自收流继续**（被重启的订阅者 PC 跨节点重协商 + 未触碰的 PC 不受影响），证明跨节点 ICERestart/重协商端到端 |
 
 ## E2E 覆盖度工具（`07-coverage.sh`）
@@ -152,7 +153,7 @@ SUMMARY: 37 passed, 0 failed
 === lk 套件 --loss 5% ===
 SUMMARY: 28 passed, 0 failed
 === Go 客户端 ===
-GO-CLIENT SUMMARY: 43 passed, 0 failed
+GO-CLIENT SUMMARY: 45 passed, 0 failed
   (receive-before-publish / NACK / data / attributes / metadata / mute /
    multitrack / single-pc / whip / manual-subscribe / participant-name /
    room-admin / track-pause / room-lifecycle / service-apis /
@@ -162,7 +163,8 @@ GO-CLIENT SUMMARY: 43 passed, 0 failed
    simulate-node-failure / simulate-server-leave / sub-perm-revoke /
    participant-leave-visible / sync-state / connection-quality / turn-credentials /
    reconnect / perform-rpc / simulcast-switch / reconnect-resume / webhook-events /
-   subscriber-pli / media-follows-signaling / multi-edge / simulate-ice-restart)
+   subscriber-pli / media-follows-signaling / multi-edge / simulate-ice-restart /
+   security-auth / scale-stress)
 ```
 
 覆盖的功能：
@@ -201,7 +203,16 @@ GO-CLIENT SUMMARY: 43 passed, 0 failed
   **实际分配** relay candidate（`HasRelayCandidate`，join 响应凭据 → 房主节点 TURN `ALLOCATE OK
   relayed: 192.168.107.4:50013`，跨节点分配路径验证）。但 **relay-only**（`ICETransportPolicyRelay`）
   的完整 ICE 连接在 Docker/kind 环境不建立（分配成功、relay 候选已收集，但 relayed socket 的
-  STUN check 到边缘 host candidate 无法完成），非 fork 服务器问题（TURN server 正常监听 + 发凭据）。
+  STUN check 到边缘 host candidate 无法完成），非 fork 服务器问题（TURN server 正常监听 + 发凭据）；
+  真实网络需独立验证。
+- **边缘路由/负载均衡（部署模式）**：fork 本身无边缘选择逻辑——客户端连到哪个边缘由部署层的
+  LB/Ingress 决定（按地域/负载把 WS 引到合适的边缘 pod）。fork 已提供多边缘注册（`nodes` hash 含
+  每边缘的 node_ip/advertise_ip）+ 房间钉扎（`room_node_map`），任意边缘都能服务任意房间（
+  `multi-edge`/`scale-stress` 已验证）。生产建议：k8s Service/Ingress 或 LiveKit 上游的
+  region-based 路由做客户端→边缘分配；本套件直接指 IP 模拟。
+- **房主节点故障恢复（后续工作）**：房主节点重启会终止其承载的全部房间会话（无跨节点迁移）。
+  `simulate-node-failure` 只测"丢参与者"；`SimulateScenario_Migration` 未 E2E 覆盖。房间迁移
+  （跨节点重建）是独立特性，超出本轮范围。
 - **WHIP ICE-restart（上游协议库 bug，已加固）**：`PATCH If-Match:*`（RFC 9725 ICE restart）在 fork 中
   会触发上游 `livekit/protocol/sdp` `PatchICECredentialAndCandidatesIntoSDP` 的
   **mutate-while-ranging panic**（`sdp.go:695`，对带 candidate 的远端描述遍历删除时切片越界），
