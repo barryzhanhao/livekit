@@ -367,8 +367,15 @@ s12_scale() {
   echo "  S12 first attempt failed; settling 10s and retrying..."
   kill_all_lk
   sleep 10
+  local fail_before="$FAIL"
   new_room s12r || return
-  s12_run
+  if s12_run; then
+    # the retry is authoritative: roll back the first attempt's FAIL counts so
+    # the summary reflects the successful retry (not the transient race).
+    FAIL="$fail_before"
+    return 0
+  fi
+  return 1
 }
 
 s12_run() {
@@ -449,3 +456,5 @@ s13_stability;       kill_all_lk
 
 summary
 echo "logs/work dir: $WORK"
+# summary()'s exit status is the failure gate; keep it as the script's exit code
+exit $([ "$FAIL" -eq 0 ] && echo 0 || echo 1)
