@@ -91,6 +91,11 @@ func (r *RedisRouter) RemoveDeadNodes() error {
 		return err
 	}
 	for _, n := range nodes {
+		// never reap the current node: its own stats can lag under load, and a
+		// self-removal would immediately re-home its rooms elsewhere.
+		if livekit.NodeID(n.Id) == r.currentNode.NodeID() {
+			continue
+		}
 		if !selector.IsAvailable(n) {
 			if err := r.rc.HDel(context.Background(), NodesKey, n.Id).Err(); err != nil {
 				return err
@@ -109,7 +114,65 @@ func (r *RedisRouter) GetNodeForRoom(_ context.Context, roomName livekit.RoomNam
 		return nil, errors.Wrap(err, "could not get node for room")
 	}
 
-	return r.GetNode(livekit.NodeID(nodeID))
+	node, err := r.GetNode(livekit.NodeID(nodeID))
+	if errors.Is(err, ErrNotFound) {
+		// the node the room was pinned to is no longer registered (room-node
+		// shutdown/crash followed by dead-node reaping). Release the stale
+		// mapping so the next join re-homes the room instead of routing into a
+		// void, and so GetNodeForRoom callers observe the room as unassigned.
+		r.clearStaleRoomMapping(roomName, livekit.NodeID(nodeID), "unregistered node")
+		return nil, ErrNotFound
+	} else if err != nil {
+		return nil, errors.Wrap(err, "could not get node for room")
+	}
+
+	// The pinned node is still registered but no longer reporting stats — its
+	// keepalive died without a clean unregister (e.g. a crashed room node).
+	// Treat it as gone so SelectRoomNode re-homes the room on a live node.
+	// The current node is by definition alive (it is executing this request);
+	// never re-home a room off the local node due to its own stats lag.
+	if livekit.NodeID(nodeID) != r.currentNode.NodeID() && !selector.IsAvailable(node) {
+		r.clearStaleRoomMapping(roomName, livekit.NodeID(nodeID), "dead node")
+		return nil, ErrNotFound
+	}
+
+	return node, nil
+}
+
+// clearStaleRoomMapping removes a room_node_map entry that points to a node that
+// is no longer serving, so the room can be re-homed by the next join.
+func (r *RedisRouter) clearStaleRoomMapping(roomName livekit.RoomName, nodeID livekit.NodeID, why string) {
+	if err := r.rc.HDel(r.ctx, NodeRoomKey, string(roomName)).Err(); err != nil {
+		logger.Warnw("could not clear stale room node mapping", err, "room", roomName, "nodeID", nodeID, "why", why)
+		return
+	}
+	logger.Infow("cleared stale room node mapping", "room", roomName, "nodeID", nodeID, "why", why)
+}
+
+// clearStaleRoomMappings reaps every room_node_map entry whose pinned node is
+// dead or unregistered. Run periodically so rooms hosted on a failed node are
+// released even if nobody joins them for a while.
+func (r *RedisRouter) clearStaleRoomMappings() {
+	entries, err := r.rc.HGetAll(r.ctx, NodeRoomKey).Result()
+	if err != nil {
+		logger.Warnw("could not list room node mappings", err)
+		return
+	}
+	for room, nodeID := range entries {
+		// never re-home a room mapped to the current node based on its own stats
+		if livekit.NodeID(nodeID) == r.currentNode.NodeID() {
+			continue
+		}
+		node, err := r.GetNode(livekit.NodeID(nodeID))
+		if err == nil && selector.IsAvailable(node) {
+			continue
+		}
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			logger.Warnw("could not check node for room mapping", err, "room", room, "nodeID", nodeID)
+			continue
+		}
+		r.clearStaleRoomMapping(livekit.RoomName(room), livekit.NodeID(nodeID), "reap")
+	}
 }
 
 func (r *RedisRouter) SetNodeForRoom(_ context.Context, roomName livekit.RoomName, nodeID livekit.NodeID) error {
@@ -209,9 +272,37 @@ func (r *RedisRouter) Start() error {
 	workerStarted := make(chan error)
 	go r.statsWorker()
 	go r.keepaliveWorker(workerStarted)
+	go r.cleanupWorker()
 
 	// wait until worker is running
 	return <-workerStarted
+}
+
+// cleanupWorker periodically reaps dead nodes and releases room_node_map
+// entries that point to them. Node liveness is derived from the keepalive that
+// each node publishes to its own stats topic (see keepaliveWorker); a node that
+// stops reporting — a crashed/failed room node — must be removed from the
+// registry and have its rooms released so subsequent joins re-home them onto a
+// live node. Without this the `nodes` hash and `room_node_map` would hold
+// failed nodes indefinitely (RemoveDeadNodes alone only runs once at startup).
+func (r *RedisRouter) cleanupWorker() {
+	interval := r.nodeStatsConfig.StatsUpdateInterval * 5
+	if interval < 10*time.Second {
+		interval = 10 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := r.RemoveDeadNodes(); err != nil {
+				logger.Warnw("could not remove dead nodes", err)
+			}
+			r.clearStaleRoomMappings()
+		case <-r.ctx.Done():
+			return
+		}
+	}
 }
 
 func (r *RedisRouter) Drain() {

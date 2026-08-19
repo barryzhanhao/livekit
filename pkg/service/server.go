@@ -102,6 +102,10 @@ func NewLivekitServer(conf *config.Config,
 	// connections. roomManager constructs it in NewLocalRoomManager.
 	s.mediaRelay.SetRTCConfig(roomManager.RTCConfig())
 	roomManager.SetMediaRelay(s.mediaRelay)
+	// A gateway session lost to a dead room node is surfaced to the RTC service,
+	// which closes the participant's signal connection so the client reconnects
+	// and the room is re-homed (room-node failure migration, #51).
+	s.mediaRelay.SetOnGatewayLost(rtcService.OnGatewayLost)
 
 	middlewares := []negroni.Handler{
 		// always first

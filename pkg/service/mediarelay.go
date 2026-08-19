@@ -55,6 +55,9 @@ type MediaRelay struct {
 
 	mu       sync.RWMutex
 	gateways map[string]*transport.MediaGateway // session ID -> edge gateway
+	// onGatewayLost is invoked with the participant SID when a gateway session's
+	// control channel terminates (see unregisterGateway). Guarded by mu.
+	onGatewayLost func(sessionID string)
 
 	done chan struct{}
 	wg   sync.WaitGroup
@@ -192,6 +195,24 @@ func (m *MediaRelay) registerGateway(sessionID string, gw *transport.MediaGatewa
 func (m *MediaRelay) unregisterGateway(sessionID string, isOfferer bool) {
 	m.mu.Lock()
 	delete(m.gateways, gatewayKey(sessionID, isOfferer))
+	onLost := m.onGatewayLost
+	m.mu.Unlock()
+	if onLost != nil {
+		// A gateway session's control channel to the room node terminated. This
+		// fires for BOTH a normal participant teardown (the room node closes the
+		// channel) and a failed room node (the channel dies with it); the RTC
+		// service decides which by checking the room node's liveness.
+		onLost(sessionID)
+	}
+}
+
+// SetOnGatewayLost registers a callback invoked whenever a gateway session's
+// control channel to the room node terminates. The sessionID is the participant
+// SID. Used for room-node failure detection (#51): the signal layer learns the
+// media plane died so it can close the client's WS and trigger re-homing.
+func (m *MediaRelay) SetOnGatewayLost(f func(sessionID string)) {
+	m.mu.Lock()
+	m.onGatewayLost = f
 	m.mu.Unlock()
 }
 

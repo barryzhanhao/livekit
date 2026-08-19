@@ -131,6 +131,8 @@ type Router interface {
 
 	ListNodes() ([]*livekit.Node, error)
 
+	GetNode(nodeID livekit.NodeID) (*livekit.Node, error)
+
 	GetNodeForRoom(ctx context.Context, roomName livekit.RoomName) (*livekit.Node, error)
 	SetNodeForRoom(ctx context.Context, roomName livekit.RoomName, nodeId livekit.NodeID) error
 	ClearRoomState(ctx context.Context, roomName livekit.RoomName) error

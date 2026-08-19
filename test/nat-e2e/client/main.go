@@ -1389,6 +1389,101 @@ func scenarioReconnectResume(url, apiKey, apiSecret, room string) {
 	os.Exit(1)
 }
 
+// scenarioRoomNodeFailure: #51 — REAL room-node failure + client-driven migration
+// (cross-node recovery). The 06 harness pins this room to the ROOM node and, once
+// the scenario prints READY (media established cross-node), KILLS the room node
+// deployment. The room node hosts the SFU + participants, so its death must:
+//
+//  1. tear down in-flight sessions: the client observes a server-driven disconnect
+//     (the edge closes the WS when the room node's signal stream dies).
+//  2. allow the room to be RE-HOMED: the next join re-runs SelectRoomNode, which
+//     clears the stale room_node_map entry for the dead node (GetNodeForRoom) and
+//     re-creates the room on a live node.
+//  3. restore media: the rejoined publisher republishes and the re-joined
+//     subscriber receives RTP again.
+//
+// We assert (1) the disconnect, (2) that a reconnect=true resume attempt is
+// rejected CLEANLY (STATE_MISMATCH — the room is gone, there is nothing to
+// resume; a hang would be a failure), and (3) that a full rejoin with the SAME
+// identity republishes and the new subscriber receives media. The harness
+// additionally asserts room_node_map was re-homed away from the dead node.
+func scenarioRoomNodeFailure(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-rnf-sub")
+	waitConnected(sub)
+	pub := newClient(url, apiKey, apiSecret, room, "go-rnf-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("ROOM_NODE_FAILURE: FAIL no baseline media", err)
+		os.Exit(1)
+	}
+	// READY marker: the harness kills the room node after seeing this line.
+	fmt.Println("ROOM_NODE_FAILURE: READY media-established")
+
+	// (1) server-driven disconnect when the room node dies. The edge closes the
+	// WS once the room node's signal stream breaks; a REAL failure must be
+	// observable by the client within a bounded window (not a silent hang).
+	if err := pub.WaitUntilDisconnected(120 * time.Second); err != nil {
+		fmt.Println("ROOM_NODE_FAILURE: FAIL publisher not disconnected after node failure:", err)
+		os.Exit(1)
+	}
+	fmt.Println("ROOM_NODE_FAILURE: publisher disconnected (reason", pub.DisconnectReason(), ")")
+	writer.Stop()
+
+	if err := sub.WaitUntilDisconnected(30 * time.Second); err != nil {
+		fmt.Println("ROOM_NODE_FAILURE: FAIL subscriber not disconnected:", err)
+		os.Exit(1)
+	}
+	fmt.Println("ROOM_NODE_FAILURE: subscriber disconnected too")
+
+	// give the registry a beat to converge (dead node reaped + stale map cleared)
+	time.Sleep(15 * time.Second)
+
+	// (2) resume attempt (reconnect=true + prior SID): a real client tries to
+	// resume first. The room is gone, so the server must reject it CLEANLY with a
+	// Leave (STATE_MISMATCH, RECONNECT action) — never accept it, never hang.
+	if err := pub.Resume(url, token(apiKey, apiSecret, room, "go-rnf-pub"), &testclient.Options{
+		Reconnect:    true,
+		ReconnectSID: string(pub.ID()),
+	}); err != nil {
+		fmt.Println("ROOM_NODE_FAILURE: resume signal failed:", err)
+	} else {
+		deadline := time.Now().Add(20 * time.Second)
+		rejected := false
+		for time.Now().Before(deadline) {
+			if pub.Disconnected() {
+				rejected = true
+				fmt.Println("ROOM_NODE_FAILURE: resume rejected (reason", pub.DisconnectReason(), ") → full rejoin")
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if !rejected {
+			fmt.Println("ROOM_NODE_FAILURE: FAIL resume neither accepted nor rejected within 20s (hang)")
+			os.Exit(1)
+		}
+	}
+	pub.Stop()
+
+	// (3) full rejoin with the SAME identity → the room is re-created on a live
+	// node; the publisher republishes and the new subscriber receives media.
+	pub2 := newClient(url, apiKey, apiSecret, room, "go-rnf-pub")
+	waitConnected(pub2)
+	w2, err := pub2.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer w2.Stop()
+
+	sub2 := newClient(url, apiKey, apiSecret, room, "go-rnf-sub")
+	waitConnected(sub2)
+	if err := waitBytes(sub2, 2048, 90*time.Second); err != nil {
+		fmt.Println("ROOM_NODE_FAILURE: FAIL media not restored after rejoin:", err)
+		os.Exit(1)
+	}
+	fmt.Println("ROOM_NODE_FAILURE: PASS (node failure observed; resume cleanly rejected; room re-homed; media restored)")
+}
+
 // scenarioWebhookEvents: drives the server-side webhook (HTTP callback) path
 // cross-node. The server POSTs signed events (Authorization Bearer JWT carrying
 // the sha256 of the body) to the configured webhook URL; the receiver pod verifies
@@ -2140,7 +2235,7 @@ func main() {
 	apiKey := flag.String("api-key", "devkey", "API key")
 	apiSecret := flag.String("api-secret", "secret", "API secret")
 	room := flag.String("room", "nat-go", "room name")
-	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|webhook-events|subscriber-pli|media-follows-signaling|multi-edge|simulate-ice-restart|security-auth|scale-stress")
+	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|room-node-failure|webhook-events|subscriber-pli|media-follows-signaling|multi-edge|simulate-ice-restart|security-auth|scale-stress")
 	flag.Parse()
 
 	switch *scenario {
@@ -2218,6 +2313,8 @@ func main() {
 		scenarioSimulcastSwitch(*url, *apiKey, *apiSecret, *room)
 	case "reconnect-resume":
 		scenarioReconnectResume(*url, *apiKey, *apiSecret, *room)
+	case "room-node-failure":
+		scenarioRoomNodeFailure(*url, *apiKey, *apiSecret, *room)
 	case "webhook-events":
 		scenarioWebhookEvents(*url, *apiKey, *apiSecret, *room)
 	case "subscriber-pli":

@@ -555,6 +555,86 @@ else
   echo "  - SCALE-STRESS: skipped (no edge2 worker)"
 fi
 
+# room-node-failure (#51): REAL room-node failure + client-driven migration. The
+# Go scenario pins a fresh room to the ROOM node, establishes media cross-node,
+# prints READY, then waits for the room node to die. We kill the room node
+# deployment, the scenario observes the server-driven disconnect, re-runs the
+# join (resume attempt cleanly rejected → full rejoin, same identity), and
+# verifies media is restored — proof the room was RE-HOMED onto a live node.
+# We then assert room_node_map moved off the dead node and bring the room node
+# back so subsequent scenarios keep working.
+if kubectl get deploy/livekit-room -n "$NAMESPACE" >/dev/null 2>&1; then
+  echo "=== room-node-failure (real node kill + re-home) ==="
+  ROOM_RNF="${ROOM_GO}-rnf"
+  seed_room_map "$ROOM_RNF"
+  OUT="$(mktemp)"
+  /tmp/nat-client -url "$WS_URL" -api-key "$API_KEY" -api-secret "$API_SECRET" \
+    -room "$ROOM_RNF" -scenario room-node-failure >"$OUT" 2>&1 &
+  SCPID=$!
+  # wait for the scenario to establish media (READY marker) before killing
+  ready=0
+  for i in $(seq 1 90); do
+    if grep -q "ROOM_NODE_FAILURE: READY" "$OUT" 2>/dev/null; then ready=1; break; fi
+    if ! kill -0 "$SCPID" 2>/dev/null; then break; fi
+    sleep 1
+  done
+  if [ "$ready" -ne 1 ]; then
+    echo "  ✗ ROOM-NODE-FAILURE: scenario did not reach READY (media not established)"
+    kill "$SCPID" 2>/dev/null || true
+    wait "$SCPID" 2>/dev/null || true
+    echo "$(cat "$OUT")" >&2 || true
+    FAIL=$((FAIL+1))
+  else
+    echo "  media established; killing the room node deployment"
+    # Force-kill: scale to 0 (no replacement) + force-delete the pod (SIGKILL, so
+    # no graceful drain / UnregisterNode). This exercises the real crash path —
+    # the edge's media gateway loses its control channel and the RTC service must
+    # close the client WS (OnGatewayLost) to trigger reconnection + re-homing.
+    kubectl scale deploy/livekit-room -n "$NAMESPACE" --replicas=0
+    kubectl delete pod -l app=livekit-room -n "$NAMESPACE" --force --grace-period=0 >/dev/null 2>&1 || true
+    # wait for the scenario to finish (disconnect + rejoin + media resume), bounded
+    rc=124
+    for i in $(seq 1 180); do
+      if ! kill -0 "$SCPID" 2>/dev/null; then
+        wait "$SCPID"
+        rc=$?
+        break
+      fi
+      sleep 1
+    done
+    if [ "$rc" -ne 0 ]; then
+      if [ "$rc" -eq 124 ]; then
+        echo "  ✗ ROOM-NODE-FAILURE: scenario TIMED OUT (client never recovered)"
+        kill -9 "$SCPID" 2>/dev/null || true
+        wait "$SCPID" 2>/dev/null || true
+      else
+        echo "  ✗ ROOM-NODE-FAILURE: scenario exit $rc"
+      fi
+      echo "$(cat "$OUT")" >&2 || true
+      FAIL=$((FAIL+1))
+    else
+      echo "  ✓ ROOM-NODE-FAILURE: scenario exit 0"
+      PASS=$((PASS+1))
+      # the room must have been re-homed off the dead room node onto a live node
+      RH="$(redis_cli HGET room_node_map "$ROOM_RNF" || true)"
+      if [ -z "$RH" ]; then
+        echo "  ✗ ROOM-NODE-FAILURE: room_node_map[$ROOM_RNF] empty after recovery"; FAIL=$((FAIL+1))
+      elif [ "$RH" = "node-room" ]; then
+        echo "  ✗ ROOM-NODE-FAILURE: room_node_map[$ROOM_RNF] still on the dead room node"; FAIL=$((FAIL+1))
+      else
+        echo "  ✓ ROOM-NODE-FAILURE: room re-homed room_node_map[$ROOM_RNF]=$RH"
+      fi
+    fi
+  fi
+  # bring the room node back for subsequent scenarios; wait until it re-registers
+  kubectl scale deploy/livekit-room -n "$NAMESPACE" --replicas=1 >/dev/null 2>&1 || true
+  wait_for "room node back up" 180 kubectl get deploy/livekit-room -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' | grep -q 1
+  wait_for "room node re-registered" 60 sh -c 'kubectl exec -n "$NAMESPACE" deploy/redis -- redis-cli --raw HLEN nodes | grep -q "^3$"'
+  rm -f "$OUT"
+else
+  echo "  - ROOM-NODE-FAILURE: skipped (no livekit-room deployment)"
+fi
+
 # health: HTTP / on both nodes (defaultHandler → healthCheck, node-stats
 # heartbeat freshness). Client-facing edge + room node must both answer 200 OK.
 if curl -s -m 5 "http://$(edge_node_ip):7880/" | grep -q '^OK$' && curl -s -m 5 "http://$(room_node_ip):7880/" | grep -q '^OK$'; then

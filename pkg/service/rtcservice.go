@@ -38,6 +38,7 @@ import (
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
+	"github.com/livekit/livekit-server/pkg/routing/selector"
 	"github.com/livekit/livekit-server/pkg/rtc"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
@@ -45,7 +46,7 @@ import (
 )
 
 type RTCService struct {
-	router        routing.MessageRouter
+	router        routing.Router
 	roomAllocator RoomAllocator
 	upgrader      websocket.Upgrader
 	config        *config.Config
@@ -55,12 +56,23 @@ type RTCService struct {
 
 	mu          sync.Mutex
 	connections map[*websocket.Conn]struct{}
+	// connsBySID maps each participant SID to its signal connection and the room
+	// node the session is anchored to (cr.NodeID from startConnection). Used by
+	// OnGatewayLost to find and close the client WS when its room node dies.
+	connsBySID map[livekit.ParticipantID]*rtcSignalConn
+}
+
+// rtcSignalConn is the per-participant bookkeeping RTCService keeps so a failed
+// room node can be surfaced to the client as a signal disconnect.
+type rtcSignalConn struct {
+	sigConn    *WSSignalConnection
+	roomNodeID livekit.NodeID
 }
 
 func NewRTCService(
 	conf *config.Config,
 	ra RoomAllocator,
-	router routing.MessageRouter,
+	router routing.Router,
 	telemetry telemetry.TelemetryService,
 ) *RTCService {
 	s := &RTCService{
@@ -71,6 +83,7 @@ func NewRTCService(
 		limits:        conf.Limit,
 		telemetry:     telemetry,
 		connections:   map[*websocket.Conn]struct{}{},
+		connsBySID:    map[livekit.ParticipantID]*rtcSignalConn{},
 	}
 
 	s.upgrader = websocket.Upgrader{
@@ -456,6 +469,7 @@ func (s *RTCService) serve(w http.ResponseWriter, r *http.Request, needsJoinRequ
 	defer func() {
 		s.mu.Lock()
 		delete(s.connections, conn)
+		delete(s.connsBySID, pID)
 		s.mu.Unlock()
 	}()
 
@@ -478,6 +492,15 @@ func (s *RTCService) serve(w http.ResponseWriter, r *http.Request, needsJoinRequ
 		"selectedNodeID", cr.NodeID,
 		"nodeSelectionReason", cr.NodeSelectionReason,
 	)
+
+	// Track the connection by participant SID so a failed room node (detected
+	// via media gateway loss) can be surfaced as a signal disconnect to the
+	// client, triggering the reconnect + room re-homing migration (#51).
+	if pID != "" && pID != "unresolved" {
+		s.mu.Lock()
+		s.connsBySID[pID] = &rtcSignalConn{sigConn: sigConn, roomNodeID: cr.NodeID}
+		s.mu.Unlock()
+	}
 
 	// handle responses
 	go func() {
@@ -639,6 +662,74 @@ func (s *RTCService) DrainConnections(interval time.Duration) {
 		_ = c.Close()
 		<-t.C
 	}
+}
+
+// nodeFailureConfirmDelay is how long a media gateway loss must persist before
+// the anchored room node is treated as dead. Gateway sessions close on BOTH a
+// normal participant teardown (the room node closes the control channel) and a
+// failed room node; the room node's keepalive must go stale (selector.IsAvailable
+// uses a 5s window) before concluding it actually died — otherwise a graceful
+// teardown would be misread as a failure and the client's WS closed spuriously.
+var nodeFailureConfirmDelay = 7 * time.Second
+
+// OnGatewayLost is invoked by MediaRelay when a participant's media gateway
+// session on this edge node lost its control channel to the room node. When the
+// room node is merely draining / the participant is leaving, the psrpc signal
+// stream closes and the WS terminates normally — this is a no-op. When the room
+// node is dead (keepalive stale or unregistered), we close the client's WS so
+// it reconnects, SelectRoomNode re-homes the room, and the session recovers on a
+// live node (#51 room-node failure migration).
+func (s *RTCService) OnGatewayLost(sid string) {
+	pid := livekit.ParticipantID(sid)
+	s.mu.Lock()
+	info, ok := s.connsBySID[pid]
+	s.mu.Unlock()
+	if !ok {
+		return // session already gone
+	}
+
+	time.AfterFunc(nodeFailureConfirmDelay, func() {
+		s.mu.Lock()
+		info, ok = s.connsBySID[pid]
+		if !ok {
+			s.mu.Unlock()
+			return // the signal stream closed normally in the meantime
+		}
+		s.mu.Unlock()
+
+		node, err := s.router.GetNode(info.roomNodeID)
+		if err == nil && selector.IsAvailable(node) {
+			return // room node alive: normal teardown, the psrpc stream close handles the WS
+		}
+		if err != nil && !errors.Is(err, routing.ErrNotFound) {
+			logger.Warnw("could not check room node liveness on gateway loss", err, "sid", sid, "roomNodeID", info.roomNodeID)
+			return
+		}
+
+		// The room node is dead. Only one of the (dual-PC) gateway-loss callbacks
+		// wins the close: the first delete removes the SID, the second no-ops.
+		s.mu.Lock()
+		if _, ok := s.connsBySID[pid]; !ok {
+			s.mu.Unlock()
+			return
+		}
+		delete(s.connsBySID, pid)
+		sigConn := info.sigConn
+		s.mu.Unlock()
+
+		logger.Infow("nat room node lost; closing participant signal to trigger migration",
+			"sid", sid, "roomNodeID", info.roomNodeID)
+		// Best-effort Leave(RECONNECT) so the client knows to reconnect, then close.
+		_, _ = sigConn.WriteResponse(&livekit.SignalResponse{
+			Message: &livekit.SignalResponse_Leave{
+				Leave: &livekit.LeaveRequest{
+					CanReconnect: true,
+					Reason:       livekit.DisconnectReason_SIGNAL_CLOSE,
+				},
+			},
+		})
+		_ = sigConn.Close()
+	})
 }
 
 type connectionResult struct {

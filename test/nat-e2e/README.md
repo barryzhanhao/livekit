@@ -117,6 +117,7 @@ cd test/nat-e2e
 | perform-rpc | `RoomService.PerformRpc` 指向 NAT 参与者 → 数据通道已桥接（P0-2），RPC 请求经边缘 DC 出站；测试客户端无 RPC responder → 干净超时（`RpcError 1501 Connection timeout`）——**有界**、绝不挂起，固化为确定性回归断言 |
 | simulcast-switch | Go 客户端自含 **PLI 响应式 3 层 VP8 simulcast 发布者**（`simulcast.go`，3 RID + per-layer PLI→keyframe + SR）+ 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`）+ 层选择 0/1/2 + **forwarder 真正上切**（`upgrading layer` 到 1/2 + 各高层 `forwarded key frame`，P0-3 层锁释放的证明）。客户端码率仅诊断（上切后跨节点下行码率有吞吐限制，见已知限制） |
 | reconnect-resume | `reconnect=true` resume 协商路径：断信令后同 SID resume → 服务端走 `resuming RTC session`（`ResumeParticipant`）→ 客户端观察到**干净 resume**（`SignalResponse_Reconnect`，媒体继续）或干净拒绝（`SignalResponse_Leave` RECONNECT → 全量重连回退），媒体必恢复、绝不挂起 |
+| room-node-failure | **真实房主节点故障迁移（#51）**：房间钉在房主节点、媒体跨节点流动后，套件**强杀房主节点 pod**（`scale 0` + `force-delete`，无优雅排空/无 UnregisterNode，模拟真崩溃）→ 边缘检测到媒体网关控制通道断开 → `OnGatewayLost` 确认房主节点死亡（keepalive 过期/已摘除）→ 向客户端发 `Leave(RECONNECT)` 并关 WS（触发迁移）；套件同时验证**死节点被摘除**（`nodes` 清理）且**房间被重归**（`room_node_map` 离开死节点、落到存活节点）→ 客户端 reconnect=true resume 被干净拒绝（`STATE_MISMATCH`，房已不在）→ **同身份全量重连** → 房间在新节点重建（跨节点，`starting RTC session` signalNodeID≠nodeID）→ 发布者重发布 + 订阅者媒体恢复（客户端 PASS + redis 双断言） |
 | webhook-events | 服务端 webhook（HTTP 回调）路径：加入/发布/离开触发 `participant_joined`/`track_published`/`track_unpublished`/`participant_left`，POST 到集群内 receiver pod（`webhook-receiver.default.svc:8080/webhook`），receiver **验证 JWT sha256 签名**（0 rejected）后逐条记录（HMAC 签名验证端到端） |
 | subscriber-pli | 下行 RTCP 的 **PLI 路径**（keyframe 请求变体，与 NACK 互补）：订阅者发真 PLI → 房主 DownTrack 处理并请求发布者 keyframe（`sending PLI RTCP`，SSRC 重写修复的 PLI 证明——修复前边缘重写 SSRC 被 `p.MediaSSRC == d.ssrc` 丢弃） |
 | media-follows-signaling | 核心边界 IP 级证明：**媒体终止于信令节点（边缘）**——服务端 PC 跑在边缘（advertise_ip），客户端收到的远端 ICE candidate 必须携带边缘 IP（= WS hostname），绝不含房主 IP；断言 candidate 含边缘 IP + 媒体实际流动 |
@@ -222,9 +223,7 @@ GO-CLIENT SUMMARY: 45 passed, 0 failed
   每边缘的 node_ip/advertise_ip）+ 房间钉扎（`room_node_map`），任意边缘都能服务任意房间（
   `multi-edge`/`scale-stress` 已验证）。生产建议：k8s Service/Ingress 或 LiveKit 上游的
   region-based 路由做客户端→边缘分配；本套件直接指 IP 模拟。
-- **房主节点故障恢复（后续工作）**：房主节点重启会终止其承载的全部房间会话（无跨节点迁移）。
-  `simulate-node-failure` 只测"丢参与者"；`SimulateScenario_Migration` 未 E2E 覆盖。房间迁移
-  （跨节点重建）是独立特性，超出本轮范围。
+- **房主节点故障恢复（#51，已实现）**：房主节点崩溃（SIGKILL/强杀）时，边缘的媒体网关控制通道断开 → `OnGatewayLost` 延迟确认房主节点死亡（keepalive 过期/已被摘除，避免误判正常 teardown）→ 向客户端发 `Leave(RECONNECT)` 并关闭 WS（迁移触发）；配套**死节点周期摘除**（`RemoveDeadNodes` + `room_node_map` 清理，原仅启动时执行一次）+ `GetNodeForRoom` 对指向死/已摘除节点的 stale 映射惰性清理——join 立即重归到存活节点。`room-node-failure` 场景强杀房主节点后验证：客户端被迁移、房间重归（`room_node_map` 离开死节点）、resume 干净拒绝、同身份重连后媒体恢复。**跨节点会话迁移（已连接会话原节点不可恢复时由客户端重连驱动）是设计边界**：`simulate-node-failure` 仍只测"丢参与者"；`SimulateScenario_Migration` 协议路径由 `reconnect-resume` 覆盖。房间内活动参与者的**状态保真迁移**（无感知迁移）仍是独立特性，超出本轮范围。
 - **WHIP ICE-restart（上游协议库 bug，已加固）**：`PATCH If-Match:*`（RFC 9725 ICE restart）在 fork 中
   会触发上游 `livekit/protocol/sdp` `PatchICECredentialAndCandidatesIntoSDP` 的
   **mutate-while-ranging panic**（`sdp.go:695`，对带 candidate 的远端描述遍历删除时切片越界），
@@ -243,7 +242,7 @@ GO-CLIENT SUMMARY: 45 passed, 0 failed
 
 ## 生产级加固（本轮随 E2E 验证落地）
 
-以下加固已在本轮双节点实测全绿（`04-e2e.sh` 37/37 + `06-client-e2e.sh` 4/4，含重连/并发/长稳）：
+以下加固已在本轮双节点实测全绿（`04-e2e.sh` 37/37 + `06-client-e2e.sh` 全场景，含重连/并发/长稳/房主节点故障迁移）：
 
 - **远程控制通道请求超时**（`remote_transport.go`）：`request()` 增加 15s 上限，边缘 executor 卡死
   时房主协商干净失败而非永久阻塞（原实现 `<-respCh` 无超时）。
@@ -268,6 +267,19 @@ GO-CLIENT SUMMARY: 45 passed, 0 failed
   独立 scratch 镜像 + ClusterIP 服务（`webhook-receiver.default.svc:8080`），双节点经集群 DNS 可达
   （宿主机不同网段不可达）。`webhook-events` 场景断言 receiver 用 `webhook.ReceiveWebhookEvent`
   验证每个事件的 JWT sha256 签名（0 rejected）并记录 4 类生命周期事件。
+- **房主节点故障迁移（#51）**：
+  - `OnGatewayLost`（`rtcservice.go` + `mediarelay.go`）：边缘媒体网关的控制通道断开（房主节点
+    崩溃/强杀）时，`MediaRelay.unregisterGateway` 通知 RTCService；延迟 7s（`nodeFailureConfirmDelay`，
+    覆盖 `selector.IsAvailable` 的 5s 窗口）确认房主节点 keepalive 过期或已被摘除——正常 teardown
+    （房主节点存活时 psrpc 信号流正常关闭 WS）不会被误判——随后向客户端发 `Leave(RECONNECT)`
+    并关 WS，触发重连 + 房间重归。新增单测 `TestOnGatewayLost`（死节点关 WS / 存活节点不关 /
+    未注册节点关 / 无连接 no-op）。
+  - 死节点周期摘除（`redisrouter.go`）：`cleanupWorker` 每 10s 执行 `RemoveDeadNodes`（原仅启动时
+    一次）+ 清理 `room_node_map` 指向死节点的条目；`GetNodeForRoom` 对指向死/已摘除节点的 stale
+    映射惰性清理（返回 `ErrNotFound`，join 立即重归到存活节点）。摘除/清理均跳过当前节点自身，
+    避免负载下自身 stats 短暂过期导致自我迁移。
+  - 客户端 `room-node-failure` 场景 + 06 套件块：强杀房主节点 pod（`scale 0` + `force-delete`）后
+    验证客户端被迁移、死节点被摘除、房间重归到存活节点、resume 干净拒绝、同身份重连后媒体恢复。
 - **畸形 padding 防护**（`mediachannelrtp.go`）：padding 长度字节大于 payload 时清 Padding 标志，
   令 Marshal 成功而非每包报错（原实现 `Padding=true` + `PaddingSize=0` 触发 pion
   `errInvalidRTPPadding`）。
