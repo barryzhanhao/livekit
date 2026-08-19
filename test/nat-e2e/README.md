@@ -116,7 +116,7 @@ cd test/nat-e2e
 | turn-relay-only | 双客户端强制 `ICETransportPolicyRelay`（唯一候选类型 = TURN relay）→ **完整 ICE 经 TURN relay 建立**（分配 → permission → relayed socket STUN check → RTP/RTCP 全部穿透 relay）+ 媒体端到端流通 + 双端**选中候选对均为 relay**（`IsRelaySelectedOnAnyTransport`）。需 `allow_restricted_peer_cidrs`（集群内边缘 host candidate 是私有 IP；真网公网 IP 默认放行） |
 | reconnect | 发布者只断开信令 WS（PC 存活）→ 断连宽限窗口内**同身份**重新 join → 服务端移除重复参与者（`RemoveParticipant DuplicateIdentity`）→ 新参与者重发布 → 订阅者跨节点看到媒体恢复（真实客户端全量重连落到的结局） |
 | perform-rpc | `RoomService.PerformRpc` 指向 NAT 参与者 → 数据通道已桥接（P0-2），RPC 请求经边缘 DC 出站；测试客户端无 RPC responder → 干净超时（`RpcError 1501 Connection timeout`）——**有界**、绝不挂起，固化为确定性回归断言 |
-| simulcast-switch | Go 客户端自含 **PLI 响应式 3 层 VP8 simulcast 发布者**（`simulcast.go`，3 RID + per-layer PLI→keyframe + SR）+ 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`）+ 层选择 0/1/2 + **forwarder 真正上切**（`upgrading layer` 到 1/2 + 各高层 `forwarded key frame`，P0-3 层锁释放的证明）。客户端码率仅诊断（上切后跨节点下行码率有吞吐限制，见已知限制） |
+| simulcast-switch | Go 客户端自含 **PLI 响应式 3 层 VP8 simulcast 发布者**（`simulcast.go`，3 RID + per-layer PLI→keyframe + SR）+ 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`）+ 层选择 0/1/2 + **forwarder 真正上切**（`upgrading layer` 到 1/2 + 各高层 `forwarded key frame`）。**客户端下行码率断言复开**：LOW/MEDIUM/HIGH 实测 98/470/1560 kbps ≥ 阈值 60/300/1200（发布者 q≈96/h≈480/f≈1680；根因是测试客户端 `sfu/buffer.Buffer` pending 队列溢出 bug，已修，见已知限制） |
 | reconnect-resume | `reconnect=true` resume 协商路径：断信令后同 SID resume → 服务端走 `resuming RTC session`（`ResumeParticipant`）→ 客户端观察到**干净 resume**（`SignalResponse_Reconnect`，媒体继续）或干净拒绝（`SignalResponse_Leave` RECONNECT → 全量重连回退），媒体必恢复、绝不挂起 |
 | room-node-failure | **真实房主节点故障迁移（#51）**：房间钉在房主节点、媒体跨节点流动后，套件**强杀房主节点 pod**（`scale 0` + `force-delete`，无优雅排空/无 UnregisterNode，模拟真崩溃）→ 边缘检测到媒体网关控制通道断开 → `OnGatewayLost` 确认房主节点死亡（keepalive 过期/已摘除）→ 向客户端发 `Leave(RECONNECT)` 并关 WS（触发迁移）；套件同时验证**死节点被摘除**（`nodes` 清理）且**房间被重归**（`room_node_map` 离开死节点、落到存活节点）→ 客户端 reconnect=true resume 被干净拒绝（`STATE_MISMATCH`，房已不在）→ **同身份全量重连** → 房间在新节点重建（跨节点，`starting RTC session` signalNodeID≠nodeID）→ 发布者重发布 + 订阅者媒体恢复（客户端 PASS + redis 双断言） |
 | webhook-events | 服务端 webhook（HTTP 回调）路径：加入/发布/离开触发 `participant_joined`/`track_published`/`track_unpublished`/`participant_left`，POST 到集群内 receiver pod（`webhook-receiver.default.svc:8080/webhook`），receiver **验证 JWT sha256 签名**（0 rejected）后逐条记录（HMAC 签名验证端到端） |
@@ -207,12 +207,17 @@ GO-CLIENT SUMMARY: 45 passed, 0 failed
     （`SetSenderReportData`→`OnRtcpSenderReport`→forwarder `SetRefSenderReport`）。此前 publisher
     的 RTCP（尤其 SR，SFU 跨层时间戳对齐所需）**从不跨节点**——`getRefLayerRTPTimestamp` 拿不到
     sender report，上切失败。
-  - **残余限制（如实记录）**：上切后**下行码率不可靠**——跨节点下行投递在高码率层切换后偶发
-    停滞（上行投递实测约 20% 丢帧，疑似 mediaLoop/信道背压或下行 pacer 竞态，独立于 NAT 桥接
-    正确性，超出本轮范围）。因此 `simulcast-switch` 场景的确定性断言是**房主侧锚点**（3 层 up
-    plane + 层选择 0/1/2 + forwarder `upgrading layer` 到 1/2 + 各高层 keyframe 被转发），客户端
-    码率仅作诊断输出，不设硬性带宽带断言（避免 flake）。真实客户端（浏览器/FFmpeg 编码器）上行
-    稳定后下行码率断言可复开。
+  - **下行冻结根因（#：P0-3 残余已解决，测试客户端 buffer bug）**：上切后"下行码率不可靠"
+    排查定位为**测试客户端**的 `sfu/buffer.Buffer` pending 队列 bug，非 NAT 桥/服务器问题。
+    逐跳计数证明：发布者写入 = 边缘 pump 读取（up 100% 无损）、房主 TCP 写入 = 边缘 down-pump
+    读取（TCP 100% 无损）、边缘 bytesSent 持续增长（1.5MB+）、客户端 transport bytesReceived
+    持续增长（1.7MB+）——**下行包全部到达客户端 SRTP 层**，但 `track.ReadRTP()` 读到一半冻结。
+    根因：客户端 `track.ReadRTP()` 经 `sfu/buffer.Buffer.Read` 读 pending 队列 `pPackets`；入队
+    突发（加入时初始 HIGH 层 180pkt/s）使 reader 落后 >500 包触发 `MaxVideoPkts` 溢出截断，但
+    `lastPacketRead` 未随截断前移 → `len(pPackets) > lastPacketRead` 永假 → reader 永久阻塞。
+    修复：`buffer.go` 溢出截断时同步调整 `lastPacketRead`（`pkg/sfu/buffer/buffer.go`）。
+    因此 `simulcast-switch` 场景的客户端 bitrate 断言**复开**（LOW≥60 / MEDIUM≥300 / HIGH≥1200
+    kbps，发布者 q≈96/h≈480/f≈1680，实测 98/470/1560 稳定通过）；房主侧锚点断言保留。
 - **TURN relay（已闭环：#50 修复 + 集群内验证）**：`turn-relay-only` 场景现断言 relay-only
   `ICETransportPolicyRelay` 的**完整 ICE 连接经 TURN relay 建立**——双端强制 relay-only（无
   host/srflx 候选）+ 媒体端到端经 relay 流通 + 双端**选中候选对均为 relay**。根因此前记为

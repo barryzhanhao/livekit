@@ -25,6 +25,7 @@ import (
 	"math/rand"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -500,6 +501,7 @@ func (p *simulcastPublisher) mediaLoop(ctx context.Context) {
 	}
 
 	frame := 0
+	lastReport := time.Now()
 	ticker := time.NewTicker(time.Second / 30)
 	defer ticker.Stop()
 	for {
@@ -527,6 +529,17 @@ func (p *simulcastPublisher) mediaLoop(ctx context.Context) {
 				if err := writeVP8Frame(p, l, &seq[i], ts, frameData); err != nil {
 					return
 				}
+			}
+			// throughput diagnostic: per-layer write totals every ~3s, so the E2E
+			// can compare publisher writes against edge-pump reads / room-buffer
+			// packets to locate cross-node RTP loss.
+			if time.Since(lastReport) >= 3*time.Second {
+				lastReport = time.Now()
+				parts := make([]string, 0, len(p.layers))
+				for _, l := range p.layers {
+					parts = append(parts, fmt.Sprintf("%s=%d", l.rid, l.packets))
+				}
+				fmt.Printf("SIMCAST_PUBWRITE: %s frame=%d\n", strings.Join(parts, " "), frame)
 			}
 		}
 	}

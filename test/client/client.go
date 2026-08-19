@@ -1513,6 +1513,31 @@ func (c *RTCClient) processRemoteTrack(track *webrtc.TrackRemote) {
 	}
 }
 
+// SubscriberTransportStats returns the subscriber PeerConnection's transport
+// bytesSent/bytesReceived counters plus per-SSRC inbound RTP stream stats
+// (packetsReceived / packetsDiscarded). Diagnostic for the down-plane freeze:
+// transport bytesReceived growing while the track reader sees nothing points to
+// an SRTP-layer drop; the inbound-stream discarded counter names it.
+func (c *RTCClient) SubscriberTransportStats() (bytesSent, bytesReceived uint64, inbound map[uint32]struct{ Rx, Discarded uint32 }) {
+	inbound = make(map[uint32]struct{ Rx, Discarded uint32 })
+	if c.subscriber == nil {
+		return
+	}
+	stats := c.subscriber.GetStats()
+	for _, st := range stats {
+		switch ts := st.(type) {
+		case webrtc.TransportStats:
+			bytesSent, bytesReceived = ts.BytesSent, ts.BytesReceived
+		case webrtc.InboundRTPStreamStats:
+			inbound[uint32(ts.SSRC)] = struct{ Rx, Discarded uint32 }{
+				Rx:        ts.PacketsReceived,
+				Discarded: ts.PacketsDiscarded,
+			}
+		}
+	}
+	return
+}
+
 func (c *RTCClient) BytesReceived() uint64 {
 	var total uint64
 	c.lock.Lock()

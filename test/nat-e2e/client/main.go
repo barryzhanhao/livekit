@@ -26,6 +26,7 @@ import (
 
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
 	"github.com/pion/webrtc/v4"
 	"github.com/twitchtv/twirp"
 
@@ -1333,8 +1334,23 @@ func scenarioSimulcastSwitch(url, apiKey, apiSecret, room string) {
 		b0 := sub.BytesReceived()
 		time.Sleep(3 * time.Second)
 		b1 := sub.BytesReceived()
-		fmt.Printf("SIMULCAST_SWITCH: %s delta %d bytes (%d -> %d) over 3s ≈ %.0f kbps\n", step, b1-b0, b0, b1, float64(b1-b0)*8/3/1000)
+		fmt.Printf("SIMULCAST_SWITCH: t=%s %s delta %d bytes (%d -> %d) over 3s ≈ %.0f kbps\n", time.Now().Format("15:04:05.000"), step, b1-b0, b0, b1, float64(b1-b0)*8/3/1000)
+		// diagnostic: the subscriber PC's transport counters tell us whether the
+		// down-plane RTP actually reaches the client's pion (bytesReceived grows)
+		// vs being lost on the wire or dropped before the track reader.
+		bs, br, inbound := sub.SubscriberTransportStats()
+		fmt.Printf("SIMULCAST_SUBSTATS: %s subscriber transport bytesSent=%d bytesReceived=%d inbound=%v\n", step, bs, br, inbound)
 		return float64(b1-b0) * 8 / 3
+	}
+	// Layer bitrate floors (kbps): the publisher emits q≈96 / h≈480 / f≈1680.
+	// The subscriber must measure a rate in the layer's band — a hard assertion
+	// that the down-plane actually delivers the switched layer cross-node. The
+	// floor is ~60% of the emitted rate to absorb measurement jitter; below it
+	// the down-plane froze (the documented pre-fix P0-3 residual).
+	layerFloor := map[livekit.VideoQuality]float64{
+		livekit.VideoQuality_LOW:    60,
+		livekit.VideoQuality_MEDIUM: 300,
+		livekit.VideoQuality_HIGH:   1200,
 	}
 	check := func(step string, q livekit.VideoQuality) {
 		setQuality(q)
@@ -1342,13 +1358,19 @@ func scenarioSimulcastSwitch(url, apiKey, apiSecret, room string) {
 		// up-switch needs the forwarder's PLI → publisher keyframe → cross-node RTP
 		// round trip (~1s).
 		time.Sleep(4 * time.Second)
-		rate(step)
+		measured := rate(step) // bps
+		measuredKbps := measured / 1000
+		if measuredKbps < layerFloor[q] {
+			fmt.Printf("SIMULCAST_SWITCH: FAIL %s measured %.0f kbps < floor %.0f kbps\n", step, measuredKbps, layerFloor[q])
+			os.Exit(1)
+		}
+		fmt.Printf("SIMULCAST_SWITCH: ✓ %s measured %.0f kbps >= floor %.0f kbps\n", step, measuredKbps, layerFloor[q])
 	}
 
 	check("LOW", livekit.VideoQuality_LOW)
 	check("MEDIUM", livekit.VideoQuality_MEDIUM)
 	check("HIGH", livekit.VideoQuality_HIGH)
-	fmt.Println("SIMULCAST_SWITCH: PASS (LOW→MEDIUM→HIGH requested; up-switch proven by room-side 'upgrading layer' + 'forwarded key frame' anchors)")
+	fmt.Println("SIMULCAST_SWITCH: PASS (LOW→MEDIUM→HIGH delivered cross-node at layer-appropriate bitrate; room-side 'upgrading layer' + 'forwarded key frame' anchors prove the up-switch)")
 }
 
 // scenarioReconnectResume: the reconnect=true resume negotiation path. The pub
@@ -2271,6 +2293,11 @@ func scenarioRoomMoveForward(url, apiKey, apiSecret, room string) {
 }
 
 func main() {
+	// Surface the client's pion-stack warnings/errors (track drops, SRTP, etc.)
+	// to stdout so client-side failures are visible in the E2E suite, while
+	// keeping normal-flow INFO logs (full SDP dumps) out of the noise.
+	logger.InitFromConfig(&logger.Config{Level: "warn"}, "nat-e2e-client")
+
 	// match the official test harness: register prometheus metrics so the RTC
 	// client's telemetry hooks don't dereference nil counters.
 	if err := prometheus.Init("nat-e2e-client", livekit.NodeType_SERVER); err != nil {

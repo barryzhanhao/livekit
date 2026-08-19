@@ -1588,6 +1588,13 @@ func (t *PCTransport) GetICEConnectionInfo() *types.ICEConnectionInfo {
 	return t.connectionDetails.GetInfo()
 }
 
+// GetStats exposes the underlying pion PeerConnection's stats report.
+// Diagnostic: lets a client inspect transport-level bytesSent/bytesReceived to
+// distinguish down-plane RTP lost on the wire from drops inside pion.
+func (t *PCTransport) GetStats() webrtc.StatsReport {
+	return t.pc.GetStats()
+}
+
 func (t *PCTransport) GetICEConnectionType() types.ICEConnectionType {
 	return t.connectionDetails.GetConnectionType()
 }

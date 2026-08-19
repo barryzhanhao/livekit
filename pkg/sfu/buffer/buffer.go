@@ -191,6 +191,18 @@ func (b *Buffer) Write(pkt []byte) (n int, err error) {
 		overflow := len(b.pPackets) - max(b.BufferBase.MaxVideoPkts(), b.BufferBase.MaxAudioPkts())
 		if overflow > 0 {
 			startIdx = overflow
+			// The overflow trims the OLDEST packets off the front; shift the
+			// reader's position so it keeps consuming from the retained tail.
+			// Without this, a reader that fell behind (e.g. a burst at join)
+			// is left with lastPacketRead >= len(pPackets) and blocks forever,
+			// silently freezing the stream even after the backlog clears.
+			if b.lastPacketRead > 0 {
+				if b.lastPacketRead >= overflow {
+					b.lastPacketRead -= overflow
+				} else {
+					b.lastPacketRead = 0
+				}
+			}
 		}
 		b.pPackets = append(b.pPackets[startIdx:], pendingPacket{
 			packet:      packet,

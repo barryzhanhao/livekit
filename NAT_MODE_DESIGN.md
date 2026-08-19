@@ -34,7 +34,7 @@
 | 验证 | 真节点端到端验证：双节点 kind K8s 复现套件 `test/nat-e2e/`（20/20 断言绿，含 `--loss 5%` WAN 丢包）。覆盖 NAT split、上下行媒体面（H264 simulcast 30fps 实测）、RTCP 双向、dual-PC、数据通道、质量反馈跨节点 | ✅ |
 | 3e | 订阅/选层/拥塞控制跨节点同步：本架构 SubscriptionManager/dynacast/stream-allocator/pacer 全在房主节点，选层/订阅本就本地决策，无需跨节点同步；跨节点反馈（REMB/NACK/PLI/RR/TWCC）已由 3e-1/3e-2 的 RTCP 通道覆盖 | ✅（剩余即真节点验证） |
 | 3e-5 | **publisher 上行 RTCP 桥（P0-3 根因修复）**：边缘网关 `pumpReceiverRTCPToMediaChannel`（读 publisher RTPReceiver 的 SR/RR 上行写 MediaChannel）+ 房主 `handleRemotePublishedTrack` 把 up MediaChannel RTCP 灌入 buffer rtcpReader（`SetSenderReportData`→`OnRtcpSenderReport`→forwarder `SetRefSenderReport`）。此前 publisher 的 RTCP（尤其 SR）从不跨节点 → `getRefLayerRTPTimestamp` 无 sender report → 层切换（上切/下切）失败 | ✅ 接线 + E2E |
-| 验证 | P0-3 simulcast 上切端到端：`test/nat-e2e/client/simulcast.go`（raw-pion 3-RID VP8 + per-layer PLI→keyframe + 250ms SR）→ forwarder `upgrading layer` 到 1/2 + 各高层 `forwarded key frame`（06 脚本断言）。残余：上切后跨节点下行码率吞吐限制（见 §6.8） | ✅（桥接/上切锚点）+ ⏳（下行码率） |
+| 验证 | P0-3 simulcast 上切端到端：`test/nat-e2e/client/simulcast.go`（raw-pion 3-RID VP8 + per-layer PLI→keyframe + 250ms SR）→ forwarder `upgrading layer` 到 1/2 + 各高层 `forwarded key frame`（06 脚本断言）+ **客户端下行 bitrate 断言**（LOW/MEDIUM/HIGH ≥ 60/300/1200 kbps，实测 98/470/1560；根因 `sfu/buffer.Buffer` pending 队列溢出 bug 已修） | ✅ |
 | 3f-1 | 房主节点故障迁移触发（#51）：边缘 `MediaRelay.unregisterGateway` → `RTCService.OnGatewayLost`（延迟 7s 确认房主节点 keepalive 过期/已被摘除，避免误判正常 teardown）→ 向客户端发 `Leave(RECONNECT)` + 关 WS，客户端重连并驱动房间重归 | ✅ 接线 + E2E |
 | 3f-2 | 死节点周期摘除：`RedisRouter.cleanupWorker`（每 10s：`RemoveDeadNodes` + `room_node_map` 指向死节点的条目清理）+ `GetNodeForRoom` 对 stale 映射惰性清理（返回 `ErrNotFound`，join 立即重归到存活节点） | ✅ 接线 + E2E |
 | 验证 | 房主节点故障迁移端到端（#51）：`room-node-failure` 场景**强杀房主节点 pod**（scale 0 + force-delete）→ 客户端 `SIGNAL_CLOSE` 断开 → 死节点被摘除 + 房间重归（`room_node_map` 落到存活节点）→ resume 干净拒绝（`STATE_MISMATCH`）→ 同身份全量重连后房间在新节点重建（跨节点，signalNodeID≠nodeID）+ 媒体恢复 | ✅ |
@@ -269,8 +269,13 @@ type gatewayUpTrack struct {
   在 per-layer PLI 时发该层关键帧 + 250ms 周期 RTCP Sender Report；forwarder 层锁释放并上切
   （房主日志 `upgrading layer`→1/2 + 各高层 `forwarded key frame`）。**关键产品修复**：publisher
   上行 RTCP 桥（见进度表末行 + 3e）——此前 publisher 的 SR/RR 不跨节点，`getRefLayerRTPTimestamp`
-  拿不到 sender report，任何层切换（含下切）都失败。残余：上切后跨节点下行码率有吞吐限制
-  （上行约 20% 丢帧，疑似 mediaLoop/信道背压或 pacer 竞态，独立于桥接正确性，另行专项）。
+  拿不到 sender report，任何层切换（含下切）都失败。**下行冻结根因（已解决）**：逐跳计数证明
+  跨节点桥 100% 无损（发布者写入 = 边缘 pump 读取、房主 TCP 写入 = 边缘 down-pump 读取、边缘
+  bytesSent 与客户端 transport bytesReceived 持续增长），冻结在**测试客户端** `track.ReadRTP()`
+  经 `sfu/buffer.Buffer.Read` 读 pending 队列处——入队突发（加入时初始 HIGH 层）使 reader 落后
+  >500 包触发 `MaxVideoPkts` 溢出截断，`lastPacketRead` 未随截断前移 → 永久阻塞。修复：`buffer.go`
+  溢出截断时同步调整 `lastPacketRead`。客户端下行 bitrate 断言已复开（LOW/MEDIUM/HIGH ≥ 60/300/1200
+  kbps，实测 98/470/1560）。
 
 ### 6.9 分步实现（每步可独立合入、单节点零回归）
 
