@@ -188,17 +188,15 @@ GO-CLIENT SUMMARY: 43 passed, 0 failed
   重跑）使其确定性通过。生产级改进方向：核查边缘控制 accept 的并发建立与 room 的
   `establishRemoteSession` 背压。
 - **数据通道（P0-2 桥接代码已落地，端到端待修）**：控制协议新增 `send_data_message`/`event_data_message`，边缘 executor 双向转发 + 房主 participant 接入房间广播（协议单测 `TestRemotePCDataChannelBridgingProtocol` 通过）。**端到端 client→room 方向仍被 pion 数据通道 stream-ID 匹配阻塞**：边缘上房主创建的 subscriber DC（奇数 stream ID）与客户端 offerer 创建的 publisher DC 不配对，客户端数据落入未接线的 SCTP 流——需专项核查（很可能需让 publisher PC 不创建 DC、只匹配客户端 offer 的 DC）。`data` 场景记录当前行为。
-- **simulcast 上切受限（精确诊断）**：MediaGateway 修复后 3 层 RTP 已能全部跨节点（`available
-  layers changed` 达 `[0,1,2]`），且 **下切**（HIGH→LOW）可真实生效（客户端码率从 ~800kbps 骤降到
-  ~150kbps）、DownTrack max-subscribed 层随请求 0/1/2 正确应用。**下切后再上切**（LOW→MEDIUM）卡进
-  层锁 PLI 循环（`sending PLI for layer lock` 每 200ms、目标层 keyframe 无法 latch、媒体冻结）。
-  受控复现的链条证据：订阅者请求到达 `SubscribedTrack`（`applying subscriber track settings` 显示
-  HIGH→LOW→MEDIUM→HIGH）→ 但 DownTrack `setting max spatial layer` 与 dynacast
-  `setting subscriber max quality` 常不触发（只 HIGH/OFF）→ `sending max subscribed quality`（发回
-  发布者）只发一次 → 发布者（lk）从不重新启用 MEDIUM/HIGH → 目标层 RTP 停滞、层锁永不 latch。
-  这是 dynacast 层传播 + 层锁的**间歇性**交互（同一场景时而全通、时而断裂），需在房主侧核查
-  max-layer 变更到 dynacast 的通知链；`simulcast-switch` 场景断言确定性的部分（3 层 up plane +
-  层选择 0/1/2 + 下切生效）。
+- **simulcast 上切受限（根因已定：发布者 per-layer keyframe 响应，非 NAT bug）**：受控复现证明
+  **NAT 跨节点路径完好**——订阅者 TrackSettings 到达 `SubscribedTrack`、`GetSpatialLayerForVideoQuality`
+  正确映射（LOW→0/MEDIUM→1/HIGH→2）、forwarder `SetMaxSpatialLayer` 正确变更 max（2→0→1→2）、
+  层锁 PLI **跨节点送达**（`nat up RTCP forwarded` 含多层 SSRC 99059724/730466811）。**卡点**：
+  forwarder 层锁等待目标层 keyframe 时，`lk --publish-demo` 发布者**不响应 per-layer PLI**
+  （实测 LOW 请求后 12s 媒体仍 0 bytes、PLI 循环 80 次）→ 目标层 keyframe 永不 latch。这是
+  **测试发布者限制**（demo 编码器不按层响应 PLI），真实编码器/PLI 响应客户端（Go 客户端需 3 层
+  simulcast 发布，SDK 工作另行专项）可打通。`simulcast-switch` 场景断言确定性的部分（3 层 up plane
+  + 层选择 0/1/2 + down-switch 生效）。
 - **TURN relay（分配正常、relay-only ICE 环境限制）**：`turn-credentials` 场景现已断言客户端
   **实际分配** relay candidate（`HasRelayCandidate`，join 响应凭据 → 房主节点 TURN `ALLOCATE OK
   relayed: 192.168.107.4:50013`，跨节点分配路径验证）。但 **relay-only**（`ICETransportPolicyRelay`）
