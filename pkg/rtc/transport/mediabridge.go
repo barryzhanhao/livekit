@@ -54,6 +54,7 @@ func pumpMediaChannelToTrackLocal(src MediaChannel, dst rtpPacketWriter) {
 			continue
 		}
 		if err := dst.WriteRTP(&pkt); err != nil {
+			logger.Warnw("nat edge down write rtp failed", err, "ssrc", pkt.SSRC, "ts", pkt.Timestamp, "sn", pkt.SequenceNumber, "len", len(raw))
 			return
 		}
 	}
@@ -97,6 +98,36 @@ func pumpSenderRTCPToMediaChannel(sender *webrtc.RTPSender, dst MediaChannel) {
 		}
 		logger.Debugw("nat edge -> room down RTCP forwarded", "pkts", len(pkts), "types", rtcpTypes(pkts))
 		if err := dst.WriteRTCP(data); err != nil {
+			return
+		}
+	}
+}
+
+// rtcpSimulcastReader is the narrow source for inbound RTCP on the edge node.
+// webrtc.RTPReceiver satisfies it. ReadSimulcast (not ReadRTCP) is required:
+// simulcast layers share one RTPReceiver and pion's Read()/ReadRTCP() panics on
+// a multi-track receiver.
+type rtcpSimulcastReader interface {
+	ReadSimulcast(b []byte, rid string) (n int, a interceptor.Attributes, err error)
+}
+
+// pumpReceiverRTCPToMediaChannel reads RTCP for a publisher's layer (SR/RR/NACK
+// sent by the client, demuxed by RID) and writes it into the up-direction
+// MediaChannel bound for the room node. This is the NAT-mode up-direction RTCP
+// path (publisher → edge → room). It mirrors the down-direction sender pump
+// (pumpSenderRTCPToMediaChannel) and is what lets the SFU learn each simulcast
+// layer's RTCP Sender Report for cross-layer timestamp alignment.
+func pumpReceiverRTCPToMediaChannel(receiver rtcpSimulcastReader, rid string, dst MediaChannel) {
+	buf := make([]byte, 65535)
+	for {
+		n, _, err := receiver.ReadSimulcast(buf, rid)
+		if err != nil {
+			return
+		}
+		if pkts, uerr := rtcp.Unmarshal(buf[:n]); uerr == nil {
+			logger.Debugw("nat edge -> room up RTCP forwarded", "pkts", len(pkts), "types", rtcpTypes(pkts))
+		}
+		if err := dst.WriteRTCP(buf[:n]); err != nil {
 			return
 		}
 	}

@@ -33,6 +33,8 @@
 | 3e-4 | dual-PC 双会话：`SubscriberRemoteControlChannel`/`SubscriberRemotePeerConnection` + `StartSession` 为 dual-PC 建 publisher/subscriber 两个远程会话（`IsOfferer` 区分方向） | ✅ 接线 |
 | 验证 | 真节点端到端验证：双节点 kind K8s 复现套件 `test/nat-e2e/`（20/20 断言绿，含 `--loss 5%` WAN 丢包）。覆盖 NAT split、上下行媒体面（H264 simulcast 30fps 实测）、RTCP 双向、dual-PC、数据通道、质量反馈跨节点 | ✅ |
 | 3e | 订阅/选层/拥塞控制跨节点同步：本架构 SubscriptionManager/dynacast/stream-allocator/pacer 全在房主节点，选层/订阅本就本地决策，无需跨节点同步；跨节点反馈（REMB/NACK/PLI/RR/TWCC）已由 3e-1/3e-2 的 RTCP 通道覆盖 | ✅（剩余即真节点验证） |
+| 3e-5 | **publisher 上行 RTCP 桥（P0-3 根因修复）**：边缘网关 `pumpReceiverRTCPToMediaChannel`（读 publisher RTPReceiver 的 SR/RR 上行写 MediaChannel）+ 房主 `handleRemotePublishedTrack` 把 up MediaChannel RTCP 灌入 buffer rtcpReader（`SetSenderReportData`→`OnRtcpSenderReport`→forwarder `SetRefSenderReport`）。此前 publisher 的 RTCP（尤其 SR）从不跨节点 → `getRefLayerRTPTimestamp` 无 sender report → 层切换（上切/下切）失败 | ✅ 接线 + E2E |
+| 验证 | P0-3 simulcast 上切端到端：`test/nat-e2e/client/simulcast.go`（raw-pion 3-RID VP8 + per-layer PLI→keyframe + 250ms SR）→ forwarder `upgrading layer` 到 1/2 + 各高层 `forwarded key frame`（06 脚本断言）。残余：上切后跨节点下行码率吞吐限制（见 §6.8） | ✅（桥接/上切锚点）+ ⏳（下行码率） |
 
 ## 1. 目标与范围
 
@@ -258,6 +260,12 @@ type gatewayUpTrack struct {
 - **数据通道(SCTP)**：已跨节点打通（P0-2）：边缘 executor 在 DC open 时 `DetachWithDeadline` +
   `ReadDataChannel` 泵入 `event_data_message`（服务端全局 `se.DetachDataChannels()` 使 pion 不跑
   OnMessage 读循环，故不能依赖 `dc.OnMessage`）。下行经 `send_data_message` → 边缘 `SendText`。
+- **simulcast 上切（P0-3）**：已打通——PLI 响应式 3 层发布者（`test/nat-e2e/client/simulcast.go`）
+  在 per-layer PLI 时发该层关键帧 + 250ms 周期 RTCP Sender Report；forwarder 层锁释放并上切
+  （房主日志 `upgrading layer`→1/2 + 各高层 `forwarded key frame`）。**关键产品修复**：publisher
+  上行 RTCP 桥（见进度表末行 + 3e）——此前 publisher 的 SR/RR 不跨节点，`getRefLayerRTPTimestamp`
+  拿不到 sender report，任何层切换（含下切）都失败。残余：上切后跨节点下行码率有吞吐限制
+  （上行约 20% 丢帧，疑似 mediaLoop/信道背压或 pacer 竞态，独立于桥接正确性，另行专项）。
 
 ### 6.9 分步实现（每步可独立合入、单节点零回归）
 

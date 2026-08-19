@@ -115,7 +115,7 @@ cd test/nat-e2e
 | turn-credentials | 启用内嵌 TURN（UDP 3478）→ join 响应经 `iceServersForParticipant` 携带 TURN URL + 非空用户名/凭据，且客户端**实际分配** relay candidate（`HasRelayCandidate`，跨节点 `ALLOCATE OK`）；relay-only 完整连接受 Docker/kind 环境限制（见已知限制） |
 | reconnect | 发布者只断开信令 WS（PC 存活）→ 断连宽限窗口内**同身份**重新 join → 服务端移除重复参与者（`RemoveParticipant DuplicateIdentity`）→ 新参与者重发布 → 订阅者跨节点看到媒体恢复（真实客户端全量重连落到的结局） |
 | perform-rpc | `RoomService.PerformRpc` 指向 NAT 参与者 → 数据通道已桥接（P0-2），RPC 请求经边缘 DC 出站；测试客户端无 RPC responder → 干净超时（`RpcError 1501 Connection timeout`）——**有界**、绝不挂起，固化为确定性回归断言 |
-| simulcast-switch | 真实 3 层 simulcast（`lk --publish-demo` 发 3-SSRC H264）+ Go 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`，MediaGateway 修复的证明）+ DownTrack max-subscribed 层随请求 0/1/2（层选择路径）；下切可真实生效（客户端码率骤降）、上切受层锁 PLI 限制（见已知限制） |
+| simulcast-switch | Go 客户端自含 **PLI 响应式 3 层 VP8 simulcast 发布者**（`simulcast.go`，3 RID + per-layer PLI→keyframe + SR）+ 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`）+ 层选择 0/1/2 + **forwarder 真正上切**（`upgrading layer` 到 1/2 + 各高层 `forwarded key frame`，P0-3 层锁释放的证明）。客户端码率仅诊断（上切后跨节点下行码率有吞吐限制，见已知限制） |
 | reconnect-resume | `reconnect=true` resume 协商路径：断信令后同 SID resume → 服务端走 `resuming RTC session`（`ResumeParticipant`）→ 客户端观察到**干净 resume**（`SignalResponse_Reconnect`，媒体继续）或干净拒绝（`SignalResponse_Leave` RECONNECT → 全量重连回退），媒体必恢复、绝不挂起 |
 | webhook-events | 服务端 webhook（HTTP 回调）路径：加入/发布/离开触发 `participant_joined`/`track_published`/`track_unpublished`/`participant_left`，POST 到集群内 receiver pod（`webhook-receiver.default.svc:8080/webhook`），receiver **验证 JWT sha256 签名**（0 rejected）后逐条记录（HMAC 签名验证端到端） |
 | subscriber-pli | 下行 RTCP 的 **PLI 路径**（keyframe 请求变体，与 NACK 互补）：订阅者发真 PLI → 房主 DownTrack 处理并请求发布者 keyframe（`sending PLI RTCP`，SSRC 重写修复的 PLI 证明——修复前边缘重写 SSRC 被 `p.MediaSSRC == d.ssrc` 丢弃） |
@@ -190,15 +190,27 @@ GO-CLIENT SUMMARY: 45 passed, 0 failed
   重跑）使其确定性通过。生产级改进方向：核查边缘控制 accept 的并发建立与 room 的
   `establishRemoteSession` 背压。
 - **数据通道（P0-2 跨节点打通）**：控制协议新增 `send_data_message`/`event_data_message`，边缘 executor 双向转发 + 房主 participant 接入房间广播（协议单测 `TestRemotePCDataChannelBridgingProtocol` + 真实 pion 集成测试 `TestRemotePCExecutorDataChannelWire` 通过）。**端到端根因与修复**：服务端在 `transport.go` 对每个 PC 全局 `se.DetachDataChannels()`，pion 对 detached DC **不启动 OnMessage 读循环**——因此边缘 `wireDataChannel` 里 `dc.OnMessage` 永远不会触发（客户端 offerer 的 DC 虽然配对、open，但数据停留在 SCTP 重排队列）。修复：`wireDataChannel` 在 DC open 时 `DetachWithDeadline` 并用 `ReadDataChannel` 泵入 `event_data_message`（与 PCTransport 自身读 detached 通道一致）。`data` 场景现断言**必须跨节点收到**。
-- **simulcast 上切受限（根因已定：发布者 per-layer keyframe 响应，非 NAT bug）**：受控复现证明
-  **NAT 跨节点路径完好**——订阅者 TrackSettings 到达 `SubscribedTrack`、`GetSpatialLayerForVideoQuality`
+- **simulcast 上切（P0-3：已从"层锁死循环"打通到"上切生效"，残余下行吞吐限制）**：受控复现
+  证明 **NAT 跨节点路径完好**——订阅者 TrackSettings 到达 `SubscribedTrack`、`GetSpatialLayerForVideoQuality`
   正确映射（LOW→0/MEDIUM→1/HIGH→2）、forwarder `SetMaxSpatialLayer` 正确变更 max（2→0→1→2）、
-  层锁 PLI **跨节点送达**（`nat up RTCP forwarded` 含多层 SSRC 99059724/730466811）。**卡点**：
-  forwarder 层锁等待目标层 keyframe 时，`lk --publish-demo` 发布者**不响应 per-layer PLI**
-  （实测 LOW 请求后 12s 媒体仍 0 bytes、PLI 循环 80 次）→ 目标层 keyframe 永不 latch。这是
-  **测试发布者限制**（demo 编码器不按层响应 PLI），真实编码器/PLI 响应客户端（Go 客户端需 3 层
-  simulcast 发布，SDK 工作另行专项）可打通。`simulcast-switch` 场景断言确定性的部分（3 层 up plane
-  + 层选择 0/1/2 + down-switch 生效）。
+  层锁 PLI **跨节点送达**（`nat up RTCP forwarded` 含多层 SSRC）。**原卡点**：`lk --publish-demo`
+  发布者不响应 per-layer PLI（目标层 keyframe 永不 latch → 上切死循环）。**本轮修复**：
+  - **PLI 响应式 3 层 VP8 发布者**（`client/simulcast.go`，raw-pion）：3 RID（q/h/f）同 m-line
+    simulcast、per-RID `ReadSimulcastRTCP` 收到 PLI 即在该层发关键帧、统一 90kHz RTP 时钟（真实
+    编码器行为）、250ms 周期发 RTCP Sender Report。替换 `lk` 后 forwarder **真正上切**：房主日志
+    `upgrading layer` 到 layer 1/2 + `forwarded key frame` layer 1/2 均出现（06 脚本断言）。
+  - **打通 publisher 上行 RTCP 桥（真实 NAT 缺口，生产代码）**：边缘网关新增
+    `pumpReceiverRTCPToMediaChannel`（读 publisher 的 SR/RR 上行写 MediaChannel），房主
+    `handleRemotePublishedTrack` 新增把 up MediaChannel RTCP 灌入 receiver 的 rtcpReader
+    （`SetSenderReportData`→`OnRtcpSenderReport`→forwarder `SetRefSenderReport`）。此前 publisher
+    的 RTCP（尤其 SR，SFU 跨层时间戳对齐所需）**从不跨节点**——`getRefLayerRTPTimestamp` 拿不到
+    sender report，上切失败。
+  - **残余限制（如实记录）**：上切后**下行码率不可靠**——跨节点下行投递在高码率层切换后偶发
+    停滞（上行投递实测约 20% 丢帧，疑似 mediaLoop/信道背压或下行 pacer 竞态，独立于 NAT 桥接
+    正确性，超出本轮范围）。因此 `simulcast-switch` 场景的确定性断言是**房主侧锚点**（3 层 up
+    plane + 层选择 0/1/2 + forwarder `upgrading layer` 到 1/2 + 各高层 keyframe 被转发），客户端
+    码率仅作诊断输出，不设硬性带宽带断言（避免 flake）。真实客户端（浏览器/FFmpeg 编码器）上行
+    稳定后下行码率断言可复开。
 - **TURN relay（分配正常、relay-only ICE 环境限制）**：`turn-credentials` 场景现已断言客户端
   **实际分配** relay candidate（`HasRelayCandidate`，join 响应凭据 → 房主节点 TURN `ALLOCATE OK
   relayed: 192.168.107.4:50013`，跨节点分配路径验证）。但 **relay-only**（`ICETransportPolicyRelay`）

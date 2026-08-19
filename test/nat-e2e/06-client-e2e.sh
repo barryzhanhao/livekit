@@ -344,44 +344,43 @@ ROOM_RPC="${ROOM_GO}-rpc"
 seed_room_map "$ROOM_RPC"
 if run_scenario perform-rpc yes "$ROOM_RPC"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
-# simulcast-switch: REAL 3-layer layer switching. lk publishes 3-layer H264
-# simulcast (publish-demo, identity go-sim-lk-pub); the Go subscriber requests
-# LOW then MEDIUM/HIGH via UpdateTrackSettings. Two room-side proofs, both scoped
-# to this scenario's participants so earlier scenarios (quality-request, single
-# layer) cannot satisfy them:
-#   (a) the room received all 3 simulcast up planes cross-node — `available layers
-#       changed - layer seen` reaching [0,1,2] for go-sim-lk-pub. This is the
-#       MediaGateway fix's proof: each simulcast layer now bridges on its own
-#       MediaChannel (previously only the first layer's RTP crossed the boundary).
-#   (b) the DownTrack's max subscribed spatial followed the client's requests —
-#       `setting max spatial layer` shows layers 0, 1, 2 for go-sim-sub (the real
-#       down-switch to LOW + selection applied through MEDIUM/HIGH).
-# The client drives the requests and keeps the session alive (client-side media
-# BITRATE assertions are not reliable: an up-switch after a down-switch stalls the
-# forwarder in a layer-lock PLI loop cross-node, documented limitation).
+# simulcast-switch: P0-3. The Go client now publishes 3-layer VP8 simulcast
+# itself (raw-pion, PLI-responsive — simulcast.go), so the forwarder's up-switch
+# layer-lock can actually release (the lk demo publisher only keyframes consumed
+# layers → up-switch stalled forever). The client drives LOW→MEDIUM→HIGH and the
+# deterministic proofs are room-side:
+#   (a) the room received all 3 simulcast up planes cross-node — `available
+#       layers changed - layer seen` reaching [0,1,2] for go-sim-go-pub.
+#   (b) the DownTrack's max subscribed spatial followed the requests — `setting
+#       max spatial layer` 0, 1, 2 for go-sim-sub.
+#   (c) the forwarder actually up-switched cross-node — `upgrading layer`
+#       reaching layer 2 AND `forwarded key frame` with layer 1 AND layer 2 for
+#       go-sim-sub (the layer-lock released and each higher layer's keyframe was
+#       forwarded). The client asserts media kept flowing (did not freeze).
+# Cross-node BITRATE bands are not asserted (allocator/down-plane timing is
+# non-deterministic after an up-switch — see README); the room-side anchors are
+# the authoritative P0-3 proof.
 ROOM_SIM="${ROOM_GO}-simulcast"
 seed_room_map "$ROOM_SIM"
-lk join-room --url "$WS_URL" --api-key "$API_KEY" --api-secret "$API_SECRET" \
-  -r "$ROOM_SIM" -i go-sim-lk-pub --publish-demo --fps 30 >"$WORK/lk-sim.log" 2>&1 &
-LK_SIM_PID=$!
 if run_scenario simulcast-switch yes "$ROOM_SIM"; then
-  if wait_log room 'available layers changed - layer seen' 60 && wait_log room 'setting max spatial layer' 60; then
-    layers3="$(room_logs --since=3m | grep 'available layers changed - layer seen' | grep 'go-sim-lk-pub' | grep -o '\[0, 1, 2\]' | head -1)"
-    layers="$(room_logs --since=3m | grep 'setting max spatial layer' | grep 'go-sim-sub' | grep -o '"layer": *[0-9]*' | grep -o '[0-9]*' | sort -u | tr '\n' ' ')"
-    if [ -n "$layers3" ] && echo " $layers " | grep -q ' 0 ' && echo " $layers " | grep -q ' 1 ' && echo " $layers " | grep -q ' 2 '; then
-      echo "  ✓ SIMULCAST-SWITCH: 3-layer up-plane cross-node + applied layer selection {0,1,2} (observed: $layers)"
+  if wait_log room 'available layers changed - layer seen' 60 && wait_log room 'upgrading layer' 60; then
+    layers3="$(room_logs --since=4m | grep 'available layers changed - layer seen' | grep 'go-sim-go-pub' | grep -o '\[0, 1, 2\]' | head -1)"
+    layers="$(room_logs --since=4m | grep 'setting max spatial layer' | grep 'go-sim-sub' | grep -o '"layer": *[0-9]*' | grep -o '[0-9]*' | sort -u | tr '\n' ' ')"
+    upgr="$(room_logs --since=4m | grep 'upgrading layer' | grep 'go-sim-sub' | grep -o '"current": "VideoLayer{s: [0-9-]*' | grep -o '[0-9]*' | sort -u | tr '\n' ' ')"
+    kf1="$(room_logs --since=4m | grep 'forwarded key frame' | grep 'go-sim-sub' | grep -o '"layer": [0-9]*' | grep -o '[0-9]*' | sort -u | tr '\n' ' ')"
+    if [ -n "$layers3" ] && echo " $layers " | grep -q ' 0 ' && echo " $layers " | grep -q ' 1 ' && echo " $layers " | grep -q ' 2 ' \
+      && echo " $upgr " | grep -q ' 2 ' && echo " $kf1 " | grep -q ' 1 ' && echo " $kf1 " | grep -q ' 2 '; then
+      echo "  ✓ SIMULCAST-SWITCH: 3 up-planes [0,1,2] + applied {0,1,2} + forwarder upgraded to layer 2 (upgraded: $upgr, keyframes on layers: $kf1)"
       PASS=$((PASS+1))
     else
-      echo "  ✗ SIMULCAST-SWITCH: layers3=[$layers3] applied=($layers)"; FAIL=$((FAIL+1))
+      echo "  ✗ SIMULCAST-SWITCH: layers3=[$layers3] applied=($layers) upgraded=($upgr) keyframes=($kf1)"; FAIL=$((FAIL+1))
     fi
   else
-    echo "  ✗ SIMULCAST-SWITCH: room logs missing layer anchors"; FAIL=$((FAIL+1))
+    echo "  ✗ SIMULCAST-SWITCH: room logs missing up-plane/upgrade anchors"; FAIL=$((FAIL+1))
   fi
 else
   FAIL=$((FAIL+1))
 fi
-kill -9 "$LK_SIM_PID" 2>/dev/null || true
-wait "$LK_SIM_PID" 2>/dev/null || true
 
 # reconnect-resume: the reconnect=true resume negotiation path. The publisher
 # drops its signal WS (PCs alive), then reconnects the signal with reconnect=true

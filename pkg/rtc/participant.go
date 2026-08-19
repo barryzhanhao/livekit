@@ -4338,11 +4338,30 @@ func (p *ParticipantImpl) handleRemotePublishedTrack(ev remoteTrackEvent) {
 	// the receiver binds (AddReceiver does buff.Bind with the negotiated codec).
 	buffFactory.GetOrNew(packetio.RTPBufferPacket, ev.SSRC)
 	buffFactory.GetOrNew(packetio.RTCPBufferPacket, ev.SSRC)
-	buff, _ := buffFactory.GetBufferPair(ev.SSRC)
+	buff, rtcpReader := buffFactory.GetBufferPair(ev.SSRC)
 	if buff == nil {
 		_ = ch.Close()
 		p.params.Logger.Errorw("could not get buffer for remote published track", nil, "ssrc", ev.SSRC)
 		return
+	}
+	// Feed the publisher's RTCP (SR/RR/NACK, bridged up by the edge gateway) into
+	// the receiver's RTCP reader. In local mode pion's SettingEngine writes the
+	// RTPReceiver's RTCP into this reader; remote mode has no pion RTPReceiver on
+	// the room node, so bridge the MediaChannel's RTCP direction here. Without the
+	// Sender Reports, GetRefLayerRTPTimestamp cannot align simulcast layer
+	// timestamps and layer up-switches stall in the forwarder's layer-lock.
+	if rtcpReader != nil {
+		go func() {
+			for {
+				data, err := ch.ReadRTCP()
+				if err != nil {
+					return
+				}
+				if _, err := rtcpReader.Write(data); err != nil {
+					return
+				}
+			}
+		}()
 	}
 
 	parameters := webrtc.RTPParameters{

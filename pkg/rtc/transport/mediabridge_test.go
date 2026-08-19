@@ -15,11 +15,13 @@
 package transport
 
 import (
+	"fmt"
 	"io"
 	"testing"
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
@@ -82,6 +84,58 @@ func TestPumpMediaChannelToTrackLocal(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for RTP packet")
 	}
+}
+
+func TestPumpReceiverRTCPToMediaChannel(t *testing.T) {
+	a, b := NewLocalMediaChannelPair(10)
+	defer a.Close()
+	defer b.Close()
+
+	sr := &rtcp.SenderReport{
+		SSRC:        0xbeefdead,
+		NTPTime:     0x12345678,
+		RTPTime:     0x1000,
+		PacketCount: 42,
+		OctetCount:  9000,
+	}
+	marshalled, err := rtcp.Marshal([]rtcp.Packet{sr})
+	require.NoError(t, err)
+	rcv := &fakeSimulcastRTCPReader{rid: "h", batches: [][]byte{marshalled}}
+	go pumpReceiverRTCPToMediaChannel(rcv, "h", a)
+
+	raw, err := b.ReadRTCP()
+	require.NoError(t, err)
+
+	pkts, err := rtcp.Unmarshal(raw)
+	require.NoError(t, err)
+	require.Len(t, pkts, 1)
+	got, ok := pkts[0].(*rtcp.SenderReport)
+	require.True(t, ok)
+	require.Equal(t, sr.SSRC, got.SSRC)
+	require.Equal(t, sr.NTPTime, got.NTPTime)
+	require.Equal(t, sr.RTPTime, got.RTPTime)
+	require.Equal(t, sr.PacketCount, got.PacketCount)
+	require.Equal(t, sr.OctetCount, got.OctetCount)
+}
+
+// fakeSimulcastRTCPReader delivers fixed RTCP batches for a rid then EOF,
+// satisfying rtcpSimulcastReader.
+type fakeSimulcastRTCPReader struct {
+	rid     string
+	batches [][]byte
+	idx     int
+}
+
+func (f *fakeSimulcastRTCPReader) ReadSimulcast(b []byte, rid string) (int, interceptor.Attributes, error) {
+	if rid != f.rid {
+		return 0, nil, fmt.Errorf("wrong rid %q", rid)
+	}
+	if f.idx >= len(f.batches) {
+		return 0, nil, io.EOF
+	}
+	bb := f.batches[f.idx]
+	f.idx++
+	return copy(b, bb), nil, nil
 }
 
 func TestPumpTrackToMediaChannel(t *testing.T) {

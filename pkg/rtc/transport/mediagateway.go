@@ -44,7 +44,16 @@ type MediaGateway struct {
 	downTracks map[livekit.TrackID]*gatewayDownTrack
 	upTracks   map[livekit.TrackID]map[uint32]*gatewayUpTrack // trackID -> SSRC -> bridge (simulcast layers)
 	publishers map[uint32]rtpPacketReader                     // SSRC -> published TrackRemote
-	closed     bool
+	// publisherReceivers keeps the RTPReceiver for each published SSRC so the
+	// up-direction RTCP pump (SR/RR from the publisher) can be bridged to the room
+	// node. Without Sender Reports the SFU cannot align simulcast layer timestamps
+	// (getRefLayerRTPTimestamp), so up-switches stall in the layer-lock.
+	publisherReceivers map[uint32]*webrtc.RTPReceiver
+	// publisherRids maps each published SSRC to its RID. Simulcast layers share
+	// one RTPReceiver, and pion's Read()/ReadRTCP() PANICS on a multi-track
+	// receiver — the RTCP pump must use ReadSimulcast(rid) instead.
+	publisherRids map[uint32]string
+	closed        bool
 
 	onTrackMu sync.RWMutex
 	onTrack   func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver)
@@ -65,18 +74,23 @@ type gatewayUpTrack struct {
 // it; Close only tears down the bridges).
 func NewMediaGateway(pc *webrtc.PeerConnection) *MediaGateway {
 	g := &MediaGateway{
-		pc:         pc,
-		downTracks: make(map[livekit.TrackID]*gatewayDownTrack),
-		upTracks:   make(map[livekit.TrackID]map[uint32]*gatewayUpTrack),
-		publishers: make(map[uint32]rtpPacketReader),
+		pc:                 pc,
+		downTracks:         make(map[livekit.TrackID]*gatewayDownTrack),
+		upTracks:           make(map[livekit.TrackID]map[uint32]*gatewayUpTrack),
+		publishers:         make(map[uint32]rtpPacketReader),
+		publisherReceivers: make(map[uint32]*webrtc.RTPReceiver),
+		publisherRids:      make(map[uint32]string),
 	}
 	// Register the publisher track when the pion PC receives it. The gateway
-	// stores the TrackRemote (keyed by SSRC) so an up-direction MediaChannel can
-	// find it, and notifies the edge service via OnPublishedTrack.
+	// stores the TrackRemote + RTPReceiver + RID (keyed by SSRC) so an
+	// up-direction MediaChannel can find the RTP source and its RTCP (SR/RR)
+	// feedback, and notifies the edge service via OnPublishedTrack.
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		g.mu.Lock()
 		if !g.closed {
 			g.publishers[uint32(track.SSRC())] = track
+			g.publisherReceivers[uint32(track.SSRC())] = receiver
+			g.publisherRids[uint32(track.SSRC())] = track.RID()
 		}
 		g.mu.Unlock()
 
@@ -174,11 +188,21 @@ func (g *MediaGateway) AddPublisherTrack(trackID livekit.TrackID, ssrc uint32, r
 		return nil
 	}
 	layers[ssrc] = &gatewayUpTrack{remote: remote, ch: ch}
+	receiver := g.publisherReceivers[ssrc]
+	rid := g.publisherRids[ssrc]
 	g.mu.Unlock()
 
 	go pumpTrackToMediaChannel(remote, ch)
 	go pumpMediaChannelRTCPToPC(ch, g.pc)
-	logger.Debugw("nat gateway publisher track attached", "trackID", trackID, "ssrc", ssrc, "sessionID", g.sessionID)
+	if receiver != nil {
+		// Bridge the publisher's own RTCP (Sender Reports / Receiver Reports) up
+		// to the room node. The SFU needs SRs to align simulcast layer timestamps
+		// (getRefLayerRTPTimestamp), without which layer up-switches stall.
+		// ReadSimulcast(rid) is required: simulcast layers share one RTPReceiver and
+		// pion's Read()/ReadRTCP() panics on a multi-track receiver.
+		go pumpReceiverRTCPToMediaChannel(receiver, rid, ch)
+	}
+	logger.Debugw("nat gateway publisher track attached", "trackID", trackID, "ssrc", ssrc, "rid", rid, "sessionID", g.sessionID)
 	return nil
 }
 
@@ -237,6 +261,10 @@ func (g *MediaGateway) removeUpTrack(trackID livekit.TrackID) {
 	g.mu.Lock()
 	layers := g.upTracks[trackID]
 	delete(g.upTracks, trackID)
+	for ssrc := range layers {
+		delete(g.publisherReceivers, ssrc)
+		delete(g.publisherRids, ssrc)
+	}
 	g.mu.Unlock()
 	for _, ut := range layers {
 		_ = ut.ch.Close()
@@ -257,6 +285,8 @@ func (g *MediaGateway) Close() {
 	g.downTracks = make(map[livekit.TrackID]*gatewayDownTrack)
 	g.upTracks = make(map[livekit.TrackID]map[uint32]*gatewayUpTrack)
 	g.publishers = make(map[uint32]rtpPacketReader)
+	g.publisherReceivers = make(map[uint32]*webrtc.RTPReceiver)
+	g.publisherRids = make(map[uint32]string)
 	g.mu.Unlock()
 
 	for _, dt := range down {
