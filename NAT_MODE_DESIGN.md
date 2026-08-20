@@ -40,6 +40,9 @@
 | 验证 | 房主节点故障迁移端到端（#51）：`room-node-failure` 场景**强杀房主节点 pod**（scale 0 + force-delete）→ 客户端 `SIGNAL_CLOSE` 断开 → 死节点被摘除 + 房间重归（`room_node_map` 落到存活节点）→ resume 干净拒绝（`STATE_MISMATCH`）→ 同身份全量重连后房间在新节点重建（跨节点，signalNodeID≠nodeID）+ 媒体恢复 | ✅ |
 | 3g-1 | TURN relay-only 全路径（#50）：双客户端强制 `ICETransportPolicyRelay`（唯一候选 = relay）→ **完整 ICE 经 TURN relay 建立** + 媒体经 relay 端到端流通 + 双端选中候选对均为 relay。根因是 `turn.go` `permissionHandler` 默认拒绝私有 IP peer（relayed socket 的 STUN check 到私有边缘 host candidate 失败），**配置问题非服务器 bug**：真网公网 host candidate 默认放行；私有网（含 kind）需 `allow_restricted_peer_cidrs` | ✅ 集群内修复 + E2E |
 | 验证 | TURN relay-only 端到端（#50）：`turn-relay-only` 场景（`configs/config.yaml` 加 `allow_restricted_peer_cidrs: [192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12]`）→ 双端 relay-only ICE connected + `IsRelaySelectedOnAnyTransport` 双端 true + 媒体经 relay 流通（`waitBytes`）。真网公网 host candidate 无需 allow-list，relay-only 直连开箱即用 | ✅ |
+| 3h-1 | 生产安全（#A1）：`media_relay` 默认关闭（`Enabled=false`，NAT 显式开启）+ **fail-closed 鉴权**（`Secret` 空 → 服务端拒绝入站、拨号端报错，NAT 无法在无 secret 下运行）+ 启动校验（`enabled && secret==空` 启动失败）。修复"fork 默认监听两个无鉴权内网端口"的安全回归 | ✅ 单测 + E2E |
+| 3h-2 | 优雅排空迁移（#A2）：`Stop(false)` 在 NAT 模式下**主动** `CloseAllRooms`（participant `Close(true, MigrationRequested, true)` → `Leave(RESUME)`）→ 客户端迁移 → 房间重归 → 参与者退出 → pod 干净退出（远早于 SIGKILL）。修复滚动更新"等 participant 永不退出 → 30s SIGKILL 崩溃式迁移" | ✅ 手动验证 + E2E `room-node-drain` |
+| 3h-3 | 并发建立（#A3）：16 客户端并发加入**集群内 16/16 ×4 全过**——服务端并发处理可靠（网关会话 50ms 内全部建立）；历史 "4+4 只建 2/8" 为 **host 测试路径伪影**（宿主机经 VM 桥，N=16 偶发 ICE 超时）。`concurrent-join` 场景（N=8 host 确定性）固化回归守卫 | ✅ 集群内证明 + 回归守卫 |
 
 ## 1. 目标与范围
 

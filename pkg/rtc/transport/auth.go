@@ -35,14 +35,28 @@ var errAuthFailed = errors.New("cross-node channel auth failed")
 // authHandshake performs a shared-secret handshake on a raw TCP connection before
 // it is wrapped as a MediaChannel/ControlChannel. The dialing node sends an AUTH
 // frame carrying the shared secret; the accepting node validates it in constant
-// time and replies with an AUTH frame ("OK" or "DENY"). A nil/empty secret
-// disables auth entirely (single-node dev mode).
+// time and replies with an AUTH frame ("OK" or "DENY").
+//
+// FAIL-CLOSED: an empty secret is never allowed — the accepting side rejects the
+// connection and the dialing side aborts. NAT mode therefore cannot run without
+// a configured media_relay.secret; this prevents an accidental upgrade from
+// exposing an unauthenticated internal media/control plane. The secret itself is
+// still exchanged in plaintext over the internal network (cluster-internal
+// defense-in-depth; pair with network isolation for full confidentiality).
 //
 // The handshake is bounded (5s deadline) so a peer that never presents a secret
 // cannot hold the accept loop's goroutine open.
 func authHandshake(conn net.Conn, secret string, isServer bool) error {
 	if secret == "" {
-		return nil // no auth configured — dev mode
+		// Fail closed: no secret configured means no cross-node channel at all.
+		// The accepting node must reject (not silently pass) so an unconfigured
+		// node never accepts an unauthenticated peer; the dialing node aborts
+		// with a clear error so misconfiguration surfaces at the dial site.
+		if isServer {
+			_ = writeFrame(conn, frameAuth, authReject)
+			return errAuthFailed
+		}
+		return errors.New("cross-node channel auth requires media_relay.secret")
 	}
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()

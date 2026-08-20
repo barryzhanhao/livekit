@@ -43,9 +43,14 @@ import (
 	"github.com/livekit/protocol/utils/xtwirp"
 
 	"github.com/livekit/livekit-server/pkg/config"
+	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/version"
 )
+
+// errMediaRelaySecretRequired is returned at startup when NAT multi-node mode
+// (media_relay.enabled) is on without the fail-closed shared secret.
+var errMediaRelaySecretRequired = errors.New("media_relay.secret is required when media_relay.enabled")
 
 type LivekitServer struct {
 	config       *config.Config
@@ -227,6 +232,13 @@ func (s *LivekitServer) Start() error {
 	}
 
 	if s.config.RTC.MediaRelay.Enabled {
+		if s.config.RTC.MediaRelay.Secret == "" {
+			// The auth handshake is fail-closed: without a secret every inbound
+			// channel is rejected and every dial aborts, so NAT mode would be
+			// dead-on-arrival AND silently. Surface it loudly at startup.
+			logger.Errorw("media_relay.enabled but no media_relay.secret set — NAT mode requires a shared cluster secret (fail-closed); all cross-node channels will be rejected", nil)
+			return errMediaRelaySecretRequired
+		}
 		if err := s.mediaRelay.Start(); err != nil {
 			return err
 		}
@@ -344,6 +356,16 @@ func (s *LivekitServer) Start() error {
 func (s *LivekitServer) Stop(force bool) {
 	// wait for all participants to exit
 	s.router.Drain()
+	// NAT mode: participants only exit when clients leave, so a graceful drain
+	// would otherwise block forever and k8s would SIGKILL the pod (rolling
+	// updates became crash-like migrations). Proactively close the rooms —
+	// room.Close marks participants expected-to-resume, which tears down the
+	// remote transports and closes the control channels to the edges; each edge
+	// then fires OnGatewayLost → Leave(RECONNECT) → the client reconnects and
+	// the room re-homes → participants exit → Stop returns cleanly.
+	if !force && s.mediaRelay != nil && s.config.RTC.MediaRelay.Enabled {
+		s.roomManager.CloseAllRooms(types.ParticipantCloseReasonMigrationRequested)
+	}
 	partTicker := time.NewTicker(5 * time.Second)
 	waitingForParticipants := !force && s.roomManager.HasParticipants()
 	for waitingForParticipants {

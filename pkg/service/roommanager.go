@@ -303,6 +303,25 @@ func (r *RoomManager) HasParticipants() bool {
 	return false
 }
 
+// CloseAllRooms closes every participant with the given reason, marked
+// expected-to-resume so the client gets a Leave(RESUME) and reconnects, driving
+// the NAT migration path (client rejoin → room re-home). Used during graceful
+// drain so a node with active rooms does not block Stop indefinitely waiting
+// for sessions that never exit on their own. Room.Close is NOT used here: it
+// passes isExpectedToResume=false (Leave DISCONNECT), which would silently drop
+// clients instead of migrating them.
+func (r *RoomManager) CloseAllRooms(reason types.ParticipantCloseReason) {
+	r.lock.RLock()
+	rooms := slices.Collect(maps.Values(r.rooms))
+	r.lock.RUnlock()
+
+	for _, room := range rooms {
+		for _, p := range room.GetParticipants() {
+			_ = p.Close(true, reason, true) // isExpectedToResume=true → Leave RESUME
+		}
+	}
+}
+
 func (r *RoomManager) Stop() {
 	// disconnect all clients
 	r.lock.RLock()

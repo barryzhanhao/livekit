@@ -106,7 +106,8 @@ func TestDownDirectionRTPFlowTCP(t *testing.T) {
 	gw := NewMediaGateway(edgePC)
 	defer gw.Close()
 
-	mediaLn, err := ListenTCPMediaChannel("127.0.0.1:0")
+	secret := "test-relay-secret" // fail-closed: channels require a secret
+	mediaLn, err := ListenTCPMediaChannel("127.0.0.1:0", secret)
 	require.NoError(t, err)
 	defer mediaLn.Close()
 
@@ -119,7 +120,7 @@ func TestDownDirectionRTPFlowTCP(t *testing.T) {
 			TrackID:   "track-1",
 			Direction: MediaDirectionDown,
 			Codec:     codec,
-		})
+		}, secret)
 		if err != nil {
 			dialedCh <- nil
 			return

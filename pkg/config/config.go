@@ -171,9 +171,9 @@ type RTCConfig struct {
 
 // MediaRelayConfig configures cross-node RTP forwarding for NAT/K8s deployments.
 type MediaRelayConfig struct {
-	// Enabled enables cross-node RTP forwarding. Default true for multi-node (NAT) mode.
-	// When enabled, participants in the same room can be on different nodes
-	// and media is forwarded between nodes via internal network.
+	// Enabled enables cross-node RTP forwarding. Default false — NAT multi-node
+	// mode is opt-in. When enabled, participants in the same room can be on
+	// different nodes and media is forwarded between nodes via internal network.
 	Enabled bool `yaml:"enabled,omitempty"`
 	// Timeout for establishing a relay connection to another node.
 	Timeout time.Duration `yaml:"timeout,omitempty"`
@@ -189,15 +189,18 @@ type MediaRelayConfig struct {
 	// 0 binds an ephemeral port.
 	ControlPort int `yaml:"control_port,omitempty"`
 	// Secret is a shared cluster secret used to authenticate node-to-node TCP
-	// connections (media_relay + control). When set, every inbound channel must
-	// complete the shared-secret handshake before media/control frames are
-	// exchanged; a node that dials without the secret is rejected. Leave empty
-	// only when the internal network is strictly isolated.
+	// connections (media_relay + control). The handshake is FAIL-CLOSED: NAT
+	// mode cannot run without a non-empty Secret — an unconfigured node rejects
+	// inbound channels and a dialing node aborts. Required for multi-node NAT.
 	Secret string `yaml:"secret,omitempty"`
 }
 
 var DefaultMediaRelayConfig = MediaRelayConfig{
-	Enabled:     true,
+	// Opt-in: NAT multi-node mode must be explicitly enabled. A default-on
+	// unauthenticated internal media/control plane is a security hazard for
+	// existing single-node deployments that upgrade to this fork. Operators
+	// enabling NAT mode MUST also set Secret (the handshake is fail-closed).
+	Enabled:     false,
 	Timeout:     10 * time.Second,
 	BufferSize:  4096,
 	Port:        7883,

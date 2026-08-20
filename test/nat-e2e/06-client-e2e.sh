@@ -483,6 +483,17 @@ ROOM_MFS="${ROOM_GO}-mfs"
 seed_room_map "$ROOM_MFS"
 if run_scenario media-follows-signaling yes "$ROOM_MFS"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 
+# concurrent-join: 8 clients join the SAME room simultaneously (each publisher PC
+# + a published track → concurrent control/media-channel establishment). The
+# server handles far higher concurrency (16/16 in-cluster, README #A3); N=8 is
+# the deterministic host-path bound (the suite's clients run on the host through
+# the Docker/VM bridge, which is the flaky side). A regression guard: the
+# historical "4+4 concurrent only 2/8 establish" was that host-path artifact,
+# not a server defect.
+ROOM_CC="${ROOM_GO}-cc"
+seed_room_map "$ROOM_CC"
+if run_scenario concurrent-join yes "$ROOM_CC"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
 # simulate-ice-restart: server-driven ICE restart (SimulateScenario_
 # SwitchCandidateProtocol → participant.ICERestart, the same path resume uses).
 # The publisher's transports renegotiate cross-node; media must continue on BOTH
@@ -643,11 +654,114 @@ if kubectl get deploy/livekit-room -n "$NAMESPACE" >/dev/null 2>&1; then
   fi
   # bring the room node back for subsequent scenarios; wait until it re-registers
   kubectl scale deploy/livekit-room -n "$NAMESPACE" --replicas=1 >/dev/null 2>&1 || true
-  wait_for "room node back up" 180 kubectl get deploy/livekit-room -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' | grep -q 1
-  wait_for "room node re-registered" 60 sh -c 'kubectl exec -n "$NAMESPACE" deploy/redis -- redis-cli --raw HLEN nodes | grep -q "^3$"'
+  # guard with a counted failure, not a set -e script death: the room node can
+  # be slow to re-register right after a kill/restart cycle, and a transient
+  # wait_for timeout must not abort the whole suite.
+  if ! wait_for "room node back up" 180 kubectl get deploy/livekit-room -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' | grep -q 1; then
+    echo "  ✗ room node did not come back up within 180s"; FAIL=$((FAIL+1))
+  fi
+  if ! wait_for "room node re-registered" 60 sh -c 'kubectl exec -n "$NAMESPACE" deploy/redis -- redis-cli --raw HLEN nodes | grep -q "^3$"'; then
+    echo "  ✗ room node did not re-register within 60s"; FAIL=$((FAIL+1))
+  fi
   rm -f "$OUT"
 else
   echo "  - ROOM-NODE-FAILURE: skipped (no livekit-room deployment)"
+fi
+
+# room-node-drain (#A2): GRACEFUL drain (kubectl scale to 0 → SIGTERM → server
+# Stop(false)), distinct from the crash path above. The drain MUST proactively
+# migrate sessions: CloseAllRooms marks participants expected-to-resume, the
+# client gets Leave(RESUME) → reconnects → room re-homes → the draining node's
+# participants exit → Stop returns → the pod terminates CLEANLY (well within the
+# 30s terminationGracePeriod, not SIGKILLed). Same client-side flow as
+# room-node-failure, but we scale WITHOUT --force so the drain path is what runs.
+if kubectl get deploy/livekit-room -n "$NAMESPACE" >/dev/null 2>&1; then
+  echo "=== room-node-drain (graceful SIGTERM + clean migration) ==="
+  ROOM_DRAIN="${ROOM_GO}-drain"
+  seed_room_map "$ROOM_DRAIN"
+  OUT="$(mktemp)"
+  /tmp/nat-client -url "$WS_URL" -api-key "$API_KEY" -api-secret "$API_SECRET" \
+    -room "$ROOM_DRAIN" -scenario room-node-failure >"$OUT" 2>&1 &
+  SCPID=$!
+  ready=0
+  for i in $(seq 1 90); do
+    if grep -q "ROOM_NODE_FAILURE: READY" "$OUT" 2>/dev/null; then ready=1; break; fi
+    if ! kill -0 "$SCPID" 2>/dev/null; then break; fi
+    sleep 1
+  done
+  if [ "$ready" -ne 1 ]; then
+    echo "  ✗ ROOM-NODE-DRAIN: scenario did not reach READY"
+    kill "$SCPID" 2>/dev/null || true
+    wait "$SCPID" 2>/dev/null || true
+    echo "$(cat "$OUT")" >&2 || true
+    FAIL=$((FAIL+1))
+  else
+    echo "  media established; draining the room node deployment (graceful SIGTERM)"
+    kubectl scale deploy/livekit-room -n "$NAMESPACE" --replicas=0
+    # The drain must terminate the pod cleanly without SIGKILL: Stop(false)
+    # closes rooms → clients migrate → participants exit → process exits. Assert
+    # the pod is gone within 25s (< the 30s terminationGracePeriod), which proves
+    # the drain returned instead of hanging until kubelet's SIGKILL.
+    pod_gone=0
+    for i in $(seq 1 25); do
+      if [ -z "$(kubectl get pod -l app=livekit-room -n "$NAMESPACE" -o name 2>/dev/null)" ]; then
+        pod_gone=$i; break
+      fi
+      sleep 1
+    done
+    if [ "$pod_gone" -eq 0 ]; then
+      echo "  ✗ ROOM-NODE-DRAIN: pod did not terminate cleanly within 25s (drain hung → SIGKILL)"
+      FAIL=$((FAIL+1))
+    else
+      echo "  ✓ ROOM-NODE-DRAIN: pod exited cleanly ${pod_gone}s after SIGTERM (no SIGKILL)"
+      # wait for the scenario to finish (disconnect + rejoin + media resume)
+      rc=124
+      for i in $(seq 1 180); do
+        if ! kill -0 "$SCPID" 2>/dev/null; then
+          wait "$SCPID"
+          rc=$?
+          break
+        fi
+        sleep 1
+      done
+      if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 124 ]; then
+          echo "  ✗ ROOM-NODE-DRAIN: scenario TIMED OUT (client never recovered)"
+          kill -9 "$SCPID" 2>/dev/null || true
+          wait "$SCPID" 2>/dev/null || true
+        else
+          echo "  ✗ ROOM-NODE-DRAIN: scenario exit $rc"
+        fi
+        echo "$(cat "$OUT")" >&2 || true
+        FAIL=$((FAIL+1))
+      else
+        echo "  ✓ ROOM-NODE-DRAIN: scenario exit 0 (client migrated cleanly)"
+        PASS=$((PASS+1))
+        RH="$(redis_cli HGET room_node_map "$ROOM_DRAIN" || true)"
+        if [ -z "$RH" ]; then
+          echo "  ✗ ROOM-NODE-DRAIN: room_node_map[$ROOM_DRAIN] empty after migration"; FAIL=$((FAIL+1))
+        elif [ "$RH" = "node-room" ]; then
+          echo "  ✗ ROOM-NODE-DRAIN: room_node_map[$ROOM_DRAIN] still on the drained node"; FAIL=$((FAIL+1))
+        else
+          echo "  ✓ ROOM-NODE-DRAIN: room re-homed room_node_map[$ROOM_DRAIN]=$RH"
+        fi
+      fi
+    fi
+  fi
+  # bring the room node back
+  kubectl scale deploy/livekit-room -n "$NAMESPACE" --replicas=1 >/dev/null 2>&1 || true
+  # guard with a counted failure, not a set -e script death: the room node can
+  # be slow to re-register right after a kill/restart cycle, and a transient
+  # wait_for timeout must not abort the whole suite.
+  if ! wait_for "room node back up" 180 kubectl get deploy/livekit-room -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' | grep -q 1; then
+    echo "  ✗ room node did not come back up within 180s"; FAIL=$((FAIL+1))
+  fi
+  if ! wait_for "room node re-registered" 60 sh -c 'kubectl exec -n "$NAMESPACE" deploy/redis -- redis-cli --raw HLEN nodes | grep -q "^3$"'; then
+    echo "  ✗ room node did not re-register within 60s"; FAIL=$((FAIL+1))
+  fi
+  rm -f "$OUT"
+else
+  echo "  - ROOM-NODE-DRAIN: skipped (no livekit-room deployment)"
 fi
 
 # health: HTTP / on both nodes (defaultHandler → healthCheck, node-stats

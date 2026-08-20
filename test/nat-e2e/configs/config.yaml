@@ -9,9 +9,10 @@ rtc:
   advertise_ip: ""          # set per pod via LIVEKIT_RTC_ADVERTISE_IP
   stun_servers: []          # LAN test: no STUN/TURN; client reaches node IP directly
   media_relay:
+    enabled: true            # NAT mode is opt-in (default false)
     port: 7883              # internal plaintext RTP/RTCP (pod-to-pod)
     control_port: 7884      # internal pion-PC control (pod-to-pod)
-    secret: nat-e2e-relay-secret   # shared cross-node auth (P0-1); empty = no auth
+    secret: nat-e2e-relay-secret   # shared cross-node auth (P0-1); FAIL-CLOSED: empty secret rejects all inbound
 keys:
   devkey: secret            # standard LiveKit dev credentials (lk --dev-compatible)
 webhook:

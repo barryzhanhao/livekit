@@ -84,13 +84,14 @@ func TestTCPControlChannel(t *testing.T) {
 }
 
 func TestTCPControlChannelListenerDial(t *testing.T) {
-	ln, err := ListenTCPControlChannel("127.0.0.1:0")
+	secret := "ctl-test-secret" // fail-closed: channels require a secret
+	ln, err := ListenTCPControlChannel("127.0.0.1:0", secret)
 	require.NoError(t, err)
 	defer ln.Close()
 
 	dialedCh := make(chan ControlChannel, 1)
 	go func() {
-		dialed, err := DialTCPControlChannel(ln.Addr().String())
+		dialed, err := DialTCPControlChannel(ln.Addr().String(), secret)
 		if err != nil {
 			dialedCh <- nil
 			return

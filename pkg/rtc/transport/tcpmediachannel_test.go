@@ -26,7 +26,8 @@ import (
 func newTCPPair(t *testing.T) (MediaChannel, MediaChannel) {
 	t.Helper()
 
-	ln, err := ListenTCPMediaChannel("127.0.0.1:0")
+	secret := "test-relay-secret" // fail-closed: channels require a secret
+	ln, err := ListenTCPMediaChannel("127.0.0.1:0", secret)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ln.Close() })
 
@@ -36,7 +37,7 @@ func newTCPPair(t *testing.T) (MediaChannel, MediaChannel) {
 	}
 	dialedCh := make(chan result, 1)
 	go func() {
-		dialed, err := DialTCPMediaChannel(ln.Addr().String())
+		dialed, err := DialTCPMediaChannel(ln.Addr().String(), secret)
 		dialedCh <- result{dialed, err}
 	}()
 

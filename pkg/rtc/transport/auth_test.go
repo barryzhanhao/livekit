@@ -59,22 +59,36 @@ func TestAuthHandshakeRejectsWrongSecret(t *testing.T) {
 	}
 }
 
-func TestAuthHandshakeDisabledWithoutSecret(t *testing.T) {
-	// no secret on either side → no handshake, plain channel
+func TestAuthHandshakeFailClosedWithoutSecret(t *testing.T) {
+	// fail-closed: no secret on either side → the dial aborts and the server
+	// rejects, so NAT mode cannot accidentally run unauthenticated.
 	ln, err := ListenTCPMediaChannel("127.0.0.1:0")
 	require.NoError(t, err)
 	defer ln.Close()
 
+	rejErr := make(chan error, 1)
 	go func() {
-		ch, err := DialTCPMediaChannel(ln.Addr().String())
-		require.NoError(t, err)
-		require.NoError(t, ch.WriteRTCP([]byte{0x02}))
+		_, err := ln.Accept()
+		rejErr <- err
 	}()
-	ch, err := ln.Accept()
-	require.NoError(t, err)
-	raw, err := ch.ReadRTCP()
-	require.NoError(t, err)
-	require.Equal(t, []byte{0x02}, raw)
+
+	dialErr := make(chan error, 1)
+	go func() {
+		_, err := DialTCPMediaChannel(ln.Addr().String())
+		dialErr <- err
+	}()
+	select {
+	case err := <-dialErr:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("dial without secret did not fail (fail-closed)")
+	}
+	select {
+	case err := <-rejErr:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not reject the unauthenticated conn (fail-closed)")
+	}
 }
 
 func TestAuthHandshakeControlChannel(t *testing.T) {

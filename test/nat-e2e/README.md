@@ -119,6 +119,8 @@ cd test/nat-e2e
 | simulcast-switch | Go 客户端自含 **PLI 响应式 3 层 VP8 simulcast 发布者**（`simulcast.go`，3 RID + per-layer PLI→keyframe + SR）+ 订阅者 `UpdateTrackSettings` LOW/MEDIUM/HIGH → 房主**3 条 up plane 全部跨节点建立**（`available layers changed` 达 `[0,1,2]`）+ 层选择 0/1/2 + **forwarder 真正上切**（`upgrading layer` 到 1/2 + 各高层 `forwarded key frame`）。**客户端下行码率断言复开**：LOW/MEDIUM/HIGH 实测 98/470/1560 kbps ≥ 阈值 60/300/1200（发布者 q≈96/h≈480/f≈1680；根因是测试客户端 `sfu/buffer.Buffer` pending 队列溢出 bug，已修，见已知限制） |
 | reconnect-resume | `reconnect=true` resume 协商路径：断信令后同 SID resume → 服务端走 `resuming RTC session`（`ResumeParticipant`）→ 客户端观察到**干净 resume**（`SignalResponse_Reconnect`，媒体继续）或干净拒绝（`SignalResponse_Leave` RECONNECT → 全量重连回退），媒体必恢复、绝不挂起 |
 | room-node-failure | **真实房主节点故障迁移（#51）**：房间钉在房主节点、媒体跨节点流动后，套件**强杀房主节点 pod**（`scale 0` + `force-delete`，无优雅排空/无 UnregisterNode，模拟真崩溃）→ 边缘检测到媒体网关控制通道断开 → `OnGatewayLost` 确认房主节点死亡（keepalive 过期/已摘除）→ 向客户端发 `Leave(RECONNECT)` 并关 WS（触发迁移）；套件同时验证**死节点被摘除**（`nodes` 清理）且**房间被重归**（`room_node_map` 离开死节点、落到存活节点）→ 客户端 reconnect=true resume 被干净拒绝（`STATE_MISMATCH`，房已不在）→ **同身份全量重连** → 房间在新节点重建（跨节点，`starting RTC session` signalNodeID≠nodeID）→ 发布者重发布 + 订阅者媒体恢复（客户端 PASS + redis 双断言） |
+| room-node-drain | **优雅排空迁移（#A2）**：`kubectl scale --replicas=0`（SIGTERM，无 force-delete）→ 服务端 `Stop(false)` **主动**关闭所有房间（`CloseAllRooms`，participant 标为 expected-to-resume）→ 客户端收到 `Leave(RESUME)` → 重连 → 房间重归 → 参与者退出 → **pod 干净退出**（≤25s，远早于 30s terminationGracePeriod，无 SIGKILL）。断言：客户端 MIGRATION 断连 + 媒体恢复 + `room_node_map` 离开被排空节点 + pod 未挂起 |
+| concurrent-join | **并发建立回归守卫（#A3）**：8 客户端同时加入同一房间（各建 publisher PC + 发布 track，压并发控制/媒体通道建立）→ 8/8 全部建立。历史 "4+4 只建 2/8" 经证实为 **host 测试路径伪影**（集群内 16/16 ×4 全过；host 路径 N=16 偶发 ICE 超时）；N=8 为 host 确定性上限 |
 | webhook-events | 服务端 webhook（HTTP 回调）路径：加入/发布/离开触发 `participant_joined`/`track_published`/`track_unpublished`/`participant_left`，POST 到集群内 receiver pod（`webhook-receiver.default.svc:8080/webhook`），receiver **验证 JWT sha256 签名**（0 rejected）后逐条记录（HMAC 签名验证端到端） |
 | subscriber-pli | 下行 RTCP 的 **PLI 路径**（keyframe 请求变体，与 NACK 互补）：订阅者发真 PLI → 房主 DownTrack 处理并请求发布者 keyframe（`sending PLI RTCP`，SSRC 重写修复的 PLI 证明——修复前边缘重写 SSRC 被 `p.MediaSSRC == d.ssrc` 丢弃） |
 | media-follows-signaling | 核心边界 IP 级证明：**媒体终止于信令节点（边缘）**——服务端 PC 跑在边缘（advertise_ip），客户端收到的远端 ICE candidate 必须携带边缘 IP（= WS hostname），绝不含房主 IP；断言 candidate 含边缘 IP + 媒体实际流动 |
@@ -165,7 +167,7 @@ GO-CLIENT SUMMARY: 45 passed, 0 failed
    simulate-node-failure / simulate-server-leave / sub-perm-revoke /
    participant-leave-visible / sync-state / connection-quality / turn-credentials /
    turn-relay-only / reconnect / perform-rpc / simulcast-switch / reconnect-resume / webhook-events /
-   subscriber-pli / media-follows-signaling / multi-edge / simulate-ice-restart /
+   room-node-drain / subscriber-pli / media-follows-signaling / concurrent-join / multi-edge / simulate-ice-restart /
    security-auth / scale-stress)
 ```
 
@@ -186,11 +188,13 @@ GO-CLIENT SUMMARY: 45 passed, 0 failed
   （远程 PC 控制通道关闭 → `create offer failed: media channel closed` → `NEGOTIATE_FAILED` →
   `FULL_RECONNECT`）。生产级改进方向：远程 PC 检测到控制通道死亡后主动触发干净的全量重连，
   而非先尝试失败的 resume。
-- **并发容量（8 会话）**：4+4 并发（8 个 participant × 2 会话）实测只建立 2/8（media
-  channel closed + TRANSPORT_FAILURE）。3+3 稳定。`04-e2e.sh` 的 S12 在 S11 边缘重启后紧跟
-  并发建立偶发失败（同为控制链路并发建立竞态），已内置**一次自动重试**（等 10s 后用新房间
-  重跑）使其确定性通过。生产级改进方向：核查边缘控制 accept 的并发建立与 room 的
-  `establishRemoteSession` 背压。
+- **并发容量（#A3：已确认为 host 测试路径伪影，非服务端缺陷）**：16 客户端并发加入（每客户端
+  publisher PC + 发布 track，压并发控制/媒体通道建立）**在集群内 4 连跑 16/16 全部建立**——
+  服务端并发处理可靠（网关会话 50ms 内全部创建，ICE/DTLS 正常完成）。host 路径（本套件客户端跑
+  在宿主机、经 Docker/VM 桥）在 N=16 时偶发丢 1-2 个客户端（ICE 连接超时，`no buffer space` 等
+  host 网络伪影），N=8 稳定。历史 "4+4 只建 2/8（media channel closed + TRANSPORT_FAILURE）"
+  即此 host 路径伪影，非服务端竞态。`concurrent-join` 场景以 N=8 固化回归守卫；`-cc-n 16` 从
+  in-cluster pod 运行可复现 16/16 服务端证明。`04-e2e.sh` 的 S12 保留自动重试吸收 host 瞬时抖动。
 - **数据通道（P0-2 跨节点打通）**：控制协议新增 `send_data_message`/`event_data_message`，边缘 executor 双向转发 + 房主 participant 接入房间广播（协议单测 `TestRemotePCDataChannelBridgingProtocol` + 真实 pion 集成测试 `TestRemotePCExecutorDataChannelWire` 通过）。**端到端根因与修复**：服务端在 `transport.go` 对每个 PC 全局 `se.DetachDataChannels()`，pion 对 detached DC **不启动 OnMessage 读循环**——因此边缘 `wireDataChannel` 里 `dc.OnMessage` 永远不会触发（客户端 offerer 的 DC 虽然配对、open，但数据停留在 SCTP 重排队列）。修复：`wireDataChannel` 在 DC open 时 `DetachWithDeadline` 并用 `ReadDataChannel` 泵入 `event_data_message`（与 PCTransport 自身读 detached 通道一致）。`data` 场景现断言**必须跨节点收到**。
 - **simulcast 上切（P0-3：已从"层锁死循环"打通到"上切生效"，残余下行吞吐限制）**：受控复现
   证明 **NAT 跨节点路径完好**——订阅者 TrackSettings 到达 `SubscribedTrack`、`GetSpatialLayerForVideoQuality`

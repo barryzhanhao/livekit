@@ -56,18 +56,35 @@ func testRTCConfig(t *testing.T) (*rtc.WebRTCConfig, []*livekit.Codec) {
 }
 
 func TestMediaRelayDialNode(t *testing.T) {
-	relay := NewMediaRelay("127.0.0.1", reserveFreePort(t), 0)
+	relay := NewMediaRelay("127.0.0.1", reserveFreePort(t), 0, "test-relay-secret")
 	require.NoError(t, relay.Start())
 	t.Cleanup(func() { _ = relay.Stop() })
 	require.NotNil(t, relay.Addr())
+
+	// Accept in a goroutine: with auth enabled the dial blocks until the server
+	// side of the handshake accepts.
+	acceptedCh := make(chan transport.MediaChannel, 1)
+	acceptErrCh := make(chan error, 1)
+	go func() {
+		accepted, err := relay.Accept()
+		if err != nil {
+			acceptErrCh <- err
+			return
+		}
+		acceptedCh <- accepted
+	}()
 
 	// DialNode resolves node.Ip:<port> and dials it.
 	dialed, err := relay.DialNode(&livekit.Node{Ip: "127.0.0.1"})
 	require.NoError(t, err)
 	defer dialed.Close()
 
-	accepted, err := relay.Accept()
-	require.NoError(t, err)
+	var accepted transport.MediaChannel
+	select {
+	case accepted = <-acceptedCh:
+	case err := <-acceptErrCh:
+		t.Fatalf("accept failed: %v", err)
+	}
 	defer accepted.Close()
 
 	// RTP flows dialed → accepted.
@@ -83,7 +100,7 @@ func TestMediaRelayDialNode(t *testing.T) {
 func TestMediaRelayControlSession(t *testing.T) {
 	rtcConf, codecs := testRTCConfig(t)
 
-	relay := NewMediaRelay("127.0.0.1", reserveFreePort(t), reserveFreePort(t))
+	relay := NewMediaRelay("127.0.0.1", reserveFreePort(t), reserveFreePort(t), "test-relay-secret")
 	relay.SetRTCConfig(rtcConf)
 	require.NoError(t, relay.Start())
 	t.Cleanup(func() { _ = relay.Stop() })

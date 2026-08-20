@@ -30,11 +30,11 @@ import (
 // the media plane (a down track) attached over a TCP MediaChannel via a hello
 // frame. It proves the full split end-to-end without any node-discovery wiring.
 func TestRemotePCSplitOverTCP(t *testing.T) {
-	controlLn, err := transport.ListenTCPControlChannel("127.0.0.1:0")
+	controlLn, err := transport.ListenTCPControlChannel("127.0.0.1:0", "test-relay-secret")
 	require.NoError(t, err)
 	defer controlLn.Close()
 
-	mediaLn, err := transport.ListenTCPMediaChannel("127.0.0.1:0")
+	mediaLn, err := transport.ListenTCPMediaChannel("127.0.0.1:0", "test-relay-secret")
 	require.NoError(t, err)
 	defer mediaLn.Close()
 
@@ -58,7 +58,7 @@ func TestRemotePCSplitOverTCP(t *testing.T) {
 	}()
 
 	// --- room node ---
-	roomCh, err := transport.DialTCPControlChannel(controlLn.Addr().String())
+	roomCh, err := transport.DialTCPControlChannel(controlLn.Addr().String(), "test-relay-secret")
 	require.NoError(t, err)
 	defer roomCh.Close()
 
@@ -102,7 +102,7 @@ func TestRemotePCSplitOverTCP(t *testing.T) {
 			TrackID:   "track-down",
 			Direction: transport.MediaDirectionDown,
 			Codec:     webrtc.RTPCodecCapability{MimeType: "video/vp8", ClockRate: 90000},
-		})
+		}, "test-relay-secret")
 		if err != nil {
 			dialedMedia <- nil
 			return

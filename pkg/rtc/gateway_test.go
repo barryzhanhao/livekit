@@ -58,11 +58,11 @@ func TestEdgeGatewaySessionHandshake(t *testing.T) {
 	rtcConf := newTestWebRTCConfig(t)
 	codecs := defaultTestCodecs(t)
 
-	controlLn, err := transport.ListenTCPControlChannel("127.0.0.1:0")
+	controlLn, err := transport.ListenTCPControlChannel("127.0.0.1:0", "test-relay-secret")
 	require.NoError(t, err)
 	defer controlLn.Close()
 
-	mediaLn, err := transport.ListenTCPMediaChannel("127.0.0.1:0")
+	mediaLn, err := transport.ListenTCPMediaChannel("127.0.0.1:0", "test-relay-secret")
 	require.NoError(t, err)
 	defer mediaLn.Close()
 
@@ -86,7 +86,7 @@ func TestEdgeGatewaySessionHandshake(t *testing.T) {
 	}()
 
 	// --- room node ---
-	roomCh, err := transport.DialTCPControlChannel(controlLn.Addr().String())
+	roomCh, err := transport.DialTCPControlChannel(controlLn.Addr().String(), "test-relay-secret")
 	require.NoError(t, err)
 
 	remote, err := DialEdgeGatewaySession(roomCh, GatewaySetup{
@@ -104,7 +104,7 @@ func TestEdgeGatewaySessionHandshake(t *testing.T) {
 		TrackID:   "track-down",
 		Direction: transport.MediaDirectionDown,
 		Codec:     webrtc.RTPCodecCapability{MimeType: "video/vp8", ClockRate: 90000},
-	})
+	}, "test-relay-secret")
 	require.NoError(t, err)
 	defer mediaCh.Close()
 

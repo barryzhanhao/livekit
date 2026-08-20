@@ -24,7 +24,7 @@ import (
 
 // TestMediaHelloRoundTrip verifies the hello frame survives a TCP round trip.
 func TestMediaHelloRoundTrip(t *testing.T) {
-	ln, err := ListenTCPMediaChannel("127.0.0.1:0")
+	ln, err := ListenTCPMediaChannel("127.0.0.1:0", "test-relay-secret")
 	require.NoError(t, err)
 	defer ln.Close()
 
@@ -37,7 +37,7 @@ func TestMediaHelloRoundTrip(t *testing.T) {
 
 	dialedCh := make(chan HelloMediaChannel, 1)
 	go func() {
-		ch, err := DialTCPMediaChannelHello(ln.Addr().String(), hello)
+		ch, err := DialTCPMediaChannelHello(ln.Addr().String(), hello, "test-relay-secret")
 		if err != nil {
 			dialedCh <- nil
 			return
@@ -68,7 +68,7 @@ func TestMediaGatewayAttachHelloUp(t *testing.T) {
 	g := NewMediaGateway(pc)
 	defer g.Close()
 
-	ln, err := ListenTCPMediaChannel("127.0.0.1:0")
+	ln, err := ListenTCPMediaChannel("127.0.0.1:0", "test-relay-secret")
 	require.NoError(t, err)
 	defer ln.Close()
 
@@ -78,7 +78,7 @@ func TestMediaGatewayAttachHelloUp(t *testing.T) {
 			TrackID:   "track-up",
 			Direction: MediaDirectionUp,
 			Codec:     webrtc.RTPCodecCapability{MimeType: "audio/opus", ClockRate: 48000},
-		})
+		}, "test-relay-secret")
 		if err != nil {
 			dialedCh <- nil
 			return
@@ -118,7 +118,7 @@ func TestMediaGatewayAttachHelloDown(t *testing.T) {
 	g := NewMediaGateway(pc)
 	defer g.Close()
 
-	ln, err := ListenTCPMediaChannel("127.0.0.1:0")
+	ln, err := ListenTCPMediaChannel("127.0.0.1:0", "test-relay-secret")
 	require.NoError(t, err)
 	defer ln.Close()
 
@@ -128,7 +128,7 @@ func TestMediaGatewayAttachHelloDown(t *testing.T) {
 			TrackID:   "track-down",
 			Direction: MediaDirectionDown,
 			Codec:     webrtc.RTPCodecCapability{MimeType: "video/vp8", ClockRate: 90000},
-		})
+		}, "test-relay-secret")
 		if err != nil {
 			dialedCh <- nil
 			return
