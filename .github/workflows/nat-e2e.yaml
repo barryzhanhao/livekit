@@ -1,0 +1,91 @@
+# Copyright 2023 LiveKit, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# NAT E2E — full kind-cluster integration suite for the NAT multi-node fork.
+#
+# Spins a 4-node kind cluster (control-plane + edge + room + edge2), builds the
+# server + test images, deploys, and runs the client E2E suite plus the
+# relay-drop and redis-HA failover drivers.
+#
+# HEAVY (~30-40 min, needs Docker + a 4-core/16GB runner): triggered manually
+# (workflow_dispatch) and on merge to master — NOT on every PR.
+#
+# Runner requirements:
+#   - ubuntu-latest (Docker preinstalled)
+#   - internet to Docker Hub (pull redis:7-alpine, busybox:1.36, kindest/node)
+#
+# Pin the action SHAs (replace `# vN` tags with commit SHAs) before enabling.
+
+name: NAT E2E
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: "^1.26"
+
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.27.0
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4 # pin to a commit SHA before enabling
+        with:
+          version: v1.32.2
+
+      - name: Create 4-node kind cluster
+        working-directory: test/nat-e2e
+        run: ./01-cluster.sh
+
+      - name: Build + load NAT images
+        working-directory: test/nat-e2e
+        run: |
+          SKIP_BROWSER=1 ./02-build-image.sh
+          ./03-deploy.sh
+
+      - name: Client E2E suite
+        working-directory: test/nat-e2e
+        run: ./06-client-e2e.sh
+
+      - name: Relay-drop recovery E2E
+        working-directory: test/nat-e2e
+        run: ./10-relay-drop.sh
+
+      - name: Redis Sentinel HA failover
+        working-directory: test/nat-e2e
+        run: ./08-redis-ha.sh
+
+      # Upload harness + server logs so a failure is diagnosable from the run.
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nat-e2e-logs
+          path: |
+            /tmp/nat-*.log
+            /tmp/nat-stress-metrics-*/*
+          if-no-files-found: warn
