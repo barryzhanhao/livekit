@@ -146,30 +146,80 @@ func TestRemotePeerConnectionRequestTimeout(t *testing.T) {
 	r.mu.Unlock()
 }
 
-// TestRemotePeerConnectionCloseUnblocksRequests verifies that when the control
-// channel dies while a request is in flight, the pending request is resolved
-// with a closed error instead of hanging (the channel-close teardown path used
-// when a participant leaves / the edge restarts).
-func TestRemotePeerConnectionCloseUnblocksRequests(t *testing.T) {
-	a, b := transport.NewLocalControlChannelPair(10)
+// TestRemotePeerConnectionDisconnectDetection verifies that OnDisconnected fires
+// when the control channel breaks unexpectedly (edge node restart), and that
+// intentional Close() suppresses the callback.
+func TestRemotePeerConnectionDisconnectDetection(t *testing.T) {
+	// ---- unexpected close fires OnDisconnected ----
+	t.Run("unexpected channel close fires callback", func(t *testing.T) {
+		a, b := transport.NewLocalControlChannelPair(10)
+		defer b.Close()
 
-	// No executor; close the peer end while a request is in flight.
-	r := NewRemotePeerConnection(a)
-	defer r.Close()
+		r := NewRemotePeerConnection(a)
+		defer r.Close()
 
-	done := make(chan error, 1)
-	go func() {
-		_, err := r.CreateAnswer(nil)
-		done <- err
-	}()
-	time.Sleep(100 * time.Millisecond) // let the request send and block
-	_ = b.Close()
+		disconnected := make(chan struct{}, 1)
+		r.OnDisconnected(func() {
+			disconnected <- struct{}{}
+		})
 
-	select {
-	case err := <-done:
-		require.Error(t, err)
-		require.ErrorIs(t, err, transport.ErrMediaChannelClosed)
-	case <-time.After(3 * time.Second):
-		t.Fatal("request did not unblock after channel close")
-	}
+		// Close the peer end — simulates edge node restart.
+		_ = b.Close()
+
+		select {
+		case <-disconnected:
+		case <-time.After(2 * time.Second):
+			t.Fatal("OnDisconnected was not called after unexpected channel close")
+		}
+	})
+
+	// ---- intentional Close() suppresses OnDisconnected ----
+	t.Run("intentional close does not fire callback", func(t *testing.T) {
+		a, b := transport.NewLocalControlChannelPair(10)
+		defer b.Close()
+
+		r := NewRemotePeerConnection(a)
+
+		disconnected := make(chan struct{}, 1)
+		r.OnDisconnected(func() {
+			close(disconnected) // use close so it stays closed even if fired
+		})
+
+		// Intentional Close() — must NOT fire the callback.
+		_ = r.Close()
+
+		// Give the readLoop time to exit and fire the callback if it were going to.
+		time.Sleep(200 * time.Millisecond)
+
+		select {
+		case <-disconnected:
+			t.Fatal("OnDisconnected was called after intentional Close()")
+		default:
+			// OK — callback was suppressed.
+		}
+	})
+
+	// ---- pending request unblocks on unexpected close ----
+	t.Run("pending request unblocks on unexpected close", func(t *testing.T) {
+		a, b := transport.NewLocalControlChannelPair(10)
+
+		r := NewRemotePeerConnection(a)
+		defer r.Close()
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := r.CreateAnswer(nil)
+			done <- err
+		}()
+		time.Sleep(100 * time.Millisecond) // let the request send and block
+		_ = b.Close() // kill the channel — simulates edge restart
+
+		select {
+		case err := <-done:
+			require.Error(t, err)
+			require.ErrorIs(t, err, transport.ErrMediaChannelClosed)
+		case <-time.After(3 * time.Second):
+			t.Fatal("request did not unblock after unexpected channel close")
+		}
+	})
 }

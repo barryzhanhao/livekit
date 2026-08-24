@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NAT Browser E2E Test</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2em auto; padding: 1em; }
+  h1 { font-size: 1.4em; }
+  #status { padding: 0.5em 1em; background: #f0f0f0; border-radius: 6px; margin: 1em 0; }
+  #status.pass { background: #d4edda; }
+  #status.fail { background: #f8d7da; }
+  #status.running { background: #fff3cd; }
+  #log { font-family: monospace; font-size: 0.85em; white-space: pre-wrap; margin-top: 1em; }
+  #log div { padding: 0.15em 0; }
+  .r { color: #888; } /* ready */
+  .i { color: #0066cc; } /* info */
+  .e { color: #cc0000; } /* error */
+  .s { color: #006600; } /* success */
+</style>
+</head>
+<body>
+  <h1>NAT Browser E2E Test</h1>
+  <div id="scenario">Loading...</div>
+  <div id="status">Initializing</div>
+  <div id="result"></div>
+  <div id="log"></div>
+
+  <script src="bundle.js"></script>
+</body>
+</html>

@@ -17,6 +17,8 @@ package transport
 import (
 	"net"
 	"sync"
+
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 )
 
 // ControlChannel is a reliable, ordered, framed channel for control-plane
@@ -148,6 +150,7 @@ func (c *tcpControlChannel) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.done)
 		_ = c.conn.Close()
+		prometheus.DecrementNATRelayConnection()
 	})
 	return nil
 }
@@ -185,10 +188,12 @@ func (l *TCPControlChannelListener) Accept() (ControlChannel, error) {
 	if err != nil {
 		return nil, err
 	}
+	conn = setTCPNoDelay(conn)
 	if err := authHandshake(conn, l.secret, true); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
+	prometheus.IncrementNATRelayConnection(prometheus.NATRelayDirectionInbound, prometheus.NATRelayTypeControl)
 	return NewTCPControlChannel(conn), nil
 }
 
@@ -205,6 +210,7 @@ func DialTCPControlChannel(addr string, secret ...string) (ControlChannel, error
 	if err != nil {
 		return nil, err
 	}
+	conn = setTCPNoDelay(conn)
 	sec := ""
 	if len(secret) > 0 {
 		sec = secret[0]
@@ -213,5 +219,6 @@ func DialTCPControlChannel(addr string, secret ...string) (ControlChannel, error
 		_ = conn.Close()
 		return nil, err
 	}
+	prometheus.IncrementNATRelayConnection(prometheus.NATRelayDirectionOutbound, prometheus.NATRelayTypeControl)
 	return NewTCPControlChannel(conn), nil
 }

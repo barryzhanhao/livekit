@@ -1,0 +1,20 @@
+{
+  "name": "nat-browser-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "esbuild public/main.js --bundle --outfile=public/bundle.js --format=esm",
+    "start": "node server.js",
+    "test": "playwright test",
+    "test:headed": "playwright test --headed"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "livekit-client": "^2.9.0",
+    "livekit-server-sdk": "^2.9.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.51.0",
+    "esbuild": "^0.25.0"
+  }
+}

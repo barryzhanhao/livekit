@@ -22,6 +22,7 @@ import (
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/protocol/logger"
 )
 
@@ -48,6 +49,8 @@ func pumpMediaChannelToTrackLocal(src MediaChannel, dst rtpPacketWriter) {
 		if err != nil {
 			return
 		}
+
+		prometheus.AddNATRelayBytes(prometheus.NATRelayDirectionInbound, prometheus.NATRelayFlowRTP, len(raw))
 
 		var pkt rtp.Packet
 		if err := pkt.Unmarshal(raw); err != nil {
@@ -76,6 +79,7 @@ func pumpTrackToMediaChannel(src rtpPacketReader, dst MediaChannel) {
 		if err != nil {
 			continue
 		}
+		prometheus.AddNATRelayBytes(prometheus.NATRelayDirectionOutbound, prometheus.NATRelayFlowRTP, n)
 		if err := dst.WriteRTP(buf[:n]); err != nil {
 			return
 		}
@@ -96,6 +100,7 @@ func pumpSenderRTCPToMediaChannel(sender *webrtc.RTPSender, dst MediaChannel) {
 		if err != nil {
 			continue
 		}
+		prometheus.AddNATRelayBytes(prometheus.NATRelayDirectionOutbound, prometheus.NATRelayFlowRTCP, len(data))
 		logger.Debugw("nat edge -> room down RTCP forwarded", "pkts", len(pkts), "types", rtcpTypes(pkts))
 		if err := dst.WriteRTCP(data); err != nil {
 			return
@@ -124,6 +129,7 @@ func pumpReceiverRTCPToMediaChannel(receiver rtcpSimulcastReader, rid string, ds
 		if err != nil {
 			return
 		}
+		prometheus.AddNATRelayBytes(prometheus.NATRelayDirectionOutbound, prometheus.NATRelayFlowRTCP, n)
 		if pkts, uerr := rtcp.Unmarshal(buf[:n]); uerr == nil {
 			logger.Debugw("nat edge -> room up RTCP forwarded", "pkts", len(pkts), "types", rtcpTypes(pkts))
 		}
@@ -142,6 +148,7 @@ func pumpMediaChannelRTCPToPC(src MediaChannel, pc *webrtc.PeerConnection) {
 		if err != nil {
 			return
 		}
+		prometheus.AddNATRelayBytes(prometheus.NATRelayDirectionInbound, prometheus.NATRelayFlowRTCP, len(data))
 		pkts, err := rtcp.Unmarshal(data)
 		if err != nil {
 			continue

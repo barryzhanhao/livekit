@@ -105,6 +105,12 @@ type RTCClient struct {
 	lastPackets   map[livekit.ParticipantID]*rtp.Packet
 	bytesReceived map[livekit.ParticipantID]uint64
 
+	// per-SSRC RTP sequence-gap loss tracking (diagnostic for end-to-end
+	// downlink loss; used by the stress test). lossBySSRC is keyed by SSRC and
+	// guarded by lossMu.
+	lossMu     sync.Mutex
+	lossBySSRC map[uint32]*rtpLossTracker
+
 	subscriptionResponse atomic.Pointer[livekit.SubscriptionResponse]
 
 	nextDataTrackHandle        atomic.Uint32
@@ -246,7 +252,14 @@ func NewWebSocketConn(host, token string, opts *Options) (*websocket.Conn, error
 	}
 
 	logger.Infow("connecting to", "url", parsedURL.String())
-	conn, _, err := websocket.DefaultDialer.Dial(connectUrl, requestHeader)
+	conn, resp, err := websocket.DefaultDialer.Dial(connectUrl, requestHeader)
+	if err != nil && resp != nil {
+		// Attach the HTTP status to the dial error: under heavy concurrent load
+		// the edge can answer a WS upgrade with a non-101 (e.g. 500/503), and
+		// knowing WHICH status distinguishes a server-side rejection from a
+		// client-side timeout. gorilla reports these as "bad handshake".
+		return nil, fmt.Errorf("ws dial: %w (http %d)", err, resp.StatusCode)
+	}
 	return conn, err
 }
 
@@ -266,6 +279,7 @@ func NewRTCClient(conn *websocket.Conn, useSinglePeerConnection bool, opts *Opti
 		me:                         &webrtc.MediaEngine{},
 		lastPackets:                make(map[livekit.ParticipantID]*rtp.Packet),
 		bytesReceived:              make(map[livekit.ParticipantID]uint64),
+		lossBySSRC:                 make(map[uint32]*rtpLossTracker),
 		pendingPublishedDataTracks: make(map[uint16]*livekit.DataTrackInfo),
 		subscribedDataTracks:       make(map[livekit.ParticipantID]map[uint16]*DataTrackRemote),
 		transportReady:             make(chan struct{}),
@@ -1498,6 +1512,7 @@ func (c *RTCClient) processRemoteTrack(track *webrtc.TrackRemote) {
 		c.lastPackets[publisherID] = pkt
 		c.bytesReceived[publisherID] += uint64(pkt.MarshalSize())
 		c.lock.Unlock()
+		c.NoteRTPLoss(pkt.SSRC, pkt.SequenceNumber)
 		numBytes += pkt.MarshalSize()
 		if time.Since(lastUpdate) > 30*time.Second {
 			logger.Infow(
@@ -1534,6 +1549,75 @@ func (c *RTCClient) SubscriberTransportStats() (bytesSent, bytesReceived uint64,
 				Discarded: ts.PacketsDiscarded,
 			}
 		}
+	}
+	return
+}
+
+// rtpLossTracker counts RTP sequence gaps for one inbound SSRC stream. Real-time
+// media from a publisher arrives with consecutive RTP sequence numbers (pion
+// increments per written packet), so a forward gap in the subscriber's read loop
+// is a packet lost somewhere in the room→edge→client path. Used by the stress
+// test to report per-client end-to-end downlink loss.
+type rtpLossTracker struct {
+	lastSeq  uint16
+	seen     bool
+	received uint64 // packets actually read
+	lost     uint64 // forward sequence gaps observed
+}
+
+func (t *rtpLossTracker) note(seq uint16) {
+	if !t.seen {
+		t.seen = true
+		t.received++
+		t.lastSeq = seq
+		return
+	}
+	var gap uint32
+	switch {
+	case seq > t.lastSeq:
+		gap = uint32(seq) - uint32(t.lastSeq) - 1
+	case seq < t.lastSeq:
+		// wrapped past 65535 back to 0
+		gap = uint32(seq) + 65536 - uint32(t.lastSeq) - 1
+	default:
+		// duplicate delivery — not a loss
+	}
+	// A gap larger than this is a stream restart or re-key on the same SSRC
+	// (renegotiation), not thousands of lost packets — ignore it. Retransmits
+	// after NACK arrive out of order (backwards) and are skipped above, so they
+	// never inflate the count.
+	if gap > 0 && gap < 4096 {
+		t.lost += uint64(gap)
+	}
+	t.received++
+	t.lastSeq = seq
+}
+
+// NoteRTPLoss advances the per-SSRC loss tracker for one received RTP packet.
+// Called by the track consumer; safe from multiple track-read goroutines.
+func (c *RTCClient) NoteRTPLoss(ssrc uint32, seq uint16) {
+	c.lossMu.Lock()
+	t := c.lossBySSRC[ssrc]
+	if t == nil {
+		t = &rtpLossTracker{}
+		c.lossBySSRC[ssrc] = t
+	}
+	t.note(seq)
+	c.lossMu.Unlock()
+}
+
+// RTPLoss returns aggregate received/lost packet counts and loss % across all
+// subscribed streams. Loss % is lost / (received + lost): the fraction of
+// expected packets that never arrived.
+func (c *RTCClient) RTPLoss() (received, lost uint64, lossPct float64) {
+	c.lossMu.Lock()
+	defer c.lossMu.Unlock()
+	for _, t := range c.lossBySSRC {
+		received += t.received
+		lost += t.lost
+	}
+	if received+lost > 0 {
+		lossPct = float64(lost) * 100 / float64(received+lost)
 	}
 	return
 }

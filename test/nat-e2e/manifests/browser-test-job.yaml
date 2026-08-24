@@ -1,0 +1,60 @@
+# Browser E2E test Job — runs Playwright-driven Chromium tests against the
+# NAT-mode edge cluster. The container starts an Express server (token endpoint +
+# test page), then runs Playwright tests that navigate the browser to connect
+# to the NAT-mode edge via livekit-client.
+#
+# The driver script (08-browser-e2e.sh) creates this Job, monitors its logs,
+# waits for completion, and reports results.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nat-browser-e2e
+  namespace: default
+  labels:
+    app: nat-browser-e2e
+    app.kubernetes.io/name: browser-test
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0              # don't retry — browser tests are expensive
+  activeDeadlineSeconds: 600   # 10 min hard timeout
+  template:
+    metadata:
+      labels:
+        app: nat-browser-e2e
+        app.kubernetes.io/name: browser-test
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: browser-test
+          image: livekit-nat-dev:browser
+          imagePullPolicy: Never
+          env:
+            - name: API_KEY
+              value: "devkey"
+            - name: API_SECRET
+              value: "secret"
+            - name: LIVEKIT_URL
+              value: "ws://livekit-edge:7880"
+            - name: ROOM
+              value: "nat-browser-e2e"
+            - name: TEST_URL
+              value: "http://localhost:8081"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 2Gi
+      initContainers:
+        - name: wait-for-edge
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -zv livekit-edge 7880 2>/dev/null; do
+                echo "waiting for livekit-edge:7880..."
+                sleep 1
+              done
+              echo "edge ready"

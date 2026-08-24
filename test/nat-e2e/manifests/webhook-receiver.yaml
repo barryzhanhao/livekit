@@ -2,6 +2,14 @@
 # events to (NAT E2E: proves the server-side webhook HTTP callback path cross-node).
 # Reachable from both server pods via the cluster DNS (hostNetwork pods still
 # resolve cluster services thanks to dnsPolicy: ClusterFirstWithHostNet).
+#
+# Pinned to the control-plane node: kind's CNI puts the node's pod-bridge IP
+# (10.244.x.1/32) on EVERY veth, and the room/edge servers bind their fixed media
+# UDP port once per interface IP. A worker with TWO regular pods would give the
+# mux two veths with the same IP -> bind the same IP:port twice -> EADDRINUSE ->
+# the server on that node crashes. Each worker may host AT MOST ONE regular pod;
+# redis takes the workers (one per node), so this helper goes to the (tainted)
+# control-plane via a toleration.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -10,6 +18,12 @@ metadata:
   labels:
     app: webhook-receiver
 spec:
+  nodeSelector:
+    kubernetes.io/hostname: nat-test-control-plane
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
   containers:
     - name: receiver
       image: webhook-recv:dev

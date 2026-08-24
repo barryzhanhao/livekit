@@ -21,6 +21,7 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 )
@@ -157,6 +158,7 @@ func (g *MediaGateway) AddSubscriberTrack(trackID livekit.TrackID, codec webrtc.
 
 	go pumpMediaChannelToTrackLocal(ch, local)
 	go pumpSenderRTCPToMediaChannel(sender, ch)
+	prometheus.AddNATGatewayTrack(prometheus.NATGatewayTrackDown)
 	logger.Debugw("nat gateway subscriber track attached", "trackID", trackID, "codec", codec.MimeType, "sessionID", g.sessionID)
 	return nil
 }
@@ -202,6 +204,7 @@ func (g *MediaGateway) AddPublisherTrack(trackID livekit.TrackID, ssrc uint32, r
 		// pion's Read()/ReadRTCP() panics on a multi-track receiver.
 		go pumpReceiverRTCPToMediaChannel(receiver, rid, ch)
 	}
+	prometheus.AddNATGatewayTrack(prometheus.NATGatewayTrackUp)
 	logger.Debugw("nat gateway publisher track attached", "trackID", trackID, "ssrc", ssrc, "rid", rid, "sessionID", g.sessionID)
 	return nil
 }
@@ -253,6 +256,7 @@ func (g *MediaGateway) removeDownTrack(trackID livekit.TrackID) {
 	delete(g.downTracks, trackID)
 	g.mu.Unlock()
 	if dt != nil {
+		prometheus.SubNATGatewayTrack(prometheus.NATGatewayTrackDown)
 		_ = dt.ch.Close()
 	}
 }
@@ -267,6 +271,7 @@ func (g *MediaGateway) removeUpTrack(trackID livekit.TrackID) {
 	}
 	g.mu.Unlock()
 	for _, ut := range layers {
+		prometheus.SubNATGatewayTrack(prometheus.NATGatewayTrackUp)
 		_ = ut.ch.Close()
 	}
 }
@@ -290,10 +295,12 @@ func (g *MediaGateway) Close() {
 	g.mu.Unlock()
 
 	for _, dt := range down {
+		prometheus.SubNATGatewayTrack(prometheus.NATGatewayTrackDown)
 		_ = dt.ch.Close()
 	}
 	for _, layers := range up {
 		for _, ut := range layers {
+			prometheus.SubNATGatewayTrack(prometheus.NATGatewayTrackUp)
 			_ = ut.ch.Close()
 		}
 	}

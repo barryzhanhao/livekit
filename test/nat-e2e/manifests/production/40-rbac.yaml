@@ -1,0 +1,51 @@
+# RBAC configuration for NAT-mode LiveKit.
+# Minimal permissions: the pod needs only to read its own pod IP and node info
+# (already granted by the default service account for pod fieldRefs via
+# the downward API — no explicit RBAC needed for that).
+#
+# The Role below is a standard resource-read access pattern; bind it only
+# if your deployment requires the LiveKit server to query the k8s API for
+# node discovery or leader election (not currently needed for NAT mode).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: livekit
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+---
+# Minimal role: only what the LiveKit server needs.
+# Extend this if you add k8s-based node discovery or leader-election later.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: livekit
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+rules:
+  # Allow reading pod info (for self-identification in logs/metrics).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Allow reading endpoints for service discovery (if not using DNS-based).
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: livekit
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+subjects:
+  - kind: ServiceAccount
+    name: livekit
+    namespace: livekit-nat
+roleRef:
+  kind: Role
+  name: livekit
+  apiGroup: rbac.authorization.k8s.io

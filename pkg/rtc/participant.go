@@ -2027,6 +2027,15 @@ func (p *ParticipantImpl) setupTransportManager() error {
 			rpc.OnDataMessage(func(kind livekit.DataPacket_Kind, data []byte) {
 				p.onReceivedDataMessage(kind, data)
 			})
+			// When the edge node restarts or the control channel dies
+			// unexpectedly, trigger a FULL_RECONNECT so the client reconnects
+			// to a (potentially different) edge node. Guarded by IsClosed /
+			// IsDisconnected in maybeReconnectOnRemoteDisconnect; in dual-PC
+			// mode both publisher and subscriber channels break at the same
+			// time, so the guard also prevents double-firing.
+			rpc.OnDisconnected(func() {
+				p.maybeReconnectOnRemoteDisconnect()
+			})
 		}
 		p.params.Logger.Infow("nat participant uses remote peer connection (NAT split)",
 			"signalNodeID", p.params.SignalNodeID, "useSinglePC", p.params.UseSinglePeerConnection)
@@ -2034,6 +2043,11 @@ func (p *ParticipantImpl) setupTransportManager() error {
 	var subscriberRemotePC peerConnection
 	if p.params.SubscriberRemoteControlChannel != nil {
 		subscriberRemotePC = NewRemotePeerConnection(p.params.SubscriberRemoteControlChannel)
+		if rpc, ok := subscriberRemotePC.(*remotePeerConnection); ok {
+			rpc.OnDisconnected(func() {
+				p.maybeReconnectOnRemoteDisconnect()
+			})
+		}
 		p.params.Logger.Infow("nat participant uses remote subscriber peer connection (dual-PC)",
 			"signalNodeID", p.params.SignalNodeID)
 	}
@@ -3746,7 +3760,21 @@ func (p *ParticipantImpl) GetCachedDownTrack(trackID livekit.TrackID) (*webrtc.R
 	return nil, sfu.DownTrackState{}
 }
 
-func (p *ParticipantImpl) IssueFullReconnect(reason types.ParticipantCloseReason) {
+// maybeReconnectOnRemoteDisconnect is called when the NAT-mode remote peer
+	// connection's control channel breaks unexpectedly (edge node restart). It
+	// guards against double-dispatch during normal teardown and triggers a full
+	// reconnect so the client establishes a new session on a (potentially
+	// different) edge node.
+	func (p *ParticipantImpl) maybeReconnectOnRemoteDisconnect() {
+		if p.IsClosed() || p.IsDisconnected() {
+			return
+		}
+		p.params.Logger.Infow("nat remote peer connection disconnected, issuing full reconnect",
+			"signalNodeID", p.params.SignalNodeID)
+		p.IssueFullReconnect(types.ParticipantCloseReasonPeerConnectionDisconnected)
+	}
+
+	func (p *ParticipantImpl) IssueFullReconnect(reason types.ParticipantCloseReason) {
 	p.sendLeaveRequest(
 		reason,
 		false, // isExpectedToResume
@@ -4256,7 +4284,17 @@ func (p *ParticipantImpl) addTrackLocalRemote(trackLocal webrtc.TrackLocal) (*we
 		for {
 			data, err := ch.ReadRTCP()
 			if err != nil {
-				p.params.Logger.Infow("nat down track RTCP loop ended", "trackID", trackLocal.ID())
+				// A dropped down-direction relay freezes this subscriber's media
+				// with no recovery — surface it as a fatal subscription error so
+				// the client reconnects and the track is re-established
+				// (config-gated by reconnect_on_subscription_error, off by
+				// default). An intentional teardown closes the relay with no
+				// error and is excluded.
+				if !p.IsClosed() && !p.IsDisconnected() && isMediaRelayDrop(ch) {
+					p.params.Logger.Warnw("nat down-direction media relay dropped; forcing reconnect",
+						nil, "trackID", trackLocal.ID())
+					p.onSubscriptionError(livekit.TrackID(trackLocal.ID()), true, err)
+				}
 				return
 			}
 			if localSSRC != 0 {
@@ -4319,6 +4357,19 @@ func (p *ParticipantImpl) handleRemotePublishedTrack(ev remoteTrackEvent) {
 	if mime.IsMimeTypeStringVideo(ev.Codec.MimeType) {
 		kind = webrtc.RTPCodecTypeVideo
 	}
+
+	// The edge's OnTrack fires before first RTP (FireOnTrackBySdp), so
+	// ev.Codec.MimeType may be empty. The pending track (from the client's
+	// AddTrack) carries the negotiated codec — use it to populate the codec so
+	// the up-plane track, media-channel hello, and AddReceiver all bind the real
+	// codec. Otherwise the SFU can't match the receiver's codec and the up-plane
+	// RTP is never forwarded to subscribers.
+	if ev.Codec.MimeType == "" {
+		_, ti, _, _, _ := p.getPendingTrack(ev.TrackID, ToProtoTrackKind(kind), true)
+		if ti != nil && len(ti.Codecs) > 0 && ti.Codecs[0].MimeType != "" {
+			ev.Codec = webrtc.RTPCodecParameters{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: ti.Codecs[0].MimeType}}
+		}
+	}
 	track := sfu.NewTrackRemoteFromMetadata(ev.TrackID, ev.StreamID, ev.RID, "", webrtc.SSRC(ev.SSRC), ev.Codec, kind)
 
 	ch, err := dialer(transport.MediaHello{
@@ -4371,7 +4422,44 @@ func (p *ParticipantImpl) handleRemotePublishedTrack(ev remoteTrackEvent) {
 	p.mediaTrackReceivedRemote(track, ev.Mid, parameters, ch)
 
 	p.params.Logger.Infow("remote published track media plane established", "trackID", ev.TrackID, "ssrc", ev.SSRC, "codec", ev.Codec.MimeType, "track", track.ID())
-	go transport.PumpRTP(ch, buff)
+	go p.pumpRemoteTrackRTP(ch, buff, livekit.TrackID(ev.TrackID))
+}
+
+// pumpRemoteTrackRTP pumps plaintext RTP from the up-direction media relay into
+// the SFU buffer until the relay closes. The relay can close for two reasons:
+// an INTENTIONAL teardown (participant leaving / track removed — the channel is
+// closed in that path) or a relay DROP (the edge↔room TCP died while the
+// participant is otherwise alive). A drop would otherwise freeze the published
+// track's media with no recovery; surface it through the publication-error path
+// so the client reconnects and re-establishes the track on a fresh relay
+// (config-gated by reconnect_on_publication_error, off by default).
+func (p *ParticipantImpl) pumpRemoteTrackRTP(ch transport.MediaChannel, buff *buffer.Buffer, trackID livekit.TrackID) {
+	transport.PumpRTP(ch, buff)
+	if p.IsClosed() || p.IsDisconnected() {
+		return
+	}
+	// A relay DROP (the edge↔room TCP died) freezes the published track's media
+	// with no recovery; surface it through the publication-error path so the
+	// client reconnects and re-establishes the track on a fresh relay
+	// (config-gated by reconnect_on_publication_error, off by default). An
+	// intentional teardown (track removed) closes the relay with no error and is
+	// excluded.
+	if !isMediaRelayDrop(ch) {
+		return
+	}
+	p.params.Logger.Warnw("nat up-direction media relay dropped; forcing reconnect", nil,
+		"trackID", trackID)
+	p.onPublicationError(trackID)
+}
+
+// isMediaRelayDrop reports whether a media channel ended because the underlying
+// relay connection dropped (a network/peer error) rather than an intentional
+// Close. Channels without a CloseReason (in-process local channels) never drop.
+func isMediaRelayDrop(ch transport.MediaChannel) bool {
+	if r, ok := ch.(interface{ CloseReason() error }); ok {
+		return r.CloseReason() != nil
+	}
+	return false
 }
 
 // mediaTrackReceivedRemote registers a publisher track received via remote
@@ -4396,9 +4484,16 @@ func (p *ParticipantImpl) mediaTrackReceivedRemote(track sfu.TrackRemote, mid st
 			return
 		}
 
-		ti.MimeType = track.Codec().MimeType
-		if len(ti.Codecs) == 1 && ti.Codecs[0].MimeType == "" {
-			ti.Codecs[0].MimeType = track.Codec().MimeType
+		// The edge's OnTrack fires before first RTP (FireOnTrackBySdp), so
+		// track.Codec() may report an empty MimeType at this point. The pending
+		// track already carries the negotiated codec from the client's AddTrack —
+		// only override when the edge actually reports one, else the empty value
+		// clobbers video/vp8 and the SFU can't process the up-plane RTP.
+		if m := track.Codec().MimeType; m != "" {
+			ti.MimeType = m
+			if len(ti.Codecs) == 1 && ti.Codecs[0].MimeType == "" {
+				ti.Codecs[0].MimeType = m
+			}
 		}
 		if utils.TimedVersionFromProto(ti.Version).IsZero() {
 			ti.Version = p.params.VersionGenerator.Next().ToProto()
@@ -4456,6 +4551,15 @@ func (p *ParticipantImpl) AddTransceiverFromTrackLocal(
 	trackLocal webrtc.TrackLocal,
 	params types.AddTrackParams,
 ) (*webrtc.RTPSender, *webrtc.RTPTransceiver, error) {
+	// NAT remote mode: the edge PC owns the transceiver/sender. Routing through
+	// addTrackLocalRemote wires the DownTrack to a per-track MediaChannel (the
+	// same path AddTrackLocal takes). Without this, a subscription that reaches
+	// this method (SupportsTransceiverReuse()==false) falls through to the
+	// remotePeerConnection's unimplemented AddTransceiverFromTrack and the
+	// down-track is never created — the cross-node subscriber receives 0 RTP.
+	if p.params.RemoteControlChannel != nil {
+		return p.addTrackLocalRemote(trackLocal)
+	}
 	if p.params.UseSinglePeerConnection {
 		return p.TransportManager.AddTransceiverFromTrackLocal(
 			trackLocal,

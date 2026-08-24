@@ -1,0 +1,96 @@
+# HorizontalPodAutoscaler + PodDisruptionBudget for NAT-mode LiveKit.
+#
+# The room Deployment is the resource-intensive component (SFU, participant
+# state, media relay TCP connections). The edge DaemonSet scales with the
+# node pool, not HPA (one edge pod per edge node).
+---
+# ── Room HPA ─────────────────────────────────────────────────────────────
+# Scale the room deployment based on CPU utilization. Adjust the target
+# based on your workload profile. SFU-heavy workloads may need a memory-based
+# metric too (uncomment the memory block below once the custom metrics
+# adapter is installed).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: livekit-room
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+    app.kubernetes.io/component: room
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: livekit-room
+  minReplicas: 3
+  maxReplicas: 20
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # 5 min before scaling down
+      policies:
+        - type: Percent
+          value: 25                     # max 25% pods removed per minute
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0     # scale up immediately
+      policies:
+        - type: Percent
+          value: 100                    # double every minute during bursts
+          periodSeconds: 60
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # Memory-based scaling (requires custom-metrics adapter / metrics-server >= 0.6):
+    # - type: Resource
+    #   resource:
+    #     name: memory
+    #     target:
+    #       type: Utilization
+    #       averageUtilization: 80
+---
+# ── Room PodDisruptionBudget ─────────────────────────────────────────────
+# Ensure at least 2 room pods remain available during voluntary disruptions
+# (node drains, cluster upgrades). For a 3-replica deployment, this allows
+# at most 1 pod disruption at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: livekit-room
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+    app.kubernetes.io/component: room
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: livekit
+      component: room
+---
+# ── Edge PodDisruptionBudget ──────────────────────────────────────────────
+# For edge DaemonSet, the PDB is per-node (each edge node runs one pod).
+# This PDB ensures that during a voluntary node drain with multiple edge
+# nodes, at least one edge pod remains available. If you have only 2 edge
+# nodes, this allows at most 1 disruption at a time.
+#
+# Note: DaemonSet PDBs use the node count, not replica count. minAvailable
+# of 1 ensures that on a single-node drain, the edge pod is not disrupted,
+# but on a 2+ node drain, only one edge pod can be unavailable at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: livekit-edge
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+    app.kubernetes.io/component: edge
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: livekit
+      component: edge

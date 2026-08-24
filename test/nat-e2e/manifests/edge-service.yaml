@@ -1,0 +1,28 @@
+# Edge ClusterIP service — stable DNS target for in-cluster consumers (stress test,
+# monitoring, etc.). The edge deployment uses hostNetwork, so the service simply
+# routes to the pod's node port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: livekit-edge
+  namespace: default
+  labels:
+    app: livekit-edge
+    app.kubernetes.io/name: edge
+spec:
+  type: ClusterIP
+  selector:
+    app: livekit-edge
+  ports:
+    - name: signaling
+      port: 7880
+      targetPort: 7880
+      protocol: TCP
+    - name: media-relay
+      port: 7883
+      targetPort: 7883
+      protocol: TCP
+    - name: media-control
+      port: 7884
+      targetPort: 7884
+      protocol: TCP

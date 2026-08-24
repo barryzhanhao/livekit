@@ -1,0 +1,6 @@
+# Single-stage: the nat-e2e stress-test client binary is pre-compiled on the host
+# by 02-build-image.sh, then COPY'd into the Alpine runtime.
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY nat-client /nat-client
+ENTRYPOINT ["/nat-client"]

@@ -22,6 +22,8 @@ import (
 	"io"
 	"net"
 	"sync"
+
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 )
 
 // tcpMediaChannel is a networked MediaChannel that carries plaintext RTP/RTCP
@@ -47,6 +49,13 @@ type tcpMediaChannel struct {
 
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// closeMu guards closeErr: the underlying reason the channel ended. Non-nil
+	// means it ended via a network/peer error (a relay DROP) rather than an
+	// intentional Close() — callers use CloseReason to distinguish a dropped
+	// relay (which should trigger a reconnect) from a teardown (which must not).
+	closeMu  sync.Mutex
+	closeErr error
 }
 
 const (
@@ -89,6 +98,18 @@ func (c *tcpMediaChannel) readLoop() {
 	for {
 		typ, payload, err := readFrame(c.conn)
 		if err != nil {
+			// A read error is a relay DROP only if it wasn't caused by our own
+			// Close() (which closes done before the conn, so an intentional
+			// teardown is always visible here as done already closed). Record the
+			// underlying error so CloseReason can distinguish drop vs teardown.
+			select {
+			case <-c.done:
+				// intentional Close() — teardown, not a drop
+			default:
+				c.closeMu.Lock()
+				c.closeErr = err
+				c.closeMu.Unlock()
+			}
 			c.Close()
 			return
 		}
@@ -182,26 +203,54 @@ func (c *tcpMediaChannel) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.done)
 		_ = c.conn.Close()
+		prometheus.DecrementNATRelayConnection()
 	})
 	return nil
 }
 
-// writeFrame writes a type-tagged, length-prefixed frame.
+// CloseReason returns the underlying error that ended the channel, or nil if it
+// was closed intentionally (Close). A non-nil reason means the relay connection
+// dropped — callers (e.g. the room node's media pump) use it to distinguish a
+// dropped relay, which should trigger a reconnect, from a teardown, which must
+// not. Not part of the MediaChannel interface; type-assert when needed.
+func (c *tcpMediaChannel) CloseReason() error {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	return c.closeErr
+}
+
+// writeFrame writes a type-tagged, length-prefixed frame. Header and payload are
+// coalesced into a SINGLE TCP write: at scale (1000s of concurrent per-track relay
+// connections) two separate writes per RTP packet double the syscalls AND, with
+// Nagle enabled, delay the payload behind the header's ACK — RTT latency per
+// packet that shows up as jitter/loss at the subscriber. The extra small buffer
+// alloc is cheaper than the syscall + Nagle penalty it removes.
 func writeFrame(w io.Writer, typ byte, payload []byte) error {
 	if len(payload) > maxFramePayload {
 		return fmt.Errorf("media frame too large: %d", len(payload))
 	}
 
-	header := [frameHeaderSize]byte{typ}
-	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
+	frame := make([]byte, frameHeaderSize+len(payload))
+	frame[0] = typ
+	binary.BigEndian.PutUint32(frame[1:], uint32(len(payload)))
+	copy(frame[frameHeaderSize:], payload)
 
-	if _, err := w.Write(header[:]); err != nil {
-		return err
-	}
-	if _, err := w.Write(payload); err != nil {
+	if _, err := w.Write(frame); err != nil {
 		return err
 	}
 	return nil
+}
+
+// setTCPNoDelay disables Nagle's algorithm on a relay connection. RTP and
+// control messages are small real-time writes; Nagle holds the second write of a
+// frame until the first is ACKed, adding one RTT of latency per packet (in LAN
+// terms: ~RTT, but the queueing/ACK coupling at 1000s of concurrent connections
+// is far worse). Without this, real-time RTP over the TCP relay is latency-bound.
+func setTCPNoDelay(conn net.Conn) net.Conn {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+	return conn
 }
 
 // readFrame reads and returns a single frame's type and payload.
@@ -256,10 +305,12 @@ func (l *TCPMediaChannelListener) Accept() (MediaChannel, error) {
 	if err != nil {
 		return nil, err
 	}
+	conn = setTCPNoDelay(conn)
 	if err := authHandshake(conn, l.secret, true); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
+	prometheus.IncrementNATRelayConnection(prometheus.NATRelayDirectionInbound, prometheus.NATRelayTypeMedia)
 	return NewTCPMediaChannel(conn), nil
 }
 
@@ -270,10 +321,12 @@ func (l *TCPMediaChannelListener) AcceptHello() (HelloMediaChannel, error) {
 	if err != nil {
 		return nil, err
 	}
+	conn = setTCPNoDelay(conn)
 	if err := authHandshake(conn, l.secret, true); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
+	prometheus.IncrementNATRelayConnection(prometheus.NATRelayDirectionInbound, prometheus.NATRelayTypeMedia)
 	return newTCPHelloMediaChannel(conn), nil
 }
 
@@ -290,6 +343,7 @@ func DialTCPMediaChannel(addr string, secret ...string) (MediaChannel, error) {
 	if err != nil {
 		return nil, err
 	}
+	conn = setTCPNoDelay(conn)
 	sec := ""
 	if len(secret) > 0 {
 		sec = secret[0]
@@ -298,6 +352,7 @@ func DialTCPMediaChannel(addr string, secret ...string) (MediaChannel, error) {
 		_ = conn.Close()
 		return nil, err
 	}
+	prometheus.IncrementNATRelayConnection(prometheus.NATRelayDirectionOutbound, prometheus.NATRelayTypeMedia)
 	return NewTCPMediaChannel(conn), nil
 }
 
@@ -309,6 +364,7 @@ func DialTCPMediaChannelHello(addr string, hello MediaHello, secret ...string) (
 	if err != nil {
 		return nil, err
 	}
+	conn = setTCPNoDelay(conn)
 	sec := ""
 	if len(secret) > 0 {
 		sec = secret[0]
@@ -317,6 +373,7 @@ func DialTCPMediaChannelHello(addr string, hello MediaHello, secret ...string) (
 		_ = conn.Close()
 		return nil, err
 	}
+	prometheus.IncrementNATRelayConnection(prometheus.NATRelayDirectionOutbound, prometheus.NATRelayTypeMedia)
 	c := newTCPHelloMediaChannel(conn)
 	if err := c.SendHello(hello); err != nil {
 		_ = c.Close()

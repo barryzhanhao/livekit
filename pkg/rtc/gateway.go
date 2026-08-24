@@ -17,10 +17,12 @@ package rtc
 import (
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 
 	"github.com/livekit/livekit-server/pkg/rtc/transport"
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 )
@@ -45,6 +47,7 @@ type GatewaySetup struct {
 	IsOfferer                bool             `json:"is_offerer"`
 	IsSendSide               bool             `json:"is_send_side"`
 	UseOneShotSignallingMode bool             `json:"use_one_shot"`
+	FireOnTrackBySdp         bool             `json:"fire_on_track_by_sdp"`
 }
 
 // gatewayAck is the handshake reply to a GatewaySetup sent over the ControlChannel
@@ -66,6 +69,7 @@ func NewEdgePeerConnection(cfg *WebRTCConfig, direction DirectionConfig, setup G
 		IsOfferer:                setup.IsOfferer,
 		IsSendSide:               setup.IsSendSide,
 		UseOneShotSignallingMode: setup.UseOneShotSignallingMode,
+		FireOnTrackBySdp:         setup.FireOnTrackBySdp,
 		Logger:                   logger.GetLogger(),
 	}
 	pc, _, _, err := newPeerConnection(params, nil)
@@ -152,6 +156,8 @@ func RunEdgeGatewaySession(ch transport.ControlChannel, cfg *WebRTCConfig, onClo
 	gw := transport.NewMediaGateway(pc)
 	gw.SetSessionID(setup.SessionID)
 	logger.Debugw("nat edge gateway session starting", "room", setup.RoomName, "sessionID", setup.SessionID, "isOfferer", setup.IsOfferer, "isSendSide", setup.IsSendSide, "oneShot", setup.UseOneShotSignallingMode)
+	prometheus.AddNATGatewaySession()
+	sessionStart := time.Now()
 	// Forward published tracks (publisher, up direction) to the room node as
 	// control events; the room node then establishes the up-direction MediaChannel
 	// and pumps RTP into its SFU buffer.
@@ -160,13 +166,20 @@ func RunEdgeGatewaySession(ch transport.ControlChannel, cfg *WebRTCConfig, onClo
 		if tr := receiver.RTPTransceiver(); tr != nil {
 			mid = tr.Mid()
 		}
+		// The edge's OnTrack fires before first RTP (FireOnTrackBySdp), so
+		// track.Codec() reports an empty MimeType / ClockRate / PayloadType. The
+		// room needs the full negotiated codec (ClockRate, PayloadType, fmtp) to
+		// bind the SFU buffer — resolve it from the transceiver's negotiated
+		// parameters (the same source the local room path uses via
+		// rtpReceiver.GetParameters), falling back to track.Codec().
+		codec := resolveEdgeOnTrackCodec(track.Codec(), receiver.GetParameters())
 		body, _ := json.Marshal(remoteTrackEvent{
 			TrackID:  track.ID(),
 			StreamID: track.StreamID(),
 			SSRC:     uint32(track.SSRC()),
 			RID:      track.RID(),
 			Mid:      mid,
-			Codec:    track.Codec(),
+			Codec:    codec,
 		})
 		msg, _ := json.Marshal(remotePCMessage{Kind: remotePCKindEvent, Op: remotePCOpEventOnTrack, Body: body})
 		_ = ch.Send(msg)
@@ -175,6 +188,7 @@ func RunEdgeGatewaySession(ch transport.ControlChannel, cfg *WebRTCConfig, onClo
 		RunRemotePCExecutor(ch, pc)
 		gw.Close()
 		_ = pc.Close()
+		prometheus.SubNATGatewaySession(time.Since(sessionStart))
 		if onClose != nil {
 			onClose(setup.SessionID, setup.IsOfferer)
 		}
@@ -190,4 +204,26 @@ func sendGatewayAck(ch transport.ControlChannel, err error) {
 	}
 	b, _ := json.Marshal(ack)
 	_ = ch.Send(b)
+}
+
+// resolveEdgeOnTrackCodec returns the full negotiated codec for a publisher track
+// received on the edge node. The edge's OnTrack fires before first RTP
+// (FireOnTrackBySdp), so trackCodec may report an empty MimeType / ClockRate /
+// PayloadType. The room needs the complete codec (ClockRate, PayloadType, fmtp)
+// to bind the SFU buffer — without it, the buffer bind fails with "invalid
+// codec" and the published track is immediately unpublished. When the track's
+// own codec is incomplete, resolve it from the transceiver's negotiated
+// parameters (the same source the local room path uses via
+// rtpReceiver.GetParameters).
+func resolveEdgeOnTrackCodec(trackCodec webrtc.RTPCodecParameters, params webrtc.RTPParameters) webrtc.RTPCodecParameters {
+	if trackCodec.MimeType != "" && trackCodec.ClockRate != 0 {
+		return trackCodec
+	}
+	for _, c := range params.Codecs {
+		if c.MimeType == "" || c.ClockRate == 0 {
+			continue
+		}
+		return c
+	}
+	return trackCodec
 }

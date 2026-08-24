@@ -237,6 +237,7 @@ func (r *RoomManager) establishRemoteSession(roomName livekit.RoomName, signalNo
 		IsOfferer:                isOfferer,
 		IsSendSide:               isOfferer,
 		UseOneShotSignallingMode: useOneShotSignallingMode,
+			FireOnTrackBySdp:         true,
 	}
 	if err := rtc.DialGateway(ch, setup); err != nil {
 		_ = ch.Close()

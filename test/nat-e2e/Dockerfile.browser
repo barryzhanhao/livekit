@@ -1,0 +1,25 @@
+# NAT browser E2E test image.
+#
+# Multi-stage:
+#   1. builder — install npm deps and bundle main.js with esbuild
+#   2. runtime — Playwright + Chromium image, runs the Express server + Playwright tests
+#
+# The build context is test/nat-e2e/ so all source paths are relative to that.
+FROM node:22-alpine AS builder
+WORKDIR /build
+COPY browser-test/package.json ./
+RUN npm install
+COPY browser-test/ .
+RUN npx esbuild public/main.js --bundle --outfile=public/bundle.js --format=esm
+
+# ---- runtime ----
+FROM mcr.microsoft.com/playwright:v1.51.0-noble
+WORKDIR /app
+# Copy the bundled output, node_modules, and all source files
+COPY --from=builder /build/ ./
+# Make the startup script executable
+COPY browser-test/run.sh ./run.sh
+RUN chmod +x run.sh
+
+EXPOSE 8081
+ENTRYPOINT ["/bin/bash", "run.sh"]

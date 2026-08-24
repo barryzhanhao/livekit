@@ -1,0 +1,81 @@
+# Stress-test K8s Job — runs the nat-client in-cluster to avoid the host-path
+# bridge flake during high-concurrency NAT-mode tests. The Job connects to the
+# edge node's WS URL, spawns N clients in batches, and reports per-batch metrics.
+#
+# The driver script (07-stress-test.sh) creates this Job, monitors its progress
+# via `kubectl logs --follow`, collects per-node metrics with `kubectl top`, and
+# cleans up.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nat-stress-test
+  namespace: default
+  labels:
+    app: nat-stress-test
+    app.kubernetes.io/name: stress-test
+spec:
+  # TTL-based auto-cleanup: Job is deleted 30 minutes after completion
+  ttlSecondsAfterFinished: 1800
+  # backoff limit: only retry once (the scenario itself has a batch retry)
+  backoffLimit: 1
+  activeDeadlineSeconds: 1800  # 30 minute hard timeout
+  template:
+    metadata:
+      labels:
+        app: nat-stress-test
+        app.kubernetes.io/name: stress-test
+    spec:
+      # The stress-test client connects to the edge service; it does NOT need
+      # hostNetwork (the edge's ClusterIP Service is reachable in-cluster).
+      restartPolicy: Never
+      containers:
+        - name: stress-test
+          image: livekit-nat-dev:stress
+          args:
+            - "-url"
+            - "ws://livekit-edge:7880"
+            - "-api-key"
+            - "devkey"
+            - "-api-secret"
+            - "secret"
+            - "-room"
+            - "nat-stress-$(ROOM_SUFFIX)"
+            - "-scenario"
+            - "stress-test"
+            - "-stress-n"
+            - "$(STRESS_N)"
+            - "-stress-batch"
+            - "$(STRESS_BATCH)"
+            - "-stress-publish"
+            - "$(STRESS_PUBLISH)"
+          env:
+            - name: ROOM_SUFFIX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: STRESS_N
+              value: "100"
+            - name: STRESS_BATCH
+              value: "10"
+            - name: STRESS_PUBLISH
+              value: "true"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 256Mi
+            limits:
+              cpu: "4"
+              memory: 2Gi
+      # The edge service must be ready before the stress test starts
+      initContainers:
+        - name: wait-for-edge
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -zv livekit-edge 7880 2>/dev/null; do
+                echo "waiting for livekit-edge:7880..."
+                sleep 1
+              done
+              echo "edge ready"

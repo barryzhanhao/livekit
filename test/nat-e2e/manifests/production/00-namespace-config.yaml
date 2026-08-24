@@ -1,0 +1,132 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+    app.kubernetes.io/component: nat-mode
+---
+# Production NAT-mode LiveKit configuration.
+# Per-pod differences (advertise_ip, node_id, region) are injected via env vars
+# in the pod specs (see edge-daemonset.yaml / room-deployment.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: livekit-config
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+    app.kubernetes.io/component: nat-mode
+data:
+  config.yaml: |
+    # ── Base configuration ──────────────────────────────────────────────────
+    # All nodes share this config; per-pod overrides use LIVEKIT_* env vars.
+    port: 7880
+
+    # ── Redis ────────────────────────────────────────────────────────────────
+    # Required for NAT multi-node: room_node_map, nodes registry, PSRPC routing.
+    # For production HA, use the Sentinel addresses below. The password is set
+    # via the LIVEKIT_REDIS_PASSWORD env var if needed.
+    redis:
+      # Single-instance address (for development or when Sentinel is not used):
+      address: redis.livekit-nat.svc:6379
+      # Sentinel HA (uncomment and configure for the 3-node Sentinel cluster):
+      # sentinel_master_name: livekit
+      # sentinel_addresses:
+      #   - redis-node-0.redis-node.livekit-nat.svc:26379
+      #   - redis-node-1.redis-node.livekit-nat.svc:26379
+      #   - redis-node-2.redis-node.livekit-nat.svc:26379
+      # username: ""
+      # password: ""
+
+    # ── Signal relay ─────────────────────────────────────────────────────────
+    # The edge↔room signal stream is PSRPC via redis. During a redis master
+    # failover (~10s) sends fail; the default retry_timeout (7.5s) makes the
+    # signal sink give up and close the stream mid-failover, tearing down the
+    # participant session and stopping media. Buffer through the failover so an
+    # established call survives a redis master change. Real outages longer than
+    # this disrupt sessions (clients reconnect).
+    signal_relay:
+      retry_timeout: 30s
+
+    # ── WebRTC ───────────────────────────────────────────────────────────────
+    rtc:
+      # External UDP media port range (must be open on the node firewall).
+      port_range_start: 50000
+      port_range_end: 60000
+      # ICE-over-TCP fallback port (optional, exposed on the node).
+      tcp_port: 7881
+      # Fixed UDP port for the single media socket (optional; if set, replaces
+      # the port_range_start/end range with a single port).
+      udp_port: 7882
+
+      # The node's internal pod IP — set via POD_IP env var in the pod spec.
+      node_ip: ""
+
+      # Externally reachable IP for ICE candidates — set per pod via
+      # LIVEKIT_RTC_ADVERTISE_IP in edge-daemonset.yaml, or via
+      # external LB DNS in room-deployment.yaml (room nodes don't terminate
+      # media, so advertise_ip matters only for the client-facing edge).
+      advertise_ip: ""
+
+      # STUN servers for NAT traversal (optional; production TURN is preferred).
+      stun_servers: []
+
+      # NAT multi-node media relay ("media follows signaling").
+      # Only enabled on NAT-mode clusters. The secret is shared between all nodes
+      # and authenticates cross-node TCP connections. FAIL-CLOSED: an empty secret
+      # rejects all inbound connections, and the server refuses to start with
+      # media_relay enabled but no secret set.
+      media_relay:
+        enabled: true
+        port: 7883              # Internal plaintext RTP/RTCP (pod-to-pod)
+        control_port: 7884      # Internal pion PC control (pod-to-pod)
+        secret: ""              # SET VIA ENV VAR LIVEKIT_RTC_MEDIA_RELAY_SECRET
+
+      # Relay-drop recovery: when an edge↔room per-track media relay drops while
+      # the participant is otherwise alive, force a full reconnect so the track
+      # is re-established instead of freezing silently (off by default; NAT opts
+      # in because the extra network hop makes relay drops more impactful).
+      reconnect_on_publication_error: true
+      reconnect_on_subscription_error: true
+
+    # ── TURN ──────────────────────────────────────────────────────────────────
+    # In-process TURN server for clients behind symmetric NAT.
+    # The allow_restricted_peer_cidrs list is needed when the edge's host
+    # candidates are on private IPs (e.g. hostNetwork in a VPC). On public
+    # networks with public host candidates, this list is not required.
+    turn:
+      enabled: true
+      udp_port: 3478
+      relay_range_start: 50000
+      relay_range_end: 50100
+      allow_restricted_peer_cidrs:
+        # Include your VPC/subnet CIDRs here if the edge nodes run on private IPs
+        # and you need relay-only ICE connectivity.
+        # - 10.0.0.0/8
+        # - 192.168.0.0/16
+
+    # ── Keys ──────────────────────────────────────────────────────────────────
+    keys:
+      # Set via LIVEKIT_KEYS env var (JSON map) or mounted secret.
+      # devkey: <your-dev-key>
+
+    # ── Webhook ───────────────────────────────────────────────────────────────
+    # webhook:
+    #   urls:
+    #     - http://webhook-receiver.livekit-nat.svc:8080/webhook
+    #   api_key: devkey
+
+    # ── Rooms ─────────────────────────────────────────────────────────────────
+    room:
+      auto_create: true
+      empty_timeout: 300
+      departure_timeout: 300
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    logging:
+      level: info
+      # Suppress verbose SDP/trickle logs on the room node:
+      component_levels:
+        livekit.sdp: info
+        livekit.ice: info

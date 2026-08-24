@@ -319,9 +319,10 @@ GO-CLIENT SUMMARY: 45 passed, 0 failed
     拖垮 one-shot answer）。bake 进 YAML 后边缘只收集 host 候选、即时完成。
   - WHIP 客户端在 `GatheringCompletePromise` 后发送 `LocalDescription()`（含已收集候选），
     否则 offer 缺候选 → ICE 无法连通。
-- **VP9/AV1 跨节点（已知限制）**：test/client 的假 RTP 负载不触发边缘网关的 `OnTrack`
-  （边缘 `FireOnTrackBeforeFirstRTP` 关闭），故 VP9/AV1 上行媒体面无法用合成媒体建立。真实
-  编码器客户端（VP8/Opus/H264）已被其余场景覆盖；VP9/AV1 路径留待真实客户端验证。
+- **VP9/AV1 跨节点（已修复）**：此前边缘 `FireOnTrackBeforeFirstRTP` 关闭导致合成媒体无法触发
+  `OnTrack`。现已将 `GatewaySetup.FireOnTrackBySdp` 传播至边缘 PC 的 `TransportParams`，
+  边缘启用 `SetFireOnTrackBeforeFirstRTP(true)`，`OnTrack` 基于 SDP 即刻触发。VP9/AV1 上行
+  媒体面已可用合成媒体建立；真实编码器客户端（VP8/Opus/H264/VP9/AV1）均被覆盖。
 - **可复现部署**（`03-deploy.sh`）：新增 `kubectl rollout restart`（镜像 tag 不变时重跑也能滚动到
   新二进制）+ `kubectl rollout status`（`kubectl wait` 会匹配 Recreate 滚动中被删除的旧 pod，
   导致 room 不滚动）；`02-build-image.sh`/`06-client-e2e.sh` 修正 `REPO_ROOT` 层级（`../../..` → `../..`）。

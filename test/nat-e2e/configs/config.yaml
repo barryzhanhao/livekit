@@ -13,6 +13,12 @@ rtc:
     port: 7883              # internal plaintext RTP/RTCP (pod-to-pod)
     control_port: 7884      # internal pion-PC control (pod-to-pod)
     secret: nat-e2e-relay-secret   # shared cross-node auth (P0-1); FAIL-CLOSED: empty secret rejects all inbound
+  # Relay-drop recovery: when an edge↔room per-track media relay drops while the
+  # participant is otherwise alive, force a full reconnect so the track is
+  # re-established instead of freezing silently. Off by default in LiveKit; NAT
+  # mode opts in because the extra network hop makes relay drops more impactful.
+  reconnect_on_publication_error: true
+  reconnect_on_subscription_error: true
 keys:
   devkey: secret            # standard LiveKit dev credentials (lk --dev-compatible)
 webhook:
@@ -20,7 +26,24 @@ webhook:
     - http://webhook-receiver.default.svc:8080/webhook
   api_key: devkey            # signing key: the receiver verifies the JWT sha256 claim
 redis:
-  address: redis.default.svc:6379
+  # Sentinel HA: LiveKit connects via the 3 sentinels; the go-redis failover
+  # client follows the promoted master on failover. Each redis pod runs a sentinel
+  # sidecar (master name `livekit`, quorum 2). Password matches the redis
+  # requirepass/masterauth in manifests/redis.yaml (shared literal).
+  sentinel_master_name: livekit
+  sentinel_addresses:
+    - redis-0.redis-headless.default.svc:26379
+    - redis-1.redis-headless.default.svc:26379
+    - redis-2.redis-headless.default.svc:26379
+  password: nat-e2e-redis-secret
+# The edge↔room signal stream is PSRPC via redis. During a redis master failover
+# (~10s: 5s down-after + promotion + client reconnect), sends fail. The default
+# retry_timeout (7.5s) makes the signal sink give up and CLOSE the stream
+# mid-failover -> the room tears down the participant's session -> media stops.
+# Buffer through the failover so an established call survives a redis master
+# change. Real outages longer than this DO disrupt sessions (clients reconnect).
+signal_relay:
+  retry_timeout: 30s
 logging:
   level: debug              # debug for NAT flow logging anchors
   component_levels:         # suppress the SDP/trickle dumps that bloat kubectl logs
@@ -32,11 +55,25 @@ room:
   auto_create: true
   empty_timeout: 300
   departure_timeout: 300
+# Bound the N² subscription fan-out at large scale: 1000 clients auto-subscribing
+# to all ~999 others = ~1M downlink track instances, which OOMs both the client
+# pods and the room node. Production LiveKit limits subscriptions per participant
+# (active-speaker style). The stress client still receives media (≥1 track), so
+# media verification holds while the room stays within capacity. The 1000-client
+# stress run caps fan-out aggressively: at 10 video + 4 audio per client the room
+# builds ~14,000 downlink instances and saturates its CPU (join latency 12-15s,
+# DTLS timeouts on the connection burst). video=2/audio=1 keeps ≥1 track flowing
+# per client (media gate: 2048 bytes) while cutting the downlink count ~4.7x.
+limit:
+  subscription_limit_video: 2
+  subscription_limit_audio: 1
 turn:
   enabled: true            # in-process TURN: exercise iceServersForParticipant +
   udp_port: 3478           # TURN credential issuance in the join response
+  # One relayed port per concurrent TURN allocation; 1000-client stress needs a
+  # wide range (old 50000-50100 = 100 ports → 508 Insufficient Capacity at ~100).
   relay_range_start: 50000
-  relay_range_end: 50100
+  relay_range_end: 51100
   # The TURN permission policy denies private-peer IPs by default (loopback,
   # link-local, multicast, RFC1918). The edge's host candidates are private kind
   # IPs (192.168.107.x), so a relay-ONLY ICE connection — the relayed socket's

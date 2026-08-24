@@ -106,10 +106,17 @@ type remotePCResponse struct {
 // transport operations to the edge node's MediaGateway over a ControlChannel.
 // SDP/ICE/state operations are serialized as JSON; the AddTrack family (which
 // requires MediaChannel establishment) is not yet wired and returns an error.
+//
+// Disconnect detection: when the underlying ControlChannel breaks unexpectedly
+// (edge node restart, network partition), readLoop exits and fires the
+// onDisconnected callback. Intentional Close() marks the instance closed first
+// so the callback is suppressed — room-node code can distinguish "edge died"
+// from "session teardown" and trigger a FULL_RECONNECT for the client.
 type remotePeerConnection struct {
 	ch transport.ControlChannel
 
 	reqID atomic.Int64
+	closed atomic.Bool
 
 	mu      sync.Mutex
 	pending map[int64]chan remotePCResponse
@@ -123,6 +130,7 @@ type remotePeerConnection struct {
 	onRemoteTrack              func(remoteTrackEvent)
 	onDataChannel              func(*webrtc.DataChannel)
 	onDataMessage              func(kind livekit.DataPacket_Kind, data []byte)
+	onDisconnected             func()
 
 	gatheringComplete chan struct{}
 	gatheringOnce     sync.Once
@@ -133,6 +141,10 @@ type remotePeerConnection struct {
 }
 
 var _ peerConnection = (*remotePeerConnection)(nil)
+
+// ErrRemotePeerConnectionClosed is returned by requests when the remote peer
+// connection has been closed (either intentionally or due to edge/node failure).
+var ErrRemotePeerConnectionClosed = errors.New("remote peer connection closed")
 
 func NewRemotePeerConnection(ch transport.ControlChannel) *remotePeerConnection {
 	r := &remotePeerConnection{
@@ -149,6 +161,16 @@ func (r *remotePeerConnection) readLoop() {
 		raw, err := r.ch.Receive()
 		if err != nil {
 			r.closePending()
+			// Fire onDisconnected on unexpected channel close (not initiated by
+			// Close(), which sets closed=true first).
+			if !r.closed.Load() {
+				r.cbMu.RLock()
+				f := r.onDisconnected
+				r.cbMu.RUnlock()
+				if f != nil {
+					f()
+				}
+			}
 			return
 		}
 		var msg remotePCMessage
@@ -335,7 +357,6 @@ func (r *remotePeerConnection) CreateOffer(options *webrtc.OfferOptions) (webrtc
 	err = json.Unmarshal(body, &sd)
 	return sd, err
 }
-
 func (r *remotePeerConnection) CreateAnswer(options *webrtc.AnswerOptions) (webrtc.SessionDescription, error) {
 	body, err := r.request(remotePCOpCreateAnswer, options)
 	if err != nil {
@@ -495,6 +516,16 @@ func (r *remotePeerConnection) OnDataMessage(f func(kind livekit.DataPacket_Kind
 	r.onDataMessage = f
 }
 
+// OnDisconnected registers a callback fired when the underlying control channel
+// breaks unexpectedly (edge node restart, network partition). Intentional
+// Close() marks the instance closed first and suppresses this callback.
+// The callback is invoked exactly once, from the readLoop goroutine.
+func (r *remotePeerConnection) OnDisconnected(f func()) {
+	r.cbMu.Lock()
+	defer r.cbMu.Unlock()
+	r.onDisconnected = f
+}
+
 // SendDataMessage forwards a data-channel message to the edge node's data channel
 // (the reverse direction of OnDataMessage). The edge executor resolves the data
 // channel by the kind-derived label and writes the payload.
@@ -513,6 +544,7 @@ func (r *remotePeerConnection) GatheringComplete() <-chan struct{} {
 }
 
 func (r *remotePeerConnection) Close() error {
+	r.closed.Store(true)
 	// Fire-and-forget: send the close request then tear down the channel. Do not
 	// block on a response — the edge node may already be gone.
 	msg, _ := json.Marshal(remotePCMessage{ID: r.reqID.Inc(), Kind: remotePCKindRequest, Op: remotePCOpClose})

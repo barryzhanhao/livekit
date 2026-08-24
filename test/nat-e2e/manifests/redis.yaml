@@ -1,11 +1,58 @@
-# Shared Redis: room/node registry + PSRPC message bus for the Redis router.
+# Redis Sentinel HA for the NAT E2E cluster.
+#
+# A single Redis instance is a single point of failure for the NAT architecture:
+# the node registry (`nodes`), room→node pinning (`room_node_map`), and the PSRPC
+# message bus all live in Redis. This deploys a 3-pod StatefulSet where each pod
+# runs a redis server AND a sentinel sidecar (bitnami-style):
+#   - redis-0 starts as the master; redis-1/redis-2 replicate from it.
+#   - The sentinels monitor master name `livekit` with quorum 2 and auto-promote
+#     a replica if the master dies (down-after 5s, failover ~5-10s).
+#   - LiveKit connects via sentinel_addresses + sentinel_master_name; the go-redis
+#     failover client follows the promoted master transparently.
+#
+# Auth: requirepass + masterauth (so a PROMOTED replica can sync from the new
+# master — the classic HA footgun) + sentinel auth-pass. Shared literal, same
+# value as the server config redis.password and common.sh REDIS_PASSWORD.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: default
+data:
+  redis.conf: |
+    port 6379
+    bind 0.0.0.0
+    protected-mode no
+    dir /data
+    appendonly yes
+    # enable-debug-command: DEBUG SLEEP is the failover-test trigger. The 08-redis-ha
+    # driver freezes the master's event loop (DEBUG SLEEP N) so it stops answering
+    # PING -> sentinels promote a replica. Signals to the container init are
+    # neutralized in the kind/OrbStack runtime (kill -STOP/-KILL on PID 1 are
+    # silently ignored), so DEBUG SLEEP is the only deterministic freeze. This is
+    # TEST-ONLY: the production manifest keeps debug commands disabled.
+    enable-debug-command yes
+  sentinel.conf: |
+    port 26379
+    bind 0.0.0.0
+    protected-mode no
+    dir /data
+    sentinel monitor livekit redis-0.redis-headless.default.svc 6379 2
+    sentinel down-after-milliseconds livekit 5000
+    sentinel failover-timeout livekit 10000
+    sentinel parallel-syncs livekit 1
+    sentinel auth-pass livekit nat-e2e-redis-secret
+---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: redis
   namespace: default
+  labels:
+    app.kubernetes.io/name: redis
 spec:
-  replicas: 1
+  serviceName: redis-headless
+  replicas: 3
   selector:
     matchLabels:
       app: redis
@@ -13,20 +60,204 @@ spec:
     metadata:
       labels:
         app: redis
+        app.kubernetes.io/name: redis
     spec:
+      affinity:
+        # Spread the 3 redis/sentinel pods one-per-node so a single node loss
+        # cannot take out the quorum (sentinels need >= 2 of 3 to promote).
+        #
+        # IMPORTANT (kind double-bind hazard): the room/edge servers bind their
+        # fixed media UDP port once per interface IP, and kind's CNI puts the
+        # node's pod-bridge IP (10.244.x.1/32) on EVERY veth. A node with TWO
+        # regular pods (two veths, same IP) makes the mux bind the same IP:port
+        # twice -> EADDRINUSE -> the server on that node crashes at startup.
+        # hostNetwork servers add no veth, so each worker may host AT MOST ONE
+        # regular pod. redis is one-per-node, and the webhook-receiver is pinned
+        # to the control-plane (see webhook-receiver.yaml) so no worker ever has
+        # two regular pods. Redis on a worker (with its server) is fine.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: redis
+              topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
       containers:
         - name: redis
           image: redis:7-alpine
+          env:
+            - name: REDIS_PASSWORD
+              value: nat-e2e-redis-secret
+          command:
+            - /bin/sh
+            - -exc
+            - |
+              # Discover the CURRENT master from any sentinel, then run as master
+              # or replica. No static replicaof: after a failover promotes e.g.
+              # redis-1, a restarted redis-0 must replicate from redis-1, never
+              # from itself. get-master-addr-by-name returns the master IP;
+              # compare against our own pod IP.
+              while true; do
+                for i in 0 1 2; do
+                  M=$(redis-cli -h "redis-$i.redis-headless.default.svc" -p 26379 --raw \
+                        sentinel get-master-addr-by-name livekit 2>/dev/null | head -1)
+                  # ignore a 127.0.0.1 monitor (sentinel startup fallback)
+                  [ -n "$M" ] && [ "$M" != "127.0.0.1" ] && break 2
+                done
+                sleep 1
+              done
+              AUTH="--requirepass $REDIS_PASSWORD --masterauth $REDIS_PASSWORD"
+              if [ "$M" = "$(hostname -i)" ]; then
+                exec redis-server /etc/redis/redis.conf $AUTH
+              else
+                exec redis-server /etc/redis/redis.conf $AUTH --replicaof "$M" 6379
+              fi
           ports:
-            - { containerPort: 6379 }
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          volumeMounts:
+            - name: redis-config
+              mountPath: /etc/redis
+              readOnly: true
+            - name: redis-data
+              mountPath: /data
+          resources:
+            requests: {cpu: "100m", memory: "64Mi"}
+            limits: {cpu: "1", memory: "512Mi"}
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-c", 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG']
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG']
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG']
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+        - name: sentinel
+          image: redis:7-alpine
+          env:
+            - name: REDIS_PASSWORD
+              value: nat-e2e-redis-secret
+          command:
+            - /bin/sh
+            - -exc
+            - |
+              # Sentinel must rewrite its config file to persist failover state;
+              # the configmap mount is read-only, so seed it into the writable
+              # data volume. redis-sentinel's config load cannot resolve cluster
+              # DNS hostnames in this image (redis-cli / getent can), so resolve
+              # the monitor target to an IP ourselves.
+              #
+              # The monitor target MUST be the CURRENT master, not a fixed pod:
+              # re-seeding to redis-0 on every restart overwrites the persisted
+              # state and loses the promoted master after a failover — the
+              # sentinels then monitor a stale address and never fail over the
+              # real master. Discover the master from the redis pods' ACTUAL
+              # roles (INFO replication), falling back to a peer sentinel, then
+              # to redis-0 (breaks the fresh-cluster bootstrap deadlock).
+              TARGET=""
+              for i in 0 1 2; do
+                ROL=$(redis-cli -h "redis-$i.redis-headless.default.svc" -p 6379 -a "$REDIS_PASSWORD" \
+                      --no-auth-warning --raw INFO replication 2>/dev/null | grep '^role:' | tr -d '\r')
+                [ "$ROL" = "master" ] && TARGET="redis-$i.redis-headless.default.svc" && break
+              done
+              if [ -z "$TARGET" ]; then
+                for i in 0 1 2; do
+                  [ "redis-$i" = "$(hostname)" ] && continue
+                  PEER=$(redis-cli -h "redis-$i.redis-headless.default.svc" -p 26379 --raw \
+                        sentinel get-master-addr-by-name livekit 2>/dev/null | head -1) || true
+                  [ -n "$PEER" ] && [ "$PEER" != "127.0.0.1" ] && TARGET="$PEER" && break
+                done
+              fi
+              [ -z "$TARGET" ] && TARGET="redis-0.redis-headless.default.svc"
+              # Retry the resolution: CoreDNS may take a moment to publish the
+              # headless A record at pod start. Never fall back to 127.0.0.1 —
+              # that would make every node replicaof itself (no master).
+              MIP=""
+              for i in $(seq 1 60); do
+                MIP="$(getent hosts "$TARGET" | awk '{print $1}' | head -1)"
+                [ -n "$MIP" ] && break
+                sleep 1
+              done
+              [ -n "$MIP" ] || { echo "could not resolve $TARGET"; exit 1; }
+              sed "s|^sentinel monitor livekit .*|sentinel monitor livekit $MIP 6379 2|" \
+                /etc/redis/sentinel.conf > /data/sentinel.conf
+              exec redis-sentinel /data/sentinel.conf
+          ports:
+            - name: sentinel
+              containerPort: 26379
+              protocol: TCP
+          volumeMounts:
+            - name: redis-config
+              mountPath: /etc/redis
+              readOnly: true
+            - name: redis-data
+              mountPath: /data
+          resources:
+            requests: {cpu: "50m", memory: "32Mi"}
+            limits: {cpu: "500m", memory: "256Mi"}
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-c", 'redis-cli -p 26379 ping | grep -q PONG']
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", 'redis-cli -p 26379 ping | grep -q PONG']
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", '[ -n "$(redis-cli -p 26379 --raw sentinel get-master-addr-by-name livekit 2>/dev/null)" ]']
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+      volumes:
+        - name: redis-config
+          configMap:
+            name: redis-config
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
 ---
+# Headless service: gives each pod a stable DNS name (redis-0.redis-headless…)
+# that sentinel's monitor and the redis entrypoint rely on.
+# publishNotReadyAddresses: sentinel must resolve redis-0 BEFORE the pod is ready
+# (bootstrap chicken-and-egg) — without this the headless service drops unready
+# pods' A records and sentinel cannot start.
 apiVersion: v1
 kind: Service
 metadata:
-  name: redis
+  name: redis-headless
   namespace: default
+  labels:
+    app.kubernetes.io/name: redis
 spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     app: redis
   ports:
-    - { port: 6379, targetPort: 6379 }
+    - name: redis
+      port: 6379
+      targetPort: 6379
+    - name: sentinel
+      port: 26379
+      targetPort: 26379

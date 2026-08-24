@@ -21,7 +21,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/livekit/protocol/auth"
@@ -1943,6 +1945,155 @@ func scenarioReceiveBeforePublish(url, apiKey, apiSecret, room string) {
 	fmt.Println("RECEIVE_BEFORE_PUBLISH: PASS (subscriber received", sub.BytesReceived(), "bytes from a track published after join)")
 }
 
+// scenarioRedisFailover: subscriber + publisher establish cross-node media, then
+// keep receiving while the harness kills/freezes the redis master. The NAT
+// architecture uses redis for IN-CALL operations too (room-state persistence via
+// RedisStore, edge↔room signaling via PSRPC), so an ACTIVE redis outage can
+// disrupt an established session. What the architecture GUARANTEES is the
+// resilience model: the outage is survived OR the session cleanly disconnects,
+// and a rejoin on the (failed-over) master restores media. This scenario accepts
+// both outcomes and FAILS only if media cannot be restored.
+func scenarioRedisFailover(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-rf-sub")
+	waitConnected(sub)
+	time.Sleep(2 * time.Second) // ensure the subscriber is fully in the room first
+
+	pub := newClient(url, apiKey, apiSecret, room, "go-rf-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("REDIS_FAILOVER: FAIL no baseline media:", err)
+		os.Exit(1)
+	}
+	// READY marker: the harness freezes the redis master after seeing this line.
+	fmt.Println("REDIS_FAILOVER: READY media-established")
+
+	window := time.Duration(*redisFailoverWindow) * time.Second
+	deadline := time.Now().Add(window)
+	last := sub.BytesReceived()
+	stalled := time.Now()
+	disrupted := false
+	for time.Now().Before(deadline) {
+		time.Sleep(time.Second)
+		// The outage can manifest as EITHER a session teardown (transport
+		// negotiation fails -> WS closes) OR a silent media stall (downlink
+		// stops, session stays up). Both count as "disrupted" -> rejoin after the
+		// window (by which time the redis failover has settled).
+		if sub.Disconnected() || pub.Disconnected() {
+			if !disrupted {
+				disrupted = true
+				fmt.Println("REDIS_FAILOVER: session disrupted during redis outage; waiting for failover to settle")
+			}
+			continue
+		}
+		cur := sub.BytesReceived()
+		if cur > last {
+			last = cur
+			stalled = time.Now()
+		} else if !disrupted && time.Since(stalled) > 10*time.Second {
+			disrupted = true
+			fmt.Println("REDIS_FAILOVER: media stalled during outage; waiting for failover to settle before rejoin")
+		}
+	}
+
+	if disrupted {
+		// the resilience model: the outage disrupted the session; a REJOIN must
+		// work and media must flow on the (now failed-over) redis master.
+		sub.Stop()
+		pub.Stop()
+		fmt.Println("REDIS_FAILOVER: rejoining on the new master...")
+		sub2 := newClient(url, apiKey, apiSecret, room, "go-rf-sub")
+		waitConnected(sub2)
+		pub2 := newClient(url, apiKey, apiSecret, room, "go-rf-pub")
+		waitConnected(pub2)
+		w2, err := pub2.AddStaticTrack("video/vp8", "video", "camera")
+		must(err)
+		defer w2.Stop()
+		if err := waitBytes(sub2, 2048, 60*time.Second); err != nil {
+			fmt.Println("REDIS_FAILOVER: FAIL media not restored after rejoin:", err)
+			os.Exit(1)
+		}
+		fmt.Println("REDIS_FAILOVER: PASS (session disrupted by outage; rejoin on new master restored media)")
+		return
+	}
+	fmt.Println("REDIS_FAILOVER: PASS (media survived the redis failover,", sub.BytesReceived(), "bytes)")
+}
+
+// scenarioRelayDrop exercises NAT relay-drop recovery: media is established
+// across the edge↔room relay, the driver drops the media-relay TCP plane (port
+// 7883) while leaving the control plane (7884) and the participant alive, and
+// the room node must force a full reconnect (reconnect_on_publication_error /
+// reconnect_on_subscription_error, NAT-enabled) instead of freezing media. The
+// client sees the forced Leave(RECONNECT) as a disconnect, rejoins, and asserts
+// media flows again.
+func scenarioRelayDrop(url, apiKey, apiSecret, room string) {
+	sub := newClient(url, apiKey, apiSecret, room, "go-rd-sub")
+	waitConnected(sub)
+	time.Sleep(2 * time.Second)
+
+	pub := newClient(url, apiKey, apiSecret, room, "go-rd-pub")
+	waitConnected(pub)
+	writer, err := pub.AddStaticTrack("video/vp8", "video", "camera")
+	must(err)
+	defer writer.Stop()
+
+	if err := waitBytes(sub, 2048, 30*time.Second); err != nil {
+		fmt.Println("RELAY_DROP: FAIL no baseline media:", err)
+		os.Exit(1)
+	}
+	// READY marker: the driver drops the media relay after seeing this line.
+	fmt.Println("RELAY_DROP: READY media-established")
+
+	window := time.Duration(*relayDropWindow) * time.Second
+	deadline := time.Now().Add(window)
+	last := sub.BytesReceived()
+	stalled := time.Now()
+	disrupted := false
+	for time.Now().Before(deadline) {
+		time.Sleep(time.Second)
+		// IssueFullReconnect closes the signal connection -> the client sees a
+		// disconnect; a silent media stall is the fallback disruption signal.
+		if sub.Disconnected() || pub.Disconnected() {
+			if !disrupted {
+				disrupted = true
+				fmt.Println("RELAY_DROP: session disrupted by relay drop; waiting for reconnect to settle")
+			}
+			continue
+		}
+		cur := sub.BytesReceived()
+		if cur > last {
+			last = cur
+			stalled = time.Now()
+		} else if !disrupted && time.Since(stalled) > 10*time.Second {
+			disrupted = true
+			fmt.Println("RELAY_DROP: media stalled after relay drop; waiting to rejoin")
+		}
+	}
+
+	if disrupted {
+		sub.Stop()
+		pub.Stop()
+		fmt.Println("RELAY_DROP: rejoining after relay drop...")
+		sub2 := newClient(url, apiKey, apiSecret, room, "go-rd-sub")
+		waitConnected(sub2)
+		pub2 := newClient(url, apiKey, apiSecret, room, "go-rd-pub")
+		waitConnected(pub2)
+		w2, err := pub2.AddStaticTrack("video/vp8", "video", "camera")
+		must(err)
+		defer w2.Stop()
+		if err := waitBytes(sub2, 2048, 60*time.Second); err != nil {
+			fmt.Println("RELAY_DROP: FAIL media not restored after rejoin:", err)
+			os.Exit(1)
+		}
+		fmt.Println("RELAY_DROP: PASS (relay drop forced reconnect; rejoin restored media)")
+		return
+	}
+	fmt.Println("RELAY_DROP: FAIL (no disruption observed — relay drop did not trigger a reconnect,", sub.BytesReceived(), "bytes)")
+}
+
 // scenarioNack: subscriber receives media, then sends RTCP NACKs toward the
 // publisher. The server-side cross-node NACK path is asserted by 06-client-e2e.sh
 // from the room node logs (nat down RTCP received from edge ... nack).
@@ -2365,6 +2516,374 @@ func scenarioRoomMoveForward(url, apiKey, apiSecret, room string) {
 // when run from an in-cluster pod.
 var ccN = flag.Int("cc-n", 8, "concurrent-join client count")
 
+// stress-test total client count, batch size, and publish flag
+var stressN = flag.Int("stress-n", 100, "stress-test total client count")
+var stressBatch = flag.Int("stress-batch", 10, "stress-test batch size (clients per batch)")
+var stressPublish = flag.Bool("stress-publish", true, "stress-test: each client publishes a static VP8 track")
+// stressOffset shifts the client identity range so multiple Job pods can each
+// connect a disjoint slice of a large room (e.g. 5 pods × 200 clients = 1000).
+// A single pod holding 1000 pion PCs + all subscribed tracks OOMs the node
+// (~4.8Gi free), so the driver shards the load across pods.
+var stressOffset = flag.Int("stress-offset", 0, "stress-test: index offset for this shard (0-based)")
+// stressLossWindow enables the per-client RTP loss report: after media
+// verification, the test samples each client's sequence-gap loss before/after
+// this window and prints a loss% distribution. 0 disables (default) so routine
+// regression runs aren't lengthened.
+var stressLossWindow = flag.Duration("stress-loss-window", 0, "stress-test: report per-client RTP loss over this window (0=off)")
+
+// clientResult holds one stress client's outcome; used across the scenario and
+// the loss reporter.
+type clientResult struct {
+	index   int
+	client  *testclient.RTCClient
+	writer  testclient.TrackWriter
+	connect time.Duration
+	err     error
+}
+// redisFailoverWindow bounds how long scenarioRedisFailover keeps receiving. The
+// 08-redis-ha.sh driver starts the client with a window long enough to cover the
+// redis-master kill + sentinel promotion (~5-10s), then waits for the result.
+var redisFailoverWindow = flag.Int("redis-failover-window", 60, "redis-failover scenario: receive window (seconds)")
+// relayDropWindow bounds how long scenarioRelayDrop watches for the forced
+// disconnect after the driver drops the media relay. The 10-relay-drop.sh driver
+// drops 7883 shortly after READY, so a short window (e.g. 30s) suffices.
+var relayDropWindow = flag.Int("relay-drop-window", 30, "relay-drop scenario: watch window (seconds)")
+
+// scenarioStressTest connects N clients in staged batches, each publishing a
+// static VP8 track, and measures connection establishment rate, media flow, and
+// aggregate throughput. Designed for in-cluster execution (Kubernetes Job) to
+// avoid the host-path bridge flake. The test:
+//
+//  1. Connects clients in batches of <stress-batch> (default 10), waiting for
+//     each batch to fully connect before starting the next.
+//  2. Each client publishes a static VP8 track (unless -stress-publish=false).
+//  3. After all batches connect, verifies that each client receives media from
+//     at least one other client.
+//  4. Reports per-batch and aggregate connect time, per-node resource usage
+//     (via kubectl top collected by the driver script), and failure rate.
+//  5. Cleans up all clients (stop writers, close connections).
+func scenarioStressTest(url, apiKey, apiSecret, room string) {
+	n := *stressN
+	batchSize := *stressBatch
+	if n <= 0 {
+		n = 100
+	}
+	if batchSize <= 0 || batchSize > n {
+		batchSize = 10
+	}
+	if batchSize > n {
+		batchSize = n
+	}
+
+	fmt.Printf("STRESS_TEST: target=%d clients, batch=%d, publish=%v, room=%s\n", n, batchSize, *stressPublish, room)
+
+	// Tune concurrency: batchSize goroutines at a time for connection, then
+	// one goroutine per client writing a static track.
+	start := time.Now()
+
+	allResults := make([]clientResult, 0, n)
+	batches := (n + batchSize - 1) / batchSize
+
+	for b := 0; b < batches; b++ {
+		lo := b * batchSize
+		hi := lo + batchSize
+		if hi > n {
+			hi = n
+		}
+		count := hi - lo
+		batchStart := time.Now()
+
+		type connResult struct {
+			index   int
+			client  *testclient.RTCClient
+			connect time.Duration
+			err     error
+		}
+
+		ch := make(chan connResult, count)
+		for i := lo; i < hi; i++ {
+			i := i
+			go func() {
+				// global index = offset + local batch index, keeping identities
+				// disjoint across shards while batch ranges stay contiguous.
+				id := fmt.Sprintf("stress-%04d", *stressOffset+i)
+				connStart := time.Now()
+				opts := &testclient.Options{AutoSubscribe: true}
+				conn, err := testclient.NewWebSocketConn(url, token(apiKey, apiSecret, room, id), opts)
+				if err != nil {
+					ch <- connResult{index: i, err: fmt.Errorf("ws dial: %w", err)}
+					return
+				}
+				c, err := testclient.NewRTCClient(conn, false, opts)
+				if err != nil {
+					ch <- connResult{index: i, err: fmt.Errorf("new client: %w", err)}
+					return
+				}
+				go c.Run()
+				if err := c.WaitUntilConnected(60 * time.Second); err != nil {
+					ch <- connResult{index: i, err: fmt.Errorf("connect: %w", err)}
+					return
+				}
+				ch <- connResult{index: i, client: c, connect: time.Since(connStart)}
+			}()
+		}
+
+		batchResults := make([]clientResult, 0, count)
+		for i := 0; i < count; i++ {
+			r := <-ch
+			if r.err != nil {
+				batchResults = append(batchResults, clientResult{index: r.index, err: r.err})
+			} else {
+				batchResults = append(batchResults, clientResult{index: r.index, client: r.client, connect: r.connect})
+			}
+		}
+
+		// Sort batch results by index for deterministic output
+		sort.Slice(batchResults, func(i, j int) bool { return batchResults[i].index < batchResults[j].index })
+
+		// Publish tracks if enabled
+		if *stressPublish {
+			for i := range batchResults {
+				r := &batchResults[i]
+				if r.err != nil || r.client == nil {
+					continue
+				}
+				writer, err := r.client.AddStaticTrack("video/vp8", "video", "camera")
+				if err != nil {
+					r.err = fmt.Errorf("publish track: %w", err)
+					continue
+				}
+				r.writer = writer
+			}
+		}
+
+		elapsed := time.Since(batchStart)
+		ok := 0
+		for _, r := range batchResults {
+			if r.err == nil {
+				ok++
+			}
+		}
+		fmt.Printf("STRESS_TEST batch %d/%d [%d,%d): %d/%d connected in %v\n",
+			b+1, batches, lo, hi-1, ok, count, elapsed.Round(time.Millisecond))
+
+		for _, r := range batchResults {
+			allResults = append(allResults, r)
+		}
+	}
+
+	connectEnd := time.Now()
+	totalOK := 0
+	var totalConnect time.Duration
+	var maxConnect time.Duration
+	var connectCount int
+	var firstErr error
+	for _, r := range allResults {
+		if r.err == nil {
+			totalOK++
+			if r.connect > 0 {
+				totalConnect += r.connect
+				connectCount++
+				if r.connect > maxConnect {
+					maxConnect = r.connect
+				}
+			}
+		} else if firstErr == nil {
+			firstErr = r.err
+		}
+	}
+
+	avgConnect := time.Duration(0)
+	if connectCount > 0 {
+		avgConnect = time.Duration(int64(totalConnect) / int64(connectCount))
+	}
+
+	fmt.Printf("STRESS_TEST connect: %d/%d succeeded, avg=%v max=%v total=%v\n",
+		totalOK, n, avgConnect.Round(time.Millisecond), maxConnect.Round(time.Millisecond), connectEnd.Sub(start).Round(time.Second))
+
+	// Verify media flow: check that each subscriber has received bytes from
+	// at least one remote publisher. Wait up to 30s for media to arrive.
+	// Parallelized: with 1000 clients a sequential 30s/deadline sweep could
+	// take tens of minutes (and the driver's Job wait would time out first).
+	// mediaOK gates PASS below: a run that connects but delivers no RTP is a
+	// failure, not a pass (the earlier "PASS with 0 media" was misleading).
+	mediaOK := 0
+	if totalOK >= 2 && *stressPublish {
+		mediaWaitStart := time.Now()
+		type mediaResult struct {
+			index int
+			err   error
+		}
+		workers := 20
+		ch := make(chan *clientResult, len(allResults))
+		for i := range allResults {
+			ch <- &allResults[i]
+		}
+		close(ch)
+		resCh := make(chan mediaResult, len(allResults))
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for r := range ch {
+					if r.err != nil || r.client == nil {
+						continue
+					}
+					if err := waitBytes(r.client, 2048, 30*time.Second); err != nil {
+						resCh <- mediaResult{index: r.index, err: err}
+					} else {
+						resCh <- mediaResult{index: r.index}
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		close(resCh)
+		for mr := range resCh {
+			if mr.err != nil {
+				fmt.Printf("STRESS_TEST client %d: no media received (%v)\n", mr.index, mr.err)
+			} else {
+				mediaOK++
+			}
+		}
+		fmt.Printf("STRESS_TEST media: %d/%d clients received media in %v\n",
+			mediaOK, totalOK, time.Since(mediaWaitStart).Round(time.Second))
+	}
+
+	// Per-client end-to-end downlink loss over a fixed window (opt-in via
+	// -stress-loss-window). Media is flowing here; the sequence-gap tracker
+	// reports where RTP actually disappears in the room→edge→client path.
+	if *stressLossWindow > 0 {
+		measureLossWindow(allResults, *stressLossWindow)
+	}
+
+	// Report aggregate bytes received
+	var totalBytes uint64
+	for _, r := range allResults {
+		if r.client != nil {
+			totalBytes += r.client.BytesReceived()
+		}
+	}
+	elapsed := time.Since(start)
+	rateMB := float64(totalBytes) / elapsed.Seconds() / 1024 / 1024
+	fmt.Printf("STRESS_TEST aggregate: totalBytes=%d elapsed=%v rate=%.2f MB/s\n",
+		totalBytes, elapsed.Round(time.Second), rateMB)
+
+	// Cleanup: stop all writers and clients
+	cleanupStart := time.Now()
+	for _, r := range allResults {
+		if r.writer != nil {
+			r.writer.Stop()
+		}
+	}
+	for _, r := range allResults {
+		if r.client != nil {
+			r.client.Stop()
+		}
+	}
+	fmt.Printf("STRESS_TEST cleanup: %d writers + %d clients stopped in %v\n",
+		len(allResults), len(allResults), time.Since(cleanupStart).Round(time.Second))
+
+	if totalOK < n {
+		fmt.Printf("STRESS_TEST: FAIL %d/%d clients failed (first error: %v)\n", n-totalOK, n, firstErr)
+		os.Exit(1)
+	}
+	if *stressPublish && mediaOK < totalOK {
+		fmt.Printf("STRESS_TEST: FAIL media — only %d/%d connected clients received RTP (0-byte downlink)\n",
+			mediaOK, totalOK)
+		os.Exit(1)
+	}
+	fmt.Printf("STRESS_TEST: PASS (%d/%d clients connected, %d received media)\n", totalOK, n, mediaOK)
+}
+
+// measureLossWindow reports per-client end-to-end downlink RTP loss over a fixed
+// window, using the sequence-gap tracker in the test client. A full stall (0 RTP
+// during the window) is reported separately from sequence-gap loss while media
+// is flowing: a stalled client's tracker records no expected packets, so it must
+// not be counted as "0% loss". This is the probe for the residual end-to-end
+// downlink loss observed under 1000-client concurrency.
+func measureLossWindow(results []clientResult, window time.Duration) {
+	type sample struct{ received, lost uint64 }
+	before := make([]sample, len(results))
+	for i := range results {
+		if results[i].client == nil {
+			continue
+		}
+		r, l, _ := results[i].client.RTPLoss()
+		before[i] = sample{r, l}
+	}
+	time.Sleep(window)
+	after := make([]sample, len(results))
+	for i := range results {
+		if results[i].client == nil {
+			continue
+		}
+		r, l, _ := results[i].client.RTPLoss()
+		after[i] = sample{r, l}
+	}
+
+	var pcts []float64
+	var noRTP, flowCount int
+	var sumPct float64
+	var aggRecv, aggLost uint64
+	buckets := [5]int{} // 0%, (0,1], (1,5], (5,20], >20
+	for i := range results {
+		if results[i].client == nil {
+			continue
+		}
+		dr := after[i].received - before[i].received
+		dl := after[i].lost - before[i].lost
+		aggRecv += dr
+		aggLost += dl
+		if dr == 0 {
+			noRTP++
+			continue
+		}
+		pct := float64(dl) * 100 / float64(dr+dl)
+		pcts = append(pcts, pct)
+		sumPct += pct
+		flowCount++
+		switch {
+		case pct == 0:
+			buckets[0]++
+		case pct <= 1:
+			buckets[1]++
+		case pct <= 5:
+			buckets[2]++
+		case pct <= 20:
+			buckets[3]++
+		default:
+			buckets[4]++
+		}
+	}
+	sort.Float64s(pcts)
+	var p50, p95, maxPct float64
+	if len(pcts) > 0 {
+		p50 = pcts[len(pcts)/2]
+		p95 = pcts[len(pcts)*95/100]
+		maxPct = pcts[len(pcts)-1]
+	}
+	avgPct := 0.0
+	if flowCount > 0 {
+		avgPct = sumPct / float64(flowCount)
+	}
+	aggPct := 0.0
+	if aggRecv+aggLost > 0 {
+		aggPct = float64(aggLost) * 100 / float64(aggRecv+aggLost)
+	}
+
+	fmt.Printf("STRESS_TEST loss window=%v: %d clients, %d no-RTP (full stall), %d flowing\n",
+		window.Round(time.Second), len(results), noRTP, flowCount)
+	fmt.Printf("STRESS_TEST loss distribution: [0%%]=%d (0,1%%]=%d (1,5%%]=%d (5,20%%]=%d >20%%=%d\n",
+		buckets[0], buckets[1], buckets[2], buckets[3], buckets[4])
+	if flowCount > 0 {
+		fmt.Printf("STRESS_TEST loss per-client (flowing): avg=%.2f%% p50=%.2f%% p95=%.2f%% max=%.2f%%\n",
+			avgPct, p50, p95, maxPct)
+	}
+	fmt.Printf("STRESS_TEST loss aggregate: received=%d lost=%d (%.2f%%)\n", aggRecv, aggLost, aggPct)
+}
+
 func main() {
 	// Surface the client's pion-stack warnings/errors (track drops, SRTP, etc.)
 	// to stdout so client-side failures are visible in the E2E suite, while
@@ -2384,7 +2903,7 @@ func main() {
 	apiKey := flag.String("api-key", "devkey", "API key")
 	apiSecret := flag.String("api-secret", "secret", "API secret")
 	room := flag.String("room", "nat-go", "room name")
-	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|room-node-failure|webhook-events|subscriber-pli|media-follows-signaling|concurrent-join|multi-edge|simulate-ice-restart|security-auth|scale-stress|turn-credentials|turn-relay-only")
+	scenario := flag.String("scenario", "receive-before-publish", "scenario: receive-before-publish|nack|data|attributes|single-pc|metadata|mute|multitrack|whip|manual-subscribe|participant-name|track-pause|room-lifecycle|service-apis|subscription-permission|quality-request|rtc-validate|update-video-track|update-audio-track|data-track-publish|hidden-participant|subscriber-only|room-move-forward|whip-ice-restart|perform-rpc|simulcast-switch|reconnect-resume|room-node-failure|webhook-events|subscriber-pli|media-follows-signaling|concurrent-join|multi-edge|simulate-ice-restart|security-auth|scale-stress|turn-credentials|turn-relay-only|stress-test|redis-failover|relay-drop")
 	flag.Parse()
 
 	switch *scenario {
@@ -2482,6 +3001,12 @@ func main() {
 		scenarioSimulateICERestart(*url, *apiKey, *apiSecret, *room)
 	case "security-auth":
 		scenarioSecurityAuth(*url, *apiKey, *apiSecret, *room)
+	case "stress-test":
+		scenarioStressTest(*url, *apiKey, *apiSecret, *room)
+	case "redis-failover":
+		scenarioRedisFailover(*url, *apiKey, *apiSecret, *room)
+	case "relay-drop":
+		scenarioRelayDrop(*url, *apiKey, *apiSecret, *room)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", *scenario)
 		os.Exit(2)

@@ -54,8 +54,40 @@ node_logs()  { kubectl logs -n "$NAMESPACE" "deploy/livekit-$1" -c server "${@:2
 edge_logs()  { node_logs edge; }
 room_logs()  { node_logs room; }
 
-# redis-cli running inside the redis pod (binary-safe via --raw)
-redis_cli() { kubectl exec -n "$NAMESPACE" deploy/redis -- redis-cli --raw "$@"; }
+# ---- redis (sentinel HA) helpers ----
+# The redis master moves on failover (sentinel promotes a replica), so every
+# redis-cli access must target the CURRENT master pod. Sentinel reports the
+# master as an IP; instead find the master by role across the 3 redis pods.
+REDIS_PASSWORD="${REDIS_PASSWORD:-nat-e2e-redis-secret}"
+
+redis_master_pod() { # echo the pod name of the current redis master (redis-0/1/2)
+  local pod
+  for pod in redis-0 redis-1 redis-2; do
+    # timeout: a dead/frozen master accepts TCP but never replies; without it the
+    # exec would hang until the client-side redis-cli gives up.
+    if kubectl exec -n "$NAMESPACE" "$pod" -- sh -c 'timeout 3 redis-cli -a "$REDIS_PASSWORD" --no-auth-warning --raw INFO replication' 2>/dev/null | grep -q '^role:master'; then
+      echo "$pod"; return 0
+    fi
+  done
+  return 1
+}
+
+# redis-cli against the current master (binary-safe via --raw)
+redis_cli() {
+  local pod
+  pod="$(redis_master_pod)" || { echo "redis_cli: no redis master pod found" >&2; return 1; }
+  kubectl exec -n "$NAMESPACE" "$pod" -- redis-cli -a "$REDIS_PASSWORD" --no-auth-warning --raw "$@"
+}
+
+# wait_for-compatible predicates (wait_for runs plain commands in-process)
+nodes_count_ok() { # 2 (no edge2) or 3 (with edge2) nodes registered
+  local n
+  n="$(redis_cli HLEN nodes 2>/dev/null || true)"
+  [ "$n" = "2" ] || [ "$n" = "3" ]
+}
+nodes_count_eq() { # exactly this many nodes registered
+  [ "$(redis_cli HLEN nodes 2>/dev/null || true)" = "$1" ]
+}
 
 wait_for() { # wait_for <desc> <timeout_sec> <cmd...>
   local desc="$1" timeout="$2"; shift 2

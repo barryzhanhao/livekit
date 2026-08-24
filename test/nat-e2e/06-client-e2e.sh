@@ -660,7 +660,7 @@ if kubectl get deploy/livekit-room -n "$NAMESPACE" >/dev/null 2>&1; then
   if ! wait_for "room node back up" 180 kubectl get deploy/livekit-room -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' | grep -q 1; then
     echo "  ✗ room node did not come back up within 180s"; FAIL=$((FAIL+1))
   fi
-  if ! wait_for "room node re-registered" 60 sh -c 'kubectl exec -n "$NAMESPACE" deploy/redis -- redis-cli --raw HLEN nodes | grep -q "^3$"'; then
+  if ! wait_for "room node re-registered" 60 nodes_count_eq 3; then
     echo "  ✗ room node did not re-register within 60s"; FAIL=$((FAIL+1))
   fi
   rm -f "$OUT"
@@ -756,7 +756,7 @@ if kubectl get deploy/livekit-room -n "$NAMESPACE" >/dev/null 2>&1; then
   if ! wait_for "room node back up" 180 kubectl get deploy/livekit-room -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' | grep -q 1; then
     echo "  ✗ room node did not come back up within 180s"; FAIL=$((FAIL+1))
   fi
-  if ! wait_for "room node re-registered" 60 sh -c 'kubectl exec -n "$NAMESPACE" deploy/redis -- redis-cli --raw HLEN nodes | grep -q "^3$"'; then
+  if ! wait_for "room node re-registered" 60 nodes_count_eq 3; then
     echo "  ✗ room node did not re-register within 60s"; FAIL=$((FAIL+1))
   fi
   rm -f "$OUT"

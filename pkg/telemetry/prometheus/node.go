@@ -119,6 +119,7 @@ func Init(nodeID string, nodeType livekit.NodeType) error {
 	initQualityStats(nodeID, nodeType)
 	initDataPacketStats(nodeID, nodeType)
 	initDebugStats(nodeID, nodeType)
+	initNATStats(nodeID, nodeType)
 
 	var err error
 	cpuStats, err = hwstats.NewCPUStats(nil)

@@ -1,0 +1,344 @@
+# Redis Sentinel HA deployment for NAT-mode LiveKit.
+#
+# Production NAT-mode requires Redis for:
+#   1. Node registry (room_node_map)
+#   2. PSRPC message bus for the Redis router
+#   3. Room state persistence
+#
+# A single Redis instance (as in the E2E test manifests) is a single point of
+# failure. This manifest deploys a 3-node Redis Sentinel HA cluster:
+#   - 3 Redis replicas (1 primary, 2 replicas)
+#   - 3 Sentinel instances for automatic failover
+#   - Headless service for pod DNS
+#   - Read-write service (primary) and read-only service (replicas)
+#
+# Apply with:
+#   kubectl apply -f 60-redis-sentinel.yaml
+#
+# Verify with:
+#   kubectl exec -it -n livekit-nat redis-node-0 -- redis-cli -p 6379 PING
+#   kubectl exec -it -n livekit-nat redis-node-0 -- redis-cli -p 26379 SENTINEL get-master-addr-by-name livekit
+---
+# ── ConfigMap ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-sentinel-config
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: redis
+data:
+  redis.conf: |
+    # Redis configuration — same for all nodes.
+    # The primary/replica roles are determined by Sentinel.
+    port 6379
+    bind 0.0.0.0
+    replica-read-only yes
+    appendonly yes
+    appendfsync everysec
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 64mb
+    # Save snapshots every 5 min if at least 1 key changed.
+    save 300 1
+    # Disable protected mode for cluster-internal traffic.
+    protected-mode no
+  sentinel.conf: |
+    # Sentinel configuration — monitors the Redis primary.
+    # Sentinel will elect a new primary if the current one is unreachable
+    # for 5000ms (down-after-milliseconds) by a majority of sentinels.
+    port 26379
+    bind 0.0.0.0
+    # Monitor the POD DNS name (redis-node-0.redis-node…) — NOT the `redis`
+    # Service, which round-robins across all 3 pods and could hit a replica.
+    sentinel monitor livekit redis-node-0.redis-node.livekit-nat.svc 6379 2
+    sentinel down-after-milliseconds livekit 5000
+    sentinel failover-timeout livekit 10000
+    sentinel parallel-syncs livekit 1
+    protected-mode no
+---
+# ── StatefulSet ───────────────────────────────────────────────────────────
+# A StatefulSet ensures stable DNS names (redis-node-0, redis-node-1, ...)
+# which Sentinel and the LiveKit config rely on for discovery.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-node
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  serviceName: redis-node
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+      component: node
+  template:
+    metadata:
+      labels:
+        app: redis
+        component: node
+    spec:
+      # Anti-affinity: prefer one Redis pod per node for HA
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: redis
+                    component: node
+                topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # Optional auth: create a `redis-auth` secret (key `password`) to enable
+          # requirepass/masterauth + sentinel auth-pass. When unset, redis runs
+          # passwordless (development). The entrypoints are auth-conditional.
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+                  optional: true
+          command:
+            - /bin/sh
+            - -exc
+            - |
+              # Discover the CURRENT master from any sentinel sidecar, then run
+              # as master or replica. No static replicaof: after a failover
+              # promotes e.g. redis-node-1, a restarted redis-node-0 must
+              # replicate from redis-node-1, never from itself.
+              # get-master-addr-by-name returns the master IP; compare to ours.
+              AUTH=""
+              [ -n "$REDIS_PASSWORD" ] && AUTH="--requirepass $REDIS_PASSWORD --masterauth $REDIS_PASSWORD"
+              while true; do
+                for i in 0 1 2; do
+                  M=$(redis-cli -h "redis-node-$i.redis-node.livekit-nat.svc" -p 26379 --raw \
+                        sentinel get-master-addr-by-name livekit 2>/dev/null | head -1)
+                  # ignore a 127.0.0.1 monitor (sentinel startup fallback)
+                  [ -n "$M" ] && [ "$M" != "127.0.0.1" ] && break 2
+                done
+                sleep 1
+              done
+              if [ "$M" = "$(hostname -i)" ]; then
+                exec redis-server /etc/redis/redis.conf $AUTH
+              else
+                exec redis-server /etc/redis/redis.conf $AUTH --replicaof "$M" 6379
+              fi
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          volumeMounts:
+            - name: redis-config
+              mountPath: /etc/redis
+              readOnly: true
+            - name: redis-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - PING
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - PING
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+        - name: sentinel
+          image: redis:7-alpine
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+                  optional: true
+          command:
+            - /bin/sh
+            - -exc
+            - |
+              # Sentinel must rewrite its config file to persist failover state;
+              # the configmap mount is read-only, so seed it into the writable
+              # data volume. redis-sentinel's config load cannot resolve cluster
+              # DNS hostnames in this image (redis-cli / getent can), so resolve
+              # the monitor target to an IP ourselves.
+              #
+              # The monitor target MUST be the CURRENT master, not a fixed pod:
+              # re-seeding to redis-node-0 on every restart overwrites the
+              # persisted state and loses the promoted master after a failover.
+              # Discover the master from the redis pods' ACTUAL roles (INFO
+              # replication), falling back to a peer sentinel, then redis-node-0
+              # (breaks the fresh-cluster bootstrap deadlock).
+              AUTH=""
+              [ -n "$REDIS_PASSWORD" ] && AUTH="-a $REDIS_PASSWORD --no-auth-warning"
+              TARGET=""
+              for i in 0 1 2; do
+                ROL=$(redis-cli -h "redis-node-$i.redis-node.livekit-nat.svc" -p 6379 $AUTH \
+                      --raw INFO replication 2>/dev/null | grep '^role:' | tr -d '\r')
+                [ "$ROL" = "master" ] && TARGET="redis-node-$i.redis-node.livekit-nat.svc" && break
+              done
+              if [ -z "$TARGET" ]; then
+                for i in 0 1 2; do
+                  [ "redis-node-$i" = "$(hostname)" ] && continue
+                  PEER=$(redis-cli -h "redis-node-$i.redis-node.livekit-nat.svc" -p 26379 --raw \
+                        sentinel get-master-addr-by-name livekit 2>/dev/null | head -1) || true
+                  [ -n "$PEER" ] && [ "$PEER" != "127.0.0.1" ] && TARGET="$PEER" && break
+                done
+              fi
+              [ -z "$TARGET" ] && TARGET="redis-node-0.redis-node.livekit-nat.svc"
+              # Retry the resolution: CoreDNS may take a moment to publish the
+              # headless A record at pod start. Never fall back to 127.0.0.1 —
+              # that would make every node replicaof itself (no master).
+              MIP=""
+              for i in $(seq 1 60); do
+                MIP="$(getent hosts "$TARGET" | awk '{print $1}' | head -1)"
+                [ -n "$MIP" ] && break
+                sleep 1
+              done
+              [ -n "$MIP" ] || { echo "could not resolve $TARGET"; exit 1; }
+              sed "s|^sentinel monitor livekit .*|sentinel monitor livekit $MIP 6379 2|" \
+                /etc/redis/sentinel.conf > /data/sentinel.conf
+              if [ -n "$REDIS_PASSWORD" ] && ! grep -q '^sentinel auth-pass livekit' /data/sentinel.conf; then
+                echo "sentinel auth-pass livekit $REDIS_PASSWORD" >> /data/sentinel.conf
+              fi
+              exec redis-sentinel /data/sentinel.conf
+          ports:
+            - name: sentinel
+              containerPort: 26379
+              protocol: TCP
+          volumeMounts:
+            - name: redis-config
+              mountPath: /etc/redis
+              readOnly: true
+            - name: redis-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - -p
+                - "26379"
+                - PING
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - -p
+                - "26379"
+                - SENTINEL
+                - get-master-addr-by-name
+                - livekit
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+      volumes:
+        - name: redis-config
+          configMap:
+            name: redis-sentinel-config
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+        labels:
+          app.kubernetes.io/name: redis
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+        # storageClassName: gp2  # uncomment and set to your cloud provider's default
+---
+# ── Headless service (for pod DNS) ────────────────────────────────────────
+# publishNotReadyAddresses: sentinel must resolve redis-node-0 BEFORE the pod is
+# ready (bootstrap chicken-and-egg) — without this the headless service drops
+# unready pods' A records and sentinel cannot start.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-node
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+    component: node
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+    - name: sentinel
+      port: 26379
+      targetPort: 26379
+---
+# ── Read-write service (primary) ──────────────────────────────────────────
+# Write operations go to the Redis primary. Sentinel promotes a new primary
+# if the current one fails, but this service does NOT auto-follow.
+# In production, use a sidecar (e.g., stunnel + sentinel) or a proxy like
+# HAProxy with Sentinel resolution to always point to the current primary.
+# For most LiveKit deployments, pointing to redis-node-0 and relying on
+# Sentinel failover (with manual LiveKit config update) is sufficient.
+# See the production deploy guide for details.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  selector:
+    app: redis
+    component: node
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+# ── Read-only service (replicas) ──────────────────────────────────────────
+# Read operations can be load-balanced across all replicas.
+# Useful for heavy read workloads (e.g., room state queries).
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-readonly
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  selector:
+    app: redis
+    component: node
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379

@@ -14,17 +14,24 @@ ROOM_IP="$(room_node_ip)"
 EDGE2_IP="$(edge2_node_ip 2>/dev/null || true)"
 log "edge node ip: $EDGE_IP   room node ip: $ROOM_IP   edge2 node ip: ${EDGE2_IP:-<none>}"
 
-# ---- Redis ----
+# ---- Redis (sentinel HA) ----
+# Remove the old single-instance Deployment/Service if a previous run created
+# them (the same object name `redis` now belongs to the HA StatefulSet).
+kubectl delete deploy/redis svc/redis -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
 kubectl apply -f "$DIR/manifests/redis.yaml"
-wait_for "redis running" 120 kubectl get deploy/redis -o jsonpath='{.status.readyReplicas}' | grep -q 1
+# NOTE: do NOT pipe wait_for output to grep — wait_for suppresses its command's
+# stdout, so the only stdout is the log line's timestamp, and `grep -q 1` would
+# match the digit "1" in the wall-clock time (a timing-dependent false pass/fail).
+wait_for "redis sentinel cluster ready" 240 bash -c '[ "$(kubectl get statefulset/redis -o jsonpath="{.status.readyReplicas}" 2>/dev/null)" = 3 ]'
+wait_for "redis master reachable via sentinel" 60 redis_cli ping
 
 # ---- webhook receiver (E2E) ----
 kubectl apply -f "$DIR/manifests/webhook-receiver.yaml"
-wait_for "webhook receiver running" 120 kubectl get pod/webhook-receiver -o jsonpath='{.status.phase}' | grep -qi Running
+wait_for "webhook receiver running" 120 bash -c '[ "$(kubectl get pod/webhook-receiver -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ]'
 
 # Clear stale node registrations from previous runs (restarts leave random
 # node IDs behind; stable IDs below prevent future duplicates).
-kubectl exec deploy/redis -- redis-cli DEL nodes room_node_map >/dev/null 2>&1 || true
+redis_cli DEL nodes room_node_map >/dev/null 2>&1 || true
 
 # ---- server config configmaps (per-node: advertise_ip/node_ip baked in) ----
 # NOTE: LIVEKIT_RTC_ADVERTISE_IP / LIVEKIT_RTC_NODE_IP env vars do NOT bind to the
@@ -85,7 +92,12 @@ spec:
             - {name: config, mountPath: /etc/livekit}
             ${NAT_COVERAGE_VOLUME_MOUNT:-}
           resources:
-            limits: {cpu: "2", memory: 1Gi}
+            # room node hosts the SFU for every participant in the room; edge holds
+            # every client's pion PC + relay bridge. A 1000-client room needs far
+            # more than the old 2CPU/1Gi cap (the room pod OOMKilled ~420 clients).
+            # 12-core OrbStack host: give the servers headroom (stress pods were
+            # starving them at 4 CPU, causing DTLS timeouts on the connect burst).
+            limits: {cpu: "8", memory: 6Gi}
       volumes:
         - name: config
           configMap:
@@ -123,9 +135,12 @@ if [ -n "${EDGE2_IP:-}" ]; then
   kubectl rollout status deploy/livekit-edge2 -n "$NAMESPACE" --timeout=180s
 fi
 
+# Edge ClusterIP service: stable DNS target for in-cluster consumers (stress test,
+# monitoring). The service targets the edge deployment's hostNetwork ports.
+kubectl apply -f "$DIR/manifests/edge-service.yaml"
+
 log "waiting for nodes registered in redis..."
-# 2 nodes without edge2, 3 with it
-wait_for "all nodes registered" 120 sh -c 'kubectl exec deploy/redis -- redis-cli --raw HLEN nodes | grep -qE "^(2|3)$"'
+wait_for "all nodes registered" 120 nodes_count_ok
 
 log "--- registered nodes ---"
 for key in $(redis_cli HKEYS nodes); do

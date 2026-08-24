@@ -1,0 +1,95 @@
+# Services for NAT-mode LiveKit deployment.
+#
+# Edge pods use hostNetwork — they bind directly to host ports 7880 (WS),
+# 7881 (TURN TCP), 7882 (UDP media), 3478 (TURN UDP). External traffic
+# reaches them via the host IP directly, so no NodePort/LB service is
+# strictly required for client-facing traffic (your k8s ingress/LB routes
+# to the host IPs of edge nodes).
+#
+# The services below provide:
+#   - ClusterIP: stable DNS targets for internal consumers (monitoring,
+#     ingress controllers, internal clients)
+#   - Headless: direct pod-to-pod discovery for room nodes
+---
+# ── Edge signal service ───────────────────────────────────────────────────
+# ClusterIP for WebSocket signaling. An ingress controller or external LB
+# can route to this service to balance across edge nodes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: livekit-edge
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+    app.kubernetes.io/component: edge
+spec:
+  selector:
+    app: livekit
+    component: edge
+  ports:
+    - name: signal
+      port: 7880
+      targetPort: 7880
+      protocol: TCP
+---
+# ── Room headless service ──────────────────────────────────────────────────
+# Headless service for pod DNS resolution (pod-ip.room.livekit-nat.svc).
+# Room nodes use this to discover each other via DNS and for Prometheus
+# scraping without going through a random load-balanced VIP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: livekit-room
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+    app.kubernetes.io/component: room
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  clusterIP: None  # headless
+  selector:
+    app: livekit
+    component: room
+  ports:
+    - name: signal
+      port: 7880
+      targetPort: 7880
+      protocol: TCP
+    - name: media-relay
+      port: 7883
+      targetPort: 7883
+      protocol: TCP
+    - name: control
+      port: 7884
+      targetPort: 7884
+      protocol: TCP
+---
+# ── TURN NodePort service ──────────────────────────────────────────────────
+# NodePort for TURN traffic. In production on a cloud VPC, replace with a
+# LoadBalancer service or use the hostNetwork ports directly with an external
+# LB that targets the edge node IPs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: livekit-turn
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+    app.kubernetes.io/component: edge
+spec:
+  type: NodePort
+  selector:
+    app: livekit
+    component: edge
+  ports:
+    - name: turn-tcp
+      port: 7881
+      targetPort: 7881
+      protocol: TCP
+      nodePort: 30781
+    - name: turn-udp
+      port: 3478
+      targetPort: 3478
+      protocol: UDP
+      nodePort: 30478

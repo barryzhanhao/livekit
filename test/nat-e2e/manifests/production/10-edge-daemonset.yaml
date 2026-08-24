@@ -1,0 +1,140 @@
+# Edge DaemonSet — one pod per edge node, terminates client WebRTC media.
+# In NAT mode, the edge node holds the real pion PeerConnection (ICE/DTLS/SRTP/UDP)
+# while the room node holds the Participant/TransportManager/SFU. Plaintext RTP/RTCP
+# flows over the internal TCP relay (7883/7884).
+#
+# The edge DaemonSet ensures every node capable of serving client traffic has an
+# edge pod. Use nodeSelector or affinity to restrict to edge-labeled nodes.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: livekit-edge
+  namespace: livekit-nat
+  labels:
+    app.kubernetes.io/name: livekit
+    app.kubernetes.io/component: edge
+    app.kubernetes.io/version: "1.0"
+spec:
+  selector:
+    matchLabels:
+      app: livekit
+      component: edge
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: livekit
+        component: edge
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "7880"
+        prometheus.io/scheme: "http"
+    spec:
+      # hostNetwork + dnsPolicy:ClusterFirstWithHostNet is required for the edge
+      # pod to bind the host's UDP media ports (7882, 50000-60000) and TCP ports
+      # (7880 WS, 7881 TURN, 3478 TURN UDP). The pod also needs access to the
+      # cluster DNS for Redis and inter-pod service discovery.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 45  # allow time for graceful drain
+
+      nodeSelector:
+        nat-role: edge        # only schedule on edge-labeled nodes
+
+      tolerations:
+        - key: "node.kubernetes.io/network-unavailable"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      containers:
+        - name: livekit
+          image: livekit/livekit-server:latest
+          imagePullPolicy: Always
+          ports:
+            - name: signal
+              containerPort: 7880
+              hostPort: 7880
+              protocol: TCP
+            - name: turn-tcp
+              containerPort: 7881
+              hostPort: 7881
+              protocol: TCP
+            - name: media-udp
+              containerPort: 7882
+              hostPort: 7882
+              protocol: UDP
+            - name: turn-udp
+              containerPort: 3478
+              hostPort: 3478
+              protocol: UDP
+            - name: metrics
+              containerPort: 7880
+              protocol: TCP
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: LIVEKIT_NODE_ID
+              value: "edge-$(POD_IP)"
+            - name: LIVEKIT_RTC_ADVERTISE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: LIVEKIT_RTC_MEDIA_RELAY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-relay-secret
+                  key: secret
+                  optional: true
+            - name: LIVEKIT_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-keys
+                  key: keys
+                  optional: true
+            - name: LIVEKIT_REGION
+              value: "default"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/livekit
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 7880
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 7880
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          startupProbe:
+            httpGet:
+              path: /
+              port: 7880
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+      volumes:
+        - name: config
+          configMap:
+            name: livekit-config

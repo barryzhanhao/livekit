@@ -120,3 +120,31 @@ func TestEdgeGatewaySessionHandshake(t *testing.T) {
 		return gw.PeerConnection().ConnectionState() == webrtc.PeerConnectionStateClosed
 	}, 2*time.Second, 10*time.Millisecond)
 }
+
+// TestResolveEdgeOnTrackCodec guards the NAT cross-node downlink fix: the edge's
+// OnTrack fires before first RTP (FireOnTrackBySdp), so track.Codec() reports an
+// empty MimeType/ClockRate/PayloadType. resolveEdgeOnTrackCodec must resolve the
+// full negotiated codec from the receiver's parameters; otherwise the room's SFU
+// buffer bind fails with "invalid codec" and the published track is unpublished
+// immediately (cross-node downlink delivered 0 RTP).
+func TestResolveEdgeOnTrackCodec(t *testing.T) {
+	fullVP8 := webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: "video/VP8", ClockRate: 90000},
+		PayloadType:        96,
+	}
+	empty := webrtc.RTPCodecParameters{}
+	fullParams := webrtc.RTPParameters{Codecs: []webrtc.RTPCodecParameters{fullVP8}}
+
+	// FireOnTrackBySdp: track codec is empty, receiver params carry the codec.
+	got := resolveEdgeOnTrackCodec(empty, fullParams)
+	require.Equal(t, fullVP8, got, "empty track codec must resolve from receiver params")
+
+	// Track codec already complete: used as-is, no lookups.
+	h264 := webrtc.RTPCodecParameters{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: "video/H264", ClockRate: 90000}, PayloadType: 100}
+	got = resolveEdgeOnTrackCodec(fullVP8, webrtc.RTPParameters{Codecs: []webrtc.RTPCodecParameters{h264}})
+	require.Equal(t, fullVP8, got, "complete track codec must be returned unchanged")
+
+	// Both empty: fall back to the (empty) track codec rather than crashing.
+	got = resolveEdgeOnTrackCodec(empty, webrtc.RTPParameters{})
+	require.Equal(t, empty, got)
+}

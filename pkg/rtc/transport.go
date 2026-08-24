@@ -2868,6 +2868,9 @@ func (t *PCTransport) handleSendOffer(_ event) error {
 		return t.sendUnmatchedMediaRequirement(true)
 	}
 
+	if t.params.RemotePeerConnection != nil {
+		t.params.Logger.Infow("nat handleSendOffer remote-mode", "transport", t.params.Transport)
+	}
 	return t.createAndSendOffer(nil)
 }
 

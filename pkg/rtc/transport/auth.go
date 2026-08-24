@@ -19,6 +19,8 @@ import (
 	"errors"
 	"net"
 	"time"
+
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 )
 
 // frameAuth is a dedicated frame type used only for the node-to-node auth
@@ -47,6 +49,7 @@ var errAuthFailed = errors.New("cross-node channel auth failed")
 // The handshake is bounded (5s deadline) so a peer that never presents a secret
 // cannot hold the accept loop's goroutine open.
 func authHandshake(conn net.Conn, secret string, isServer bool) error {
+	start := time.Now()
 	if secret == "" {
 		// Fail closed: no secret configured means no cross-node channel at all.
 		// The accepting node must reject (not silently pass) so an unconfigured
@@ -54,8 +57,10 @@ func authHandshake(conn net.Conn, secret string, isServer bool) error {
 		// with a clear error so misconfiguration surfaces at the dial site.
 		if isServer {
 			_ = writeFrame(conn, frameAuth, authReject)
+			prometheus.IncrementNATRelayAuthFailure()
 			return errAuthFailed
 		}
+		prometheus.IncrementNATRelayAuthFailure()
 		return errors.New("cross-node channel auth requires media_relay.secret")
 	}
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
@@ -64,27 +69,39 @@ func authHandshake(conn net.Conn, secret string, isServer bool) error {
 	if isServer {
 		typ, payload, err := readFrame(conn)
 		if err != nil {
+			prometheus.IncrementNATRelayAuthFailure()
 			return err
 		}
 		if typ != frameAuth {
+			prometheus.IncrementNATRelayAuthFailure()
 			return errAuthFailed
 		}
 		if subtle.ConstantTimeCompare(payload, []byte(secret)) != 1 {
 			_ = writeFrame(conn, frameAuth, authReject)
+			prometheus.IncrementNATRelayAuthFailure()
 			return errAuthFailed
 		}
-		return writeFrame(conn, frameAuth, []byte("OK"))
+		if err := writeFrame(conn, frameAuth, []byte("OK")); err != nil {
+			prometheus.IncrementNATRelayAuthFailure()
+			return err
+		}
+		prometheus.IncrementNATRelayAuthSuccess(time.Since(start))
+		return nil
 	}
 
 	if err := writeFrame(conn, frameAuth, []byte(secret)); err != nil {
+		prometheus.IncrementNATRelayAuthFailure()
 		return err
 	}
 	typ, resp, err := readFrame(conn)
 	if err != nil {
+		prometheus.IncrementNATRelayAuthFailure()
 		return err
 	}
 	if typ != frameAuth || string(resp) != "OK" {
+		prometheus.IncrementNATRelayAuthFailure()
 		return errAuthFailed
 	}
+	prometheus.IncrementNATRelayAuthSuccess(time.Since(start))
 	return nil
 }
